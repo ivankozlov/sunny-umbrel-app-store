@@ -1,0 +1,126 @@
+name: Publish image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver matching umbrel-app.yml (without v)
+        required: true
+        default: "0.1.0"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-sunny-personal-digest
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Validate requested version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version must be strict semver" >&2
+            exit 2
+          fi
+          grep -Fx "version: \"$RELEASE_VERSION\"" sunny-personal-digest/umbrel-app.yml
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Verify locked dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements.txt
+      - name: Run release gates before registry access
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m unittest discover -s tests -v
+          python scripts/check_package.py
+          python -m compileall -q src tests scripts
+
+  publish:
+    needs: gate
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: ghcr-release
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the gated source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@53851d14592bedcffcf25ea515637cff71ef929a
+        with:
+          image: tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5
+        with:
+          version: v0.31.1
+          driver-opts: |
+            image=moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+      - name: Log in to GHCR
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to overwrite an existing version tag
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          image="ghcr.io/ivankozlov/sunny-personal-digest:v${RELEASE_VERSION}"
+          if probe_output="$(docker buildx imagetools inspect "$image" 2>&1)"; then
+            echo "refusing to overwrite existing tag: $image" >&2
+            exit 1
+          fi
+          if printf '%s' "$probe_output" | grep -Eqi \
+              'manifest unknown|404 Not Found|manifest[^[:space:]]* not found'; then
+            echo "confirmed that the version tag does not exist"
+          else
+            echo "Registry probe failed without an explicit missing-manifest response" >&2
+            exit 1
+          fi
+      - name: Build and push multi-architecture image
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/ivankozlov/sunny-personal-digest:v${{ inputs.version }}
+          build-args: APP_VERSION=${{ inputs.version }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Record release-gate digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          {
+            echo "## Release gate"
+            echo
+            echo "Image: \`ghcr.io/ivankozlov/sunny-personal-digest:v${RELEASE_VERSION}\`"
+            echo "Digest: \`${IMAGE_DIGEST}\`"
+            echo
+            echo "Make the GHCR package public, verify both architectures, then pin this digest in both Compose services."
+          } >> "$GITHUB_STEP_SUMMARY"

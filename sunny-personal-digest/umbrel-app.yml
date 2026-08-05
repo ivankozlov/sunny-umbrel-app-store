@@ -1,0 +1,42 @@
+manifestVersion: 1
+id: sunny-personal-digest
+disabled: true
+category: automation
+name: Sunny Personal Digest
+version: "0.1.0"
+tagline: Daily Telegram digest for one selected chat
+description: >-
+  Reads only one explicitly selected Telegram chat, summarizes new text and
+  captions through OpenRouter, and sends the final digest to Sunny over a
+  pinned SSH connection.
+
+
+  Telegram and provider credentials are deliberately excluded from Umbrel
+  backups. A restored config requires manual confirmation that the previous
+  Telegram device was terminated before reauthorization. This package remains
+  disabled until its public multi-architecture GHCR image has been published
+  and pinned by digest.
+releaseNotes: ""
+
+developer: Ivan Kozlov
+website: https://github.com/ivankozlov/sunny-umbrel-app-store
+dependencies: []
+repo: https://github.com/ivankozlov/sunny-umbrel-app-store
+support: https://github.com/ivankozlov/sunny-umbrel-app-store/issues
+
+port: 42831
+icon: https://raw.githubusercontent.com/ivankozlov/sunny-umbrel-app-store/main/sunny-personal-digest/icon.svg
+gallery: []
+path: ""
+
+defaultUsername: sunny
+deterministicPassword: true
+submitter: Ivan Kozlov
+
+backupIgnore:
+  - data/private/*
+  - data/private/.*
+  - data/runtime/*
+  - data/runtime/.*
+  - data/config/pending-upload.json
+  - data/config/.pending-upload.json.*

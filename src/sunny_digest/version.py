@@ -1,0 +1,10 @@
+COLLECTOR_VERSION = "0.1.0"
+PROMPT_VERSION = "personal-digest-v1"
+UPLOAD_SCHEMA = "sunny.personal-digest.v1"
+GATE_SCHEMA = "sunny.personal-digest-gate.v1"
+STATUS_REQUEST_SCHEMA = "sunny.personal-digest-status-request.v1"
+MAX_UPLOAD_BYTES = 32 * 1024
+MAX_PROMPT_BYTES = 96 * 1024
+MAX_DIGEST_CHARS = 3_700
+MAX_SCAN_MESSAGES = 1_000
+DEFAULT_LOOKBACK_HOURS = 72

@@ -1,0 +1,68 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: sunny-personal-digest_web_1
+      APP_PORT: 8080
+
+  web:
+    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.1.0@sha256:RELEASE_GATE_MULTIARCH_DIGEST
+    command: ["web"]
+    user: "1000:1000"
+    init: true
+    restart: on-failure
+    stop_grace_period: 30s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    pids_limit: 64
+    mem_limit: 128m
+    environment:
+      SUNNY_IPC_SOCKET: /data/runtime/control.sock
+      SUNNY_WEB_HOST: 0.0.0.0
+      SUNNY_WEB_PORT: 8080
+      SUNNY_UI_USERNAME: sunny
+      SUNNY_UI_PASSWORD: ${APP_PASSWORD}
+    volumes:
+      - ${APP_DATA_DIR}/data/runtime:/data/runtime
+    healthcheck:
+      test: ["CMD", "python", "-m", "sunny_digest.healthcheck", "web"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  collector:
+    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.1.0@sha256:RELEASE_GATE_MULTIARCH_DIGEST
+    command: ["collector"]
+    user: "1000:1000"
+    init: true
+    restart: on-failure
+    stop_grace_period: 30s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    pids_limit: 96
+    mem_limit: 512m
+    environment:
+      SUNNY_CONFIG_DIR: /data/config
+      SUNNY_PRIVATE_DIR: /data/private
+      SUNNY_RUNTIME_DIR: /data/runtime
+      SUNNY_IPC_SOCKET: /data/runtime/control.sock
+      SUNNY_COLLECT_INTERVAL_S: 300
+    volumes:
+      - ${APP_DATA_DIR}/data/config:/data/config
+      - ${APP_DATA_DIR}/data/private:/data/private
+      - ${APP_DATA_DIR}/data/runtime:/data/runtime
+    healthcheck:
+      test: ["CMD", "python", "-m", "sunny_digest.healthcheck", "collector"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

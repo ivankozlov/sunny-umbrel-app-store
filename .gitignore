@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Runtime material must never enter git.
+data/
+.env
+.env.*
+**/.env
+**/.env.*
+*.session
+*.session-journal
+id_ed25519
+id_ed25519.pub
+*.pem
+pending-upload.json
+
+# Keep only empty package directories; their runtime contents remain ignored.
+!sunny-personal-digest/data/
+!sunny-personal-digest/data/config/
+!sunny-personal-digest/data/private/
+!sunny-personal-digest/data/runtime/
+sunny-personal-digest/data/config/*
+sunny-personal-digest/data/private/*
+sunny-personal-digest/data/runtime/*
+!sunny-personal-digest/data/config/.gitkeep
+!sunny-personal-digest/data/private/.gitkeep
+!sunny-personal-digest/data/runtime/.gitkeep

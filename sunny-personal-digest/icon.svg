@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Sunny Personal Digest">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffca3a"/>
+      <stop offset="1" stop-color="#ff7b00"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="#111827"/>
+  <circle cx="91" cy="91" r="43" fill="url(#g)"/>
+  <g stroke="#ffca3a" stroke-width="10" stroke-linecap="round">
+    <path d="M91 25v12M91 145v12M25 91h12M145 91h12M44 44l9 9M129 129l9 9M138 44l-9 9M53 129l-9 9"/>
+  </g>
+  <rect x="91" y="101" width="112" height="93" rx="18" fill="#f9fafb"/>
+  <path d="M115 129h64M115 151h64M115 173h42" stroke="#374151" stroke-width="10" stroke-linecap="round"/>
+</svg>
