@@ -8,6 +8,11 @@ on:
         required: true
         default: "0.1.0"
         type: string
+      bootstrap_empty_package:
+        description: One-time bootstrap for an absent GHCR package
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -84,6 +89,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Refuse to overwrite an existing version tag
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BOOTSTRAP_EMPTY_PACKAGE: ${{ inputs.bootstrap_empty_package }}
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           image="ghcr.io/ivankozlov/sunny-personal-digest:v${RELEASE_VERSION}"
@@ -94,8 +101,30 @@ jobs:
           if printf '%s' "$probe_output" | grep -Eqi \
               'manifest unknown|404 Not Found|manifest[^[:space:]]* not found'; then
             echo "confirmed that the version tag does not exist"
-          else
+            exit 0
+          fi
+
+          if [[ "$BOOTSTRAP_EMPTY_PACKAGE" != "true" || "$RELEASE_VERSION" != "0.1.0" ]]; then
             echo "Registry probe failed without an explicit missing-manifest response" >&2
+            exit 1
+          fi
+          grep -Fx 'disabled: true' sunny-personal-digest/umbrel-app.yml >/dev/null
+          grep -F 'sha256:RELEASE_GATE_MULTIARCH_DIGEST' \
+            sunny-personal-digest/docker-compose.yml >/dev/null
+
+          package_probe="$(mktemp)"
+          trap 'rm -f "$package_probe"' EXIT
+          if gh api --include \
+              --header 'X-GitHub-Api-Version: 2026-03-10' \
+              '/users/ivankozlov/packages/container/sunny-personal-digest/versions?per_page=1' \
+              >"$package_probe" 2>/dev/null; then
+            echo "Package metadata exists but the registry probe was inconclusive" >&2
+            exit 1
+          fi
+          if head -n 1 "$package_probe" | grep -Eq '^HTTP/[0-9.]+ 404([[:space:]]|$)'; then
+            echo "confirmed one-time bootstrap of an absent package"
+          else
+            echo "Package probe failed without an explicit 404 response" >&2
             exit 1
           fi
       - name: Build and push multi-architecture image

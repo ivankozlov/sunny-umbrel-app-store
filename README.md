@@ -162,7 +162,9 @@ pull without registry credentials.
 1. Push this directory as the repository root. Keep the disabled manifest and
    digest placeholder.
 2. Protect the `ghcr-release` GitHub Environment with branch `main` and Ivan as
-   required reviewer. Run the pinned `Publish image` workflow with version `0.1.0`.
+   required reviewer. For the first and only package bootstrap, run the pinned
+   `Publish image` workflow with version `0.1.0` and
+   `bootstrap_empty_package=true`; leave that input `false` for every later run.
    The publish job itself is also restricted to `main`. It runs all offline gates,
    refuses to overwrite an existing version tag, builds both
    supported architectures, pushes the tag, emits an SBOM/provenance
