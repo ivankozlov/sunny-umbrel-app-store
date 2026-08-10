@@ -98,6 +98,10 @@ jobs:
             echo "refusing to overwrite existing tag: $image" >&2
             exit 1
           fi
+          if printf '%s\n' "$probe_output" | grep -Fqx "ERROR: $image: not found"; then
+            echo "confirmed that the version tag does not exist"
+            exit 0
+          fi
           if printf '%s' "$probe_output" | grep -Eqi \
               'manifest unknown|404 Not Found|manifest[^[:space:]]* not found'; then
             echo "confirmed that the version tag does not exist"

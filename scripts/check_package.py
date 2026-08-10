@@ -235,6 +235,7 @@ def main() -> int:
         "platforms: linux/amd64,linux/arm64", "sbom: true", "provenance: mode=max",
         "Refuse to overwrite an existing version tag",
         "Registry probe failed without an explicit missing-manifest response",
+        'grep -Fqx "ERROR: $image: not found"',
         "manifest unknown|404 Not Found|manifest[^[:space:]]* not found",
         "bootstrap_empty_package",
         "BOOTSTRAP_EMPTY_PACKAGE",
