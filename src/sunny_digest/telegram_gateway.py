@@ -1,17 +1,92 @@
 from __future__ import annotations
 
+import hashlib
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .models import DialogCandidate, FetchResult, PeerSpec, SelectedMessage
-from .prompting import prompt_size, truncate_first_to_budget
+from .models import (
+    DialogCandidate,
+    FetchResult,
+    MentionEvent,
+    MentionScanResult,
+    PeerSpec,
+    SelectedMessage,
+)
+from .prompting import prompt_size
 from .version import (
     COLLECTOR_VERSION,
     DEFAULT_LOOKBACK_HOURS,
+    MAX_MENTION_EVENTS,
+    MAX_MENTION_SNIPPET_UTF16,
     MAX_PROMPT_BYTES,
     MAX_SCAN_MESSAGES,
 )
+
+
+def _truncate_first_to_budget(message: SelectedMessage,
+                              max_prompt_bytes: int,
+                              chat_title: Optional[str]) -> SelectedMessage:
+    """Fit one anomalously large row into the caller's per-chat budget."""
+    if prompt_size([message], chat_title) <= max_prompt_bytes:
+        return message
+    suffix = "\n[обрезано]"
+    low, high = 0, len(message.text)
+    best = ""
+    while low <= high:
+        middle = (low + high) // 2
+        candidate_text = message.text[:middle].rstrip() + suffix
+        candidate = SelectedMessage(
+            message.message_id, message.sender_id, message.sent_at, candidate_text)
+        if prompt_size([candidate], chat_title) <= max_prompt_bytes:
+            best = candidate_text
+            low = middle + 1
+        else:
+            high = middle - 1
+    if not best:
+        raise ValueError("one Telegram message cannot fit the prompt budget")
+    return SelectedMessage(message.message_id, message.sender_id, message.sent_at, best)
+
+
+def _clean_text(value: Any, *, max_utf16_units: Optional[int] = None) -> str:
+    raw = "" if value is None else str(value)
+    clean = "".join(
+        " " if char.isspace() else char
+        for char in raw
+        if (char.isspace()
+            or unicodedata.category(char) not in ("Cc", "Cf", "Cs"))
+    )
+    clean = " ".join(clean.split())
+    if max_utf16_units is None:
+        return clean
+    used = 0
+    kept: List[str] = []
+    for char in clean:
+        units = 2 if ord(char) > 0xFFFF else 1
+        if used + units > max_utf16_units:
+            break
+        kept.append(char)
+        used += units
+    return "".join(kept)
+
+
+def _sender_display(message: Any) -> str:
+    post_author = _clean_text(getattr(message, "post_author", None))
+    if post_author:
+        return _clean_text(post_author, max_utf16_units=160)
+    sender = getattr(message, "sender", None)
+    if sender is not None:
+        full_name = " ".join(filter(None, (
+            _clean_text(getattr(sender, "first_name", None)),
+            _clean_text(getattr(sender, "last_name", None)),
+        )))
+        display = full_name or _clean_text(getattr(sender, "title", None))
+        if not display:
+            username = _clean_text(getattr(sender, "username", None))
+            display = f"@{username}" if username else ""
+        if display:
+            return _clean_text(display, max_utf16_units=160)
+    return "Неизвестный отправитель"
 
 
 class TelethonGateway:
@@ -38,6 +113,11 @@ class TelethonGateway:
             system_version="umbrelOS",
             app_version=COLLECTOR_VERSION,
         )
+
+    def _peer_dialog_modules(self):
+        from telethon.tl.functions.messages import GetPeerDialogsRequest
+        from telethon.tl.types import InputDialogPeer
+        return InputDialogPeer, GetPeerDialogsRequest
 
     async def send_code(self, session_text: str, phone: str) -> Tuple[str, str]:
         client = self._client(session_text)
@@ -84,7 +164,7 @@ class TelethonGateway:
             if not await client.is_user_authorized():
                 raise RuntimeError("Telegram session is not authorized")
             async for dialog in client.iter_dialogs(limit=500):
-                # The initial receiver pilot is bound to one group/supergroup.
+                # Only groups/supergroups can enter the immutable selected set.
                 # Private users and broadcast-only channels are not selectable.
                 if not bool(getattr(dialog, "is_group", False)) or int(dialog.id) >= 0:
                     continue
@@ -97,11 +177,9 @@ class TelethonGateway:
                     continue
                 else:
                     continue
-                raw_title = "".join(
-                    char for char in str(dialog.name or "Unnamed chat")
-                    if unicodedata.category(char) not in ("Cc", "Cf")
-                )
-                title = " ".join(raw_title.split())[:160] or "Unnamed chat"
+                title = _clean_text(
+                    dialog.name or "Unnamed chat", max_utf16_units=160,
+                ) or "Unnamed chat"
                 candidates.append(DialogCandidate(int(dialog.id), title, peer))
             return candidates
         finally:
@@ -114,6 +192,214 @@ class TelethonGateway:
         if peer.kind == "chat":
             return InputPeerChat(peer.peer_id)
         raise ValueError("only an exact group peer can be read")
+
+    def _validate_selected_peers(
+            self, selected_peers: Sequence[Tuple[int, PeerSpec]]) -> Dict[int, PeerSpec]:
+        if not selected_peers:
+            raise ValueError("at least one exact peer is required")
+        expected: Dict[int, PeerSpec] = {}
+        for chat_id, peer in selected_peers:
+            if type(chat_id) is not int or chat_id != peer.telegram_chat_id():
+                raise ValueError("selected chat_id does not match peer")
+            if chat_id in expected:
+                raise ValueError("selected chat_id is duplicated")
+            expected[chat_id] = peer
+        return expected
+
+    async def _snapshot_tops_connected(
+            self, client: Any, selected_peers: Sequence[Tuple[int, PeerSpec]],
+            utils: Any) -> Dict[int, int]:
+        expected = self._validate_selected_peers(selected_peers)
+        InputDialogPeer, GetPeerDialogsRequest = self._peer_dialog_modules()
+        request = GetPeerDialogsRequest(peers=[
+            InputDialogPeer(peer=self._input_peer(peer))
+            for _, peer in selected_peers
+        ])
+        response = await client(request)
+        tops: Dict[int, int] = {}
+        for dialog in getattr(response, "dialogs", ()):
+            chat_id = int(utils.get_peer_id(dialog.peer))
+            if chat_id not in expected:
+                raise RuntimeError("Telegram snapshot returned an unexpected peer")
+            if chat_id in tops:
+                raise RuntimeError("Telegram snapshot duplicated an exact peer")
+            top = dialog.top_message
+            if type(top) is not int or top < 0:
+                raise RuntimeError("Telegram snapshot returned an invalid top message")
+            tops[chat_id] = top
+        if set(tops) != set(expected):
+            raise RuntimeError("Telegram snapshot did not return the exact selected peer set")
+        return tops
+
+    async def snapshot_tops(
+            self, session_text: str,
+            selected_peers: Sequence[Tuple[int, PeerSpec]]) -> Dict[int, int]:
+        """Return top IDs for the exact locked peers without listing dialogs/history."""
+        self._validate_selected_peers(selected_peers)
+        _, utils, _, _, _, _, _ = self._modules()
+        client = self._client(session_text)
+        await client.connect()
+        try:
+            if not await client.is_user_authorized():
+                raise RuntimeError("Telegram session is not authorized")
+            return await self._snapshot_tops_connected(client, selected_peers, utils)
+        finally:
+            await client.disconnect()
+
+    async def _scan_mentions_connected(
+            self, client: Any, utils: Any, peer: PeerSpec, expected_chat_id: int,
+            chat_title: str, source_id: str, from_message_id_exclusive: int,
+            frozen_through_message_id: int) -> MentionScanResult:
+        if expected_chat_id != peer.telegram_chat_id():
+            raise ValueError("expected chat_id does not match peer")
+        if (type(from_message_id_exclusive) is not int
+                or type(frozen_through_message_id) is not int
+                or from_message_id_exclusive < 0
+                or frozen_through_message_id < from_message_id_exclusive):
+            raise ValueError("Telegram mention scan range is invalid")
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id is invalid")
+        clean_title = _clean_text(chat_title, max_utf16_units=160) or "Unnamed chat"
+        if frozen_through_message_id == from_message_id_exclusive:
+            return MentionScanResult(from_message_id_exclusive, [])
+        through = from_message_id_exclusive
+        events: List[MentionEvent] = []
+        viewed = 0
+        stopped_at_mention_cap = False
+        async for message in client.iter_messages(
+                self._input_peer(peer), min_id=from_message_id_exclusive,
+                max_id=frozen_through_message_id + 1, reverse=True,
+                limit=MAX_SCAN_MESSAGES):
+            viewed += 1
+            message_id = int(message.id)
+            if not through < message_id <= frozen_through_message_id:
+                raise RuntimeError("Telegram mention scan returned an invalid message order")
+            actual_chat_id = int(utils.get_peer_id(message.peer_id))
+            if actual_chat_id != expected_chat_id:
+                raise RuntimeError("Telegram returned a message from an unexpected peer")
+            if bool(getattr(message, "mentioned", False)):
+                if len(events) >= MAX_MENTION_EVENTS:
+                    stopped_at_mention_cap = True
+                    break
+                sent_at = message.date
+                if sent_at.tzinfo is None:
+                    sent_at = sent_at.replace(tzinfo=timezone.utc)
+                sent_at = sent_at.astimezone(timezone.utc)
+                event_id = hashlib.sha256(
+                    f"{source_id}:{expected_chat_id}:{message_id}".encode("utf-8")
+                ).hexdigest()
+                link = (
+                    f"https://t.me/c/{peer.peer_id}/{message_id}"
+                    if peer.kind == "channel" else None
+                )
+                events.append(MentionEvent(
+                    event_id=event_id,
+                    chat_id=expected_chat_id,
+                    message_id=message_id,
+                    sent_at=sent_at,
+                    chat_title=clean_title,
+                    sender=_sender_display(message),
+                    snippet=_clean_text(
+                        getattr(message, "message", None),
+                        max_utf16_units=MAX_MENTION_SNIPPET_UTF16,
+                    ),
+                    link=link,
+                ))
+            through = message_id
+
+        if (not stopped_at_mention_cap
+                and (viewed < MAX_SCAN_MESSAGES
+                     or through == frozen_through_message_id)):
+            through = frozen_through_message_id
+        return MentionScanResult(through, events)
+
+    async def scan_mentions(
+            self, session_text: str, peer: PeerSpec, expected_chat_id: int,
+            chat_title: str, source_id: str, from_message_id_exclusive: int,
+            frozen_through_message_id: int) -> MentionScanResult:
+        """Scan one exact frozen ID window using Telegram's native mention flag."""
+        _, utils, _, _, _, _, _ = self._modules()
+        client = self._client(session_text)
+        await client.connect()
+        try:
+            if not await client.is_user_authorized():
+                raise RuntimeError("Telegram session is not authorized")
+            return await self._scan_mentions_connected(
+                client, utils, peer, expected_chat_id, chat_title, source_id,
+                from_message_id_exclusive, frozen_through_message_id,
+            )
+        finally:
+            await client.disconnect()
+
+    async def snapshot_and_scan_mentions(
+            self, session_text: str, source_id: str,
+            selected: Sequence[Tuple[int, PeerSpec, str, int]],
+    ) -> Tuple[Dict[int, int], Dict[int, MentionScanResult], List[int]]:
+        """Snapshot and scan every exact peer in one authenticated connection."""
+        pairs = [(chat_id, peer) for chat_id, peer, _, _ in selected]
+        self._validate_selected_peers(pairs)
+        _, utils, _, _, _, _, _ = self._modules()
+        client = self._client(session_text)
+        await client.connect()
+        try:
+            if not await client.is_user_authorized():
+                raise RuntimeError("Telegram session is not authorized")
+            tops: Dict[int, int] = {}
+            scans: Dict[int, MentionScanResult] = {}
+            failed: List[int] = []
+            for chat_id, peer, title, start in selected:
+                try:
+                    top = (await self._snapshot_tops_connected(
+                        client, [(chat_id, peer)], utils))[chat_id]
+                    tops[chat_id] = top
+                    scans[chat_id] = await self._scan_mentions_connected(
+                        client, utils, peer, chat_id, title, source_id, start, top,
+                    )
+                except Exception:
+                    # Peer-local failures are intentionally redacted. One stale
+                    # access_hash must not starve the other locked chats.
+                    failed.append(chat_id)
+            return tops, scans, failed
+        finally:
+            await client.disconnect()
+
+    async def acknowledge_read(self, session_text: str, peer: PeerSpec,
+                               through_message_id: int) -> None:
+        succeeded, failed = await self.acknowledge_reads(
+            session_text, [(peer.telegram_chat_id(), peer, through_message_id)])
+        if failed or succeeded != [peer.telegram_chat_id()]:
+            raise RuntimeError("Telegram read acknowledgement failed")
+
+    async def acknowledge_reads(
+            self, session_text: str,
+            acknowledgements: Sequence[Tuple[int, PeerSpec, int]],
+    ) -> Tuple[List[int], List[int]]:
+        if not acknowledgements:
+            return [], []
+        for chat_id, peer, through_message_id in acknowledgements:
+            if chat_id != peer.telegram_chat_id():
+                raise ValueError("read acknowledgement chat_id does not match peer")
+            if type(through_message_id) is not int or through_message_id < 0:
+                raise ValueError("Telegram read acknowledgement ID is invalid")
+        client = self._client(session_text)
+        await client.connect()
+        succeeded: List[int] = []
+        failed: List[int] = []
+        try:
+            if not await client.is_user_authorized():
+                raise RuntimeError("Telegram session is not authorized")
+            for chat_id, peer, through_message_id in acknowledgements:
+                try:
+                    await client.send_read_acknowledge(
+                        self._input_peer(peer), max_id=through_message_id,
+                        clear_mentions=True,
+                    )
+                    succeeded.append(chat_id)
+                except Exception:
+                    failed.append(chat_id)
+            return succeeded, failed
+        finally:
+            await client.disconnect()
 
     async def bootstrap_cursor(self, session_text: str, peer: PeerSpec,
                                now: datetime) -> int:
@@ -139,14 +425,19 @@ class TelethonGateway:
 
     async def fetch(self, session_text: str, peer: PeerSpec, expected_chat_id: int,
                     from_message_id_exclusive: int, cutoff_at: datetime,
-                    not_before_at: Optional[datetime] = None) -> FetchResult:
+                    not_before_at: Optional[datetime] = None,
+                    max_prompt_bytes: int = MAX_PROMPT_BYTES,
+                    chat_title: Optional[str] = None) -> FetchResult:
+        if not_before_at is not None and not_before_at.tzinfo is None:
+            raise ValueError("Telegram lower time boundary must be timezone-aware")
+        if (type(max_prompt_bytes) is not int
+                or not 0 < max_prompt_bytes <= MAX_PROMPT_BYTES):
+            raise ValueError("Telegram prompt budget is invalid")
         _, utils, _, _, _, _, _ = self._modules()
         client = self._client(session_text)
         await client.connect()
         through = from_message_id_exclusive
         selected: List[SelectedMessage] = []
-        if not_before_at is not None and not_before_at.tzinfo is None:
-            raise ValueError("Telegram lower time boundary must be timezone-aware")
         not_before = (
             not_before_at.astimezone(timezone.utc)
             if not_before_at is not None else None
@@ -198,12 +489,13 @@ class TelethonGateway:
                     sent_at=sent_at,
                     text=text,
                 )
-                if prompt_size(selected + [candidate]) > MAX_PROMPT_BYTES:
+                if prompt_size(selected + [candidate], chat_title) > max_prompt_bytes:
                     if selected:
                         # Do not advance across text omitted from the bounded
                         # prompt; a later due run resumes from this message.
                         break
-                    candidate = truncate_first_to_budget(candidate)
+                    candidate = _truncate_first_to_budget(
+                        candidate, max_prompt_bytes, chat_title)
                 selected.append(candidate)
                 through = max(through, message_id)
             return FetchResult(through, selected)

@@ -12,16 +12,18 @@ from pathlib import Path
 
 def fixture(phase: str):
     base = {
-        "schema": "sunny.personal-digest-local-status.v1",
+        "schema": "sunny.personal-chats.local-status.v2",
         "phase": phase,
         "configured": phase != "fresh",
         "chat_locked": phase == "chat_locked",
         "consent_active": phase not in ("fresh", "unavailable"),
-        "pending_upload": False,
+        "pending_digest_upload": False,
+        "pending_monitor_upload": False,
         "source_id": None,
-        "chat_id": None,
-        "chat_title": None,
-        "initial_message_id": None,
+        "chats": [],
+        "monitoring_phase": "not_selected",
+        "activation_required": False,
+        "monitoring_active": False,
         "upload_public_key": None,
         "upload_key_fingerprint": None,
         "model": None,
@@ -34,6 +36,8 @@ def fixture(phase: str):
         "last_error_type": None,
         "last_message_count": None,
         "last_through_message_id": None,
+        "failed_chat_count": 0,
+        "revocation_required": False,
     }
     if phase == "dialogs_listed":
         base["dialogs"] = [
@@ -43,9 +47,14 @@ def fixture(phase: str):
     if phase == "chat_locked":
         base.update({
             "source_id": "12345678-1234-4678-9234-567812345678",
-            "chat_id": -1001234567890,
-            "chat_title": "Тестовая группа",
-            "initial_message_id": 4821,
+            "chats": [
+                {"chat_id": -1001234567890, "title": "Тестовая группа",
+                 "kind": "channel"},
+                {"chat_id": -987654321, "title": "Семейный чат",
+                 "kind": "chat"},
+            ],
+            "monitoring_phase": "activation_required",
+            "activation_required": True,
             "upload_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureOnlyNotARealKey sunny-test",
             "upload_key_fingerprint": "SHA256:fixture-only-not-a-key",
             "model": "anthropic/example-model",

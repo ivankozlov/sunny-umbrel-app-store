@@ -1,60 +1,77 @@
-# Sunny Personal Digest for Umbrel
+# Sunny Personal Chats for Umbrel
 
-Community App Store package for a narrowly scoped collector: it reads text from
-one explicitly selected Telegram group, creates a daily Russian digest through
-OpenRouter, and uploads only the final bounded payload to Sunny over a pinned
-SSH forced command.
+Community App Store package for a narrowly scoped Telegram user-session client.
+It watches 1–16 immutable groups/supergroups, clears read state about once a
+minute, forwards bounded native-mention events to Sunny, and creates one combined
+daily digest through OpenRouter.
 
 > **Release gate:** install only a commit whose manifest has `disabled: false`
-> and whose two Compose services pin the same real immutable digest. A checkout
-> with `disabled: true` or `RELEASE_GATE_MULTIARCH_DIGEST` is a pre-publish
-> artifact and must not be installed.
+> and whose two Compose services pin the same real immutable multi-architecture
+> digest. A checkout with `disabled: true` or
+> `RELEASE_GATE_MULTIARCH_DIGEST` is intentionally not installable.
+
+The app/package/image ID remains `sunny-personal-digest` for release continuity;
+the v0.2 product name is **Sunny Personal Chats**. v0.2 is a breaking credential
+generation and does not migrate the unpublished v0.1 pilot state.
+
+## Product contract
+
+- Setup lists Telegram groups once and accepts an immutable selection of 1–16.
+  A forum is selected as a whole chat; individual topics are not selected.
+- Selection itself does not read selected-peer history or mutate read state.
+  Runtime access starts only after the user explicitly activates monitoring.
+- First activation captures a frozen head for every exact peer, durably uploads
+  a baseline with no mention events, and only after its receiver receipt marks
+  existing unread messages through those heads as read. Historical mentions are
+  never forwarded.
+- Subsequent scans run about every 60 seconds. Native `message.mentioned` events
+  are detected locally without an LLM and contain only chat title, display sender,
+  timestamp, message ID, up to 300 UTF-16 units of text, and an exact link when
+  Telegram provides one.
+- A mention-bearing range is marked read only after a durable DO receipt. If Sunny
+  is unavailable, unread may remain temporarily. Scans use an ID cursor, so a new
+  post-activation mention is still forwarded if another Telegram client read it
+  before the next poll.
+- One daily OpenRouter call produces one combined Russian digest for all selected
+  chats. The monitor and digest hash/cursor chains are independent, so an LLM or
+  daily failure cannot stop frequent read handling.
 
 ## Security model
 
-Telegram does not let an API ID/hash or an authorized user session restrict
-itself to selected chats. The containment is therefore implemented locally and
-fail-closed:
+Telegram API credentials and a user StringSession cannot restrict themselves to
+specific chats. Containment is enforced locally and fails closed:
 
-- setup may enumerate dialogs exactly once; only groups/supergroups are shown.
-  It must finish in one uninterrupted one-hour monotonic lease; a collector
-  restart before chat lock fails closed and requires factory reset and login;
-- selection stores one exact `InputPeer` (`kind`, ID, access hash), deletes the
-  dialog list, and permanently locks the Telegram session to that peer without
-  reading selected-peer history. The contractual initial cursor is the sentinel `0`;
-- runtime never calls generic entity resolution, receives no push updates, and
-  never downloads media;
-- changing the account, chat, model, provider key, or receiver endpoint requires
-  factory reset, which first persists a blocking revocation marker, then signals
-  cancellation, attempts Telegram logout, and deletes all local credentials, keys,
-  and their exact crash-temporary files. If Telegram does not confirm logout, a
-  persistent UI warning blocks new setup until the device is terminated manually
-  and that action is acknowledged;
-- consent expires after at most 90 days. Renewal can only extend consent for the
-  already locked peer; it cannot change any credential or endpoint. The
-  authenticated receiver clock is checked after the gate, so a slow Umbrel
-  clock cannot extend an expired consent window;
-- each run asks Sunny's authenticated `status-v1` gate before Telegram or
-  OpenRouter. `due: false` means neither service is contacted;
-- the first due run derives its 72-hour lower boundary from authenticated
-  receiver `server_time`, not the Umbrel clock or setup time, and also filters
-  every row by that exact timestamp before it can enter the prompt;
-- raw chat text exists only in collector memory. The only durable content is an
-  exact final upload payload awaiting acknowledgement. Sender and message IDs are
-  replaced with prompt-local `participant-N` labels before OpenRouter;
-- every OpenRouter request requires Zero Data Retention and rejects data-collecting
-  providers with `provider.zdr=true` and `provider.data_collection=deny`;
-- after an accepted upload, an atomic local checkpoint records the sequence, hash,
-  cursor, and date before pending bytes are deleted. A rolled-back or jumped Sunny
-  receiver state is rejected before Telegram is contacted;
-- SSH uses a dedicated generated Ed25519 key, exact pinned `known_hosts`, a
-  literal `status-v1`/`upload-v1` remote command, and no forwarding or password
-  fallback.
+- dialog enumeration is setup-only; the setup must finish within one continuous
+  one-hour monotonic lease. A collector restart before chat lock requires factory
+  reset and a fresh Telegram login;
+- locked settings store exact `InputPeer` values. Runtime never calls generic
+  entity resolution, receives no push updates, and never downloads media;
+- every runtime tick first obtains authenticated `status-v2` from the forced-command
+  receiver. Without a valid gate there is no Telegram scan, read acknowledgement,
+  or OpenRouter request;
+- a watcher cycle shares one Telegram connection across every selected peer and
+  one connection for batched read acknowledgements; one broken peer does not block
+  healthy peers;
+- the first daily run derives each 72-hour lower boundary from authenticated
+  receiver `server_time`, not the Umbrel wall clock. Later runs continue independent
+  digest cursors without dropping accumulated backlog;
+- raw daily chat text exists only in collector memory and the ZDR OpenRouter
+  request. Every request sets `provider.zdr=true` and
+  `provider.data_collection=deny`;
+- bounded mention events are an explicit privacy exception: they are durable on
+  Umbrel while pending, in DO receiver/inbox/backups, and in Sunny's Telegram
+  outbox. Health/status never contains titles, snippets, digest text, phone,
+  credentials, or session data;
+- two independent sequence/hash/cursor chains reject rollback, gaps, equivocation,
+  and cross-stream confusion before Telegram read state advances;
+- SSH uses a dedicated generated Ed25519 key, an exact externally verified
+  `known_hosts` entry, literal `status-v2` / `monitor-upload-v2` /
+  `digest-upload-v2` commands, and no forwarding, PTY, user rc, or password fallback.
 
 Root access to the Umbrel host can still copy the live Telegram StringSession.
 Telegram 2FA protects authorization of a new client; it does not make a stolen
-authorized session harmless. If the host is suspected compromised, terminate
-the device named **Sunny Umbrel** in Telegram immediately.
+authorized session harmless. On suspected compromise terminate the device named
+**Sunny Umbrel** in Telegram immediately.
 
 ## Container boundary
 
@@ -63,85 +80,52 @@ Umbrel app_proxy (Umbrel login)
         │
         ▼
 web :8080 (second Basic Auth with APP_PASSWORD)
-        │  narrow JSON IPC over Unix socket
+        │ narrow JSON IPC over Unix socket
         ▼
-collector ── Telegram exact InputPeer
-    │      ├── OpenRouter (selected text, only when due)
+collector ── exact Telegram peers
+    │      ├── OpenRouter ZDR (daily raw text only)
     │      └── SSH forced-command receiver
     │
-    ├── /data/config   settings, known_hosts, ACK checkpoint, pending final payload
-    ├── /data/private  Telegram session, API/provider/upload keys
+    ├── /data/config   locked settings, checkpoints, pending final payloads
+    ├── /data/private  Telegram session and provider/uploader credentials
     └── /data/runtime  socket, redacted status, heartbeat
 ```
 
-`web` mounts only `data/runtime`. During setup, credentials necessarily transit
-through its authenticated form and Unix-socket client, but it never writes them
-and never mounts `data/config` or `data/private`. Status contains no provider
-keys, session data, raw messages, known-host key, or private upload key.
+`web` mounts only `data/runtime`. Credentials necessarily transit through its
+authenticated forms and Unix-socket client during setup, but the web container
+does not mount or write `data/config` or `data/private`.
 
-Umbrel backups exclude `data/private`, `data/runtime`, the exact pending payload,
-and its atomic crash-temporary files. Config metadata includes a non-secret
-`telegram-session-outstanding` marker that is durably armed before the first
-Telegram authorization request. After a config-only restore the missing session
-plus that marker creates a blocking warning: terminate/verify **Sunny Umbrel** in
-Telegram Settings → Devices, acknowledge that remote action in the UI, and only
-then provision a fresh Telegram authorization, OpenRouter key, upload key, and
-receiver binding. Never reuse restored chain metadata as a new credential epoch.
+Umbrel backups exclude `data/private`, `data/runtime`, both pending payloads, and
+their crash-temporary files. Config retains a non-secret outstanding-session marker.
+After a config-only restore, terminate or verify the old **Sunny Umbrel** device in
+Telegram, acknowledge that action in the UI, and provision a fresh credential epoch.
 
 ## Provisioning
 
-Provision in this order:
+1. Create Telegram application credentials at `my.telegram.org`.
+2. Create a dedicated OpenRouter key with a small spending limit. Disable account
+   input/output logging and opt-in use of prompts, and narrow the key/model/provider
+   allowlist as far as practical.
+3. Obtain the DO Ed25519 SSH host-key line through an independent trusted channel.
+   Never bootstrap trust with `ssh-keyscan` on the Umbrel.
+4. Complete the public repository/image release gate below.
+5. Install **Sunny Personal Chats** from the Community App Store. The additional
+   username is `sunny`; Umbrel displays the deterministic app password.
+6. Enter Telegram/OpenRouter/SSH settings and consent. Consent explicitly covers
+   daily selected-chat text sent to ZDR OpenRouter, bounded native-mention events
+   sent to Sunny, and read acknowledgements visible on every Telegram client.
+7. Finish Telegram login, enumerate groups once, select 1–16 checkboxes, and lock
+   the exact set within the same one-hour collector process.
 
-1. Create Telegram application credentials at `my.telegram.org`. These identify
-   the client application but do **not** limit which chats the user session can
-   access.
-2. Create a dedicated OpenRouter key with a small spending limit. Do not reuse a
-   general-purpose account key. Also disable input/output logging and opt-in use
-   of prompts in the account, and restrict the key/model/provider set as narrowly
-   as practical; the app independently forces ZDR and rejects data collection on
-   every request.
-3. Obtain the DO Ed25519 SSH host-key line through a trusted channel. Never
-   bootstrap trust with `ssh-keyscan` from the Umbrel.
-4. Publish the collector image and complete the release gate below.
-5. Add the public Community App Store URL in Umbrel, then install
-   `Sunny Personal Digest`. The additional username is `sunny`; the password is
-   the deterministic app password shown by Umbrel.
-6. Complete Telegram setup and lock the exact group within one uninterrupted
-   hour. If collector restarts before lock, factory-reset and log in again. Then
-   use the displayed public bootstrap values to install Sunny's forced-command
-   receiver binding. Until this binding exists, the app fails closed before
-   Telegram runtime access.
+The UI then displays only public bootstrap data: source UUID, locked chat IDs/titles,
+uploader public key/fingerprint, and endpoint metadata. It never displays the private
+key or session. Do not activate monitoring until the receiver and Sunny `chats` topic
+are ready. Changing the selection, model, endpoint, or credentials requires factory
+reset and a new receiver generation.
 
-The setup UI collects API credentials, receiver host/port, the exact pinned
-`known_hosts` line, and a consent expiration. SSH login is deliberately fixed to
-`root`, matching the installer-owned `/root/.ssh/authorized_keys`; its forced
-command immediately executes the receiver as the dedicated non-root service
-user. Telegram sends a login code and, when enabled, asks for the 2FA password.
-
-After login, open the dialog list once and select the pilot group. The UI then
-shows a canonical source UUID, `chat_id`, contractual `initial_message_id=0`,
-upload public key, and fingerprint. `0` is a receiver-chain sentinel, not a read
-of Telegram history. Register exactly that public key in Sunny's receiver
-configuration. Until the server binding is installed, runs fail closed before
-Telegram access because the authenticated status request cannot succeed.
-
-On the first authenticated due run, the collector asks the exact peer for the
-newest message strictly before `receiver server_time - 72 hours`. It uses the
-newer of that boundary cursor and the receiver cursor, while the upload preserves
-the receiver's contractual `from_message_id_exclusive`. Rows older than the exact
-time boundary are filtered even if Telegram IDs are anomalous. No raw bootstrap
-messages are stored. Daily scans use a server-issued cutoff snapshot and a
-deterministic 96 KiB prompt budget; text not included stays behind the cursor for
-a later due run. Media/service-only events can advance the cursor without an
-OpenRouter request. Because peer access is first exercised at that due run, a
-stale/revoked access hash may surface only after lock and then requires factory
-reset.
-
-After the UI has shown the public bootstrap values, stop the Umbrel app and verify
-the collector is no longer running before applying the DO receiver binding. Keep
-it stopped throughout `--apply`; only after apply succeeds, explicitly start the
-app. Starting arms the scheduler after its initial delay and may immediately read
-Telegram and call OpenRouter when the authenticated gate says `due: true`.
+On explicit activation, baseline upload precedes every read acknowledgement. If the
+daily gate is already due, the same runtime cycle may immediately scan up to the
+trusted 72-hour boundary and call OpenRouter.
 
 ## Local verification
 
@@ -161,9 +145,8 @@ Docker is required for the production image check:
 docker build --platform linux/amd64 -t sunny-personal-digest:local .
 ```
 
-The real web path can be rendered without Telegram credentials by running a
-separate read-only fake IPC fixture. This is not a production/demo bypass:
-production code still connects to the configured Unix socket.
+The real web path can be rendered without credentials with the test-only fake IPC
+fixture. Production code still requires the configured Unix socket.
 
 ```bash
 tmpdir="$(mktemp -d)"
@@ -177,46 +160,52 @@ PYTHONPATH=src python3 -m sunny_digest.main web
 ```
 
 Open `http://127.0.0.1:18080/` and authenticate as `sunny` / `test-only`.
-Use `--phase dialogs_listed` or `--phase chat_locked` for the other screens.
+Use the fixture phases to inspect login, multi-select, locked, and activation screens.
 
 ## Two-phase GitHub/GHCR release
 
-The target public repository is
-`https://github.com/ivankozlov/sunny-umbrel-app-store`. Both that repository and
-`ghcr.io/ivankozlov/sunny-personal-digest` must be public so Umbrel can clone and
+The target repository is
+`https://github.com/ivankozlov/sunny-umbrel-app-store`. Both the repository and
+`ghcr.io/ivankozlov/sunny-personal-digest` must be public so umbrelOS can clone and
 pull without registry credentials.
 
-1. Push this directory as the repository root. Keep the disabled manifest and
-   digest placeholder.
-2. Protect the `ghcr-release` GitHub Environment with branch `main` and Ivan as
-   required reviewer. For the first and only package bootstrap, run the pinned
-   `Publish image` workflow with version `0.1.0` and
-   `bootstrap_empty_package=true`; for `0.1.1` and every later run that input must
-   remain `false`.
-   The publish job itself is also restricted to `main`. It runs all offline gates,
-   refuses to overwrite an existing version tag, builds both
-   supported architectures, pushes the tag, emits an SBOM/provenance
-   attestation, and prints the immutable manifest digest. Tags are normally
-   mutable registry references; the workflow guard and digest pin are both
-   intentional protections. GitHub Actions, QEMU, Buildx, and BuildKit inputs are
-   pinned; the privileged QEMU/BuildKit helper images use immutable OCI digests.
-3. Confirm the GHCR package is public and inspect the manifest architectures.
-4. Replace the whole `sha256:RELEASE_GATE_MULTIARCH_DIGEST` fragment in both
-   Compose services with the exact workflow output `sha256:<64 hex>`, set
-   `disabled: false`, and keep manifest/image/runtime versions in lockstep.
-5. Run `python3 scripts/check_package.py --release`. Only then push the enabling
-   commit and add the repository URL as an Umbrel Community App Store.
+1. Push a disabled `0.2.0` source commit with the digest placeholder.
+2. Run the pinned `Publish image` workflow from `main` through the protected
+   `ghcr-release` Environment. `bootstrap_empty_package=true` remains permanently
+   limited to the original `0.1.0`; it must be false for `0.2.0`.
+3. Verify the public OCI index contains `linux/amd64` and `linux/arm64`.
+4. Pin the exact workflow digest in both Compose services, set `disabled: false`,
+   and keep manifest/image/runtime versions in lockstep.
+5. Run `python3 scripts/check_package.py --release` before the enabling commit.
 
-Never use a mutable tag without a digest, enable the app before the image is
-public, or let a workflow rewrite the manifest automatically.
+Never overwrite a version tag, use a mutable tag without its digest, or enable the
+app before both the repository and image are public.
+
+## Rollout boundary
+
+Topic creation, public release, physical Umbrel installation, receiver `--apply`,
+Sunny deployment, and activation are separate externally visible or persistent
+actions. Each needs its own explicit approval. Activation intentionally clears the
+existing unread baseline and can trigger a due daily request immediately.
+
+After activation, create one **new** real mention for the smoke test. Verify durable
+receiver receipt before read disappearance, delivery to the Sunny topic **Чаты**, no
+duplicate after retry, independent monitor/digest health, and then the first combined
+daily digest.
 
 ## Incident response
 
-Use **Factory reset / отзыв доступа** in the UI when possible. It cancels local
-work after first persisting a blocking revocation marker, but cannot retract a
-request that OpenRouter already received. If the
-UI reports unconfirmed Telegram logout, terminate **Sunny Umbrel** under Telegram
-Settings → Devices and explicitly acknowledge that manual action before setup is
-allowed again. For suspected host compromise, follow [SECURITY.md](SECURITY.md):
-revoke the Telegram session, stop the app, remove the upload key server-side,
-revoke the OpenRouter key, and reprovision from scratch.
+Use **Factory reset / revoke access** in the UI when possible. It persists a blocking
+revocation marker, cancels local work, attempts Telegram logout, and deletes local
+credentials and exact crash-temporary files. If logout is unconfirmed, terminate
+**Sunny Umbrel** in Telegram Settings → Devices before provisioning again.
+
+For suspected host compromise:
+
+1. terminate the Telegram device;
+2. revoke the dedicated OpenRouter key;
+3. revoke the dedicated DO uploader key and disable its receiver gate;
+4. stop and investigate the Umbrel, then reprovision with a new source/key epoch.
+
+Changing the Telegram 2FA password alone does not revoke an active MTProto session.
+See [SECURITY.md](SECURITY.md) and the private Sunny runbook for disable/rotation details.

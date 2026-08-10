@@ -141,6 +141,14 @@ class Paths:
         return self.config_dir / "acknowledged.json"
 
     @property
+    def monitor_pending(self) -> Path:
+        return self.config_dir / "pending-monitor-upload.json"
+
+    @property
+    def watch_state(self) -> Path:
+        return self.config_dir / "watch-state.json"
+
+    @property
     def revocation_warning(self) -> Path:
         return self.config_dir / "revocation-warning.json"
 
@@ -190,6 +198,8 @@ class Paths:
             self.known_hosts,
             self.pending,
             self.acknowledged,
+            self.monitor_pending,
+            self.watch_state,
             self.credentials,
             self.telegram_session,
             self.setup_state,

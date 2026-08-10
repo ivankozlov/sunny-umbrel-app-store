@@ -7,11 +7,13 @@ from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from .contracts import (
-    canonical_upload_bytes,
+    canonical_digest_bytes,
+    canonical_monitor_bytes,
     status_request,
     validate_gate,
     validate_receipt,
-    validate_upload,
+    validate_digest_upload,
+    validate_monitor_upload,
 )
 from .storage import Paths
 
@@ -108,7 +110,7 @@ class SSHTransport:
         self.user = upload["user"]
 
     def _args(self, command: str) -> list[str]:
-        if command not in ("status-v1", "upload-v1"):
+        if command not in ("status-v2", "monitor-upload-v2", "digest-upload-v2"):
             raise ValueError("unsupported receiver command")
         return [
             "ssh", "-F", "/dev/null", "-T",
@@ -169,7 +171,7 @@ class SSHTransport:
             await asyncio.gather(cancelled, return_exceptions=True)
         if revoked.is_set():
             # Receipt may already be durable remotely. Keep pending bytes and let the
-            # next status-v1 query reconcile the chain.
+            # next status-v2 query reconcile the independent stream chain.
             raise asyncio.CancelledError
         if process.returncode != 0:
             raise RuntimeError("SSH forced command failed")
@@ -181,19 +183,39 @@ class SSHTransport:
             raise RuntimeError("SSH response root is not an object")
         return value
 
-    async def gate(self, source_id: str, chat_id: int, revoked: asyncio.Event) -> Dict[str, Any]:
-        request = status_request(source_id, chat_id)
-        return validate_gate(await self._exchange("status-v1", request, revoked))
+    async def gate(self, source_id: str, chat_ids: list[int],
+                   revoked: asyncio.Event) -> Dict[str, Any]:
+        request = status_request(source_id, chat_ids)
+        return validate_gate(
+            await self._exchange("status-v2", request, revoked), chat_ids)
 
-    async def upload(self, pending_bytes: bytes, revoked: asyncio.Event) -> Dict[str, Any]:
+    async def _upload(self, pending_bytes: bytes, revoked: asyncio.Event,
+                      stream: str) -> Dict[str, Any]:
         try:
             upload = json.loads(pending_bytes.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             raise RuntimeError("pending upload is invalid") from None
         if not isinstance(upload, dict):
             raise RuntimeError("pending upload is invalid")
-        validate_upload(upload)
-        if canonical_upload_bytes(upload) != pending_bytes:
+        if stream == "monitor":
+            validate_monitor_upload(upload)
+            canonical = canonical_monitor_bytes(upload)
+            command = "monitor-upload-v2"
+        elif stream == "digest":
+            validate_digest_upload(upload)
+            canonical = canonical_digest_bytes(upload)
+            command = "digest-upload-v2"
+        else:
+            raise ValueError("unsupported upload stream")
+        if canonical != pending_bytes:
             raise RuntimeError("pending upload bytes are not canonical")
-        receipt = await self._exchange("upload-v1", pending_bytes, revoked)
-        return validate_receipt(receipt, upload)
+        receipt = await self._exchange(command, pending_bytes, revoked)
+        return validate_receipt(receipt, upload, stream)
+
+    async def upload_monitor(self, pending_bytes: bytes,
+                             revoked: asyncio.Event) -> Dict[str, Any]:
+        return await self._upload(pending_bytes, revoked, "monitor")
+
+    async def upload_digest(self, pending_bytes: bytes,
+                            revoked: asyncio.Event) -> Dict[str, Any]:
+        return await self._upload(pending_bytes, revoked, "digest")

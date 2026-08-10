@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from .models import SelectedMessage
+from .models import DigestChat, SelectedMessage
 from .storage import canonical_json_bytes
 from .version import MAX_PROMPT_BYTES, PROMPT_VERSION
 
@@ -18,34 +18,56 @@ PROMPT_PREFIX = (
 )
 
 
-def message_row_bytes(message: SelectedMessage, sender_label: str) -> bytes:
-    return canonical_json_bytes({
+def message_row_bytes(message: SelectedMessage, sender_label: str,
+                      chat_title: Optional[str] = None) -> bytes:
+    row = {
         # Numeric Telegram sender/message IDs are not needed by the model.
         # An encounter-order alias preserves conversational attribution without
         # exporting stable account identifiers to OpenRouter.
         "sender": sender_label,
         "sent_at": message.sent_at.isoformat(),
         "text": message.text,
-    })
+    }
+    if chat_title is not None:
+        row["chat"] = chat_title
+    return canonical_json_bytes(row)
 
 
-def _rows(messages: List[SelectedMessage]) -> List[bytes]:
+def _rows(messages: List[SelectedMessage], chat_title: Optional[str] = None) -> List[bytes]:
     labels: Dict[Optional[int], str] = {}
     rows = []
     for message in messages:
         if message.sender_id not in labels:
             labels[message.sender_id] = f"participant-{len(labels) + 1}"
-        rows.append(message_row_bytes(message, labels[message.sender_id]))
+        rows.append(message_row_bytes(
+            message, labels[message.sender_id], chat_title,
+        ))
     return rows
 
 
-def prompt_size(messages: List[SelectedMessage]) -> int:
-    rows = _rows(messages)
+def prompt_size(messages: List[SelectedMessage], chat_title: Optional[str] = None) -> int:
+    rows = _rows(messages, chat_title)
     return len(PROMPT_PREFIX.encode("utf-8")) + sum(map(len, rows)) + max(0, len(rows) - 1)
 
 
 def render_prompt(messages: List[SelectedMessage]) -> str:
     rows = _rows(messages)
+    raw = PROMPT_PREFIX.encode("utf-8") + b"\n".join(rows)
+    if len(raw) > MAX_PROMPT_BYTES:
+        raise ValueError("prompt exceeds bounded input size")
+    return raw.decode("utf-8")
+
+
+def render_digest_prompt(chats: List[DigestChat]) -> str:
+    rows: List[bytes] = []
+    for chat in chats:
+        labels: Dict[Optional[int], str] = {}
+        for message in chat.messages:
+            if message.sender_id not in labels:
+                labels[message.sender_id] = f"participant-{len(labels) + 1}"
+            rows.append(message_row_bytes(
+                message, labels[message.sender_id], chat.title,
+            ))
     raw = PROMPT_PREFIX.encode("utf-8") + b"\n".join(rows)
     if len(raw) > MAX_PROMPT_BYTES:
         raise ValueError("prompt exceeds bounded input size")

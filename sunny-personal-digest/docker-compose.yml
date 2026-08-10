@@ -7,7 +7,7 @@ services:
       APP_PORT: 8080
 
   web:
-    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.1.1@sha256:RELEASE_GATE_MULTIARCH_DIGEST
+    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.2.0@sha256:RELEASE_GATE_MULTIARCH_DIGEST
     command: ["web"]
     user: "1000:1000"
     init: true
@@ -36,7 +36,7 @@ services:
       timeout: 5s
       retries: 3
   collector:
-    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.1.1@sha256:RELEASE_GATE_MULTIARCH_DIGEST
+    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.2.0@sha256:RELEASE_GATE_MULTIARCH_DIGEST
     command: ["collector"]
     user: "1000:1000"
     init: true
@@ -56,7 +56,7 @@ services:
       SUNNY_PRIVATE_DIR: /data/private
       SUNNY_RUNTIME_DIR: /data/runtime
       SUNNY_IPC_SOCKET: /data/runtime/control.sock
-      SUNNY_COLLECT_INTERVAL_S: 300
+      SUNNY_COLLECT_INTERVAL_S: 60
     volumes:
       - ${APP_DATA_DIR}/data/config:/data/config
       - ${APP_DATA_DIR}/data/private:/data/private

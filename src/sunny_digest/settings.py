@@ -6,15 +6,20 @@ import ipaddress
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from .contracts import parse_utc, utc_iso
-from .models import PeerSpec
+from .models import PeerSpec, validate_chat_title
 from .storage import Paths, atomic_write_bytes, atomic_write_json, read_json
+from .version import MAX_SELECTED_CHATS
 
 
-SETTINGS_SCHEMA = "sunny.personal-digest-settings.v1"
-CREDENTIALS_SCHEMA = "sunny.personal-digest-credentials.v1"
+SETTINGS_SCHEMA = "sunny.personal-chats.settings.v2"
+CREDENTIALS_SCHEMA = "sunny.personal-chats.credentials.v2"
+CONSENT_SCOPE = (
+    "selected-groups-daily-text-to-zdr-openrouter-native-mention-title-sender-"
+    "link-snippet-300-durable-sunny-and-telegram-read-acks"
+)
 MAX_CONSENT_DAYS = 90
 _HOST = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{1,158}$")
@@ -102,7 +107,7 @@ def validate_configure(value: Dict[str, Any], now: datetime) -> tuple[Dict[str, 
         "openrouter_model": model,
         "upload": {"host": host, "port": port, "user": user},
         "consent": {
-            "scope": "one-exact-chat-text-and-captions",
+            "scope": CONSENT_SCOPE,
             "granted_at": utc_iso(current),
             "expires_at": utc_iso(expires),
         },
@@ -131,8 +136,7 @@ def load_settings(paths: Paths) -> Dict[str, Any]:
         "schema", "phase", "chat_locked", "openrouter_model", "upload", "consent",
     }
     locked_keys = {
-        "source_id", "chat_id", "chat_title", "peer", "initial_message_id",
-        "upload_public_key", "upload_key_fingerprint",
+        "source_id", "chats", "upload_public_key", "upload_key_fingerprint",
     }
     expected = base_keys | locked_keys if value.get("chat_locked") is True else base_keys
     if set(value) != expected:
@@ -160,7 +164,7 @@ def load_settings(paths: Paths) -> Dict[str, Any]:
         raise ValueError("settings consent is invalid")
     consent = value["consent"]
     if set(consent) != {"scope", "granted_at", "expires_at"} or consent[
-            "scope"] != "one-exact-chat-text-and-captions":
+            "scope"] != CONSENT_SCOPE:
         raise ValueError("settings consent is invalid")
     granted = parse_utc(consent["granted_at"], "consent granted_at")
     expires = parse_utc(consent["expires_at"], "consent expires_at")
@@ -171,23 +175,13 @@ def load_settings(paths: Paths) -> Dict[str, Any]:
     if value["chat_locked"]:
         if value["phase"] != "chat_locked":
             raise ValueError("locked settings phase is invalid")
-        peer = PeerSpec.from_dict(value["peer"])
-        if type(value["chat_id"]) is not int or not -(2**63) <= value["chat_id"] < 0:
-            raise ValueError("locked chat_id is invalid")
-        if value["chat_id"] != peer.telegram_chat_id():
-            raise ValueError("locked chat_id does not match peer")
+        validate_locked_chats(value["chats"])
         try:
             canonical_source = str(uuid.UUID(value["source_id"]))
         except (ValueError, TypeError, AttributeError):
             raise ValueError("locked source_id is invalid") from None
         if canonical_source != value["source_id"]:
             raise ValueError("locked source_id is invalid")
-        if type(value["initial_message_id"]) is not int or not (
-                0 <= value["initial_message_id"] <= 2**63 - 1):
-            raise ValueError("initial cursor is invalid")
-        if (not isinstance(value["chat_title"], str) or not value["chat_title"]
-                or len(value["chat_title"]) > 160):
-            raise ValueError("locked chat title is invalid")
         if (not isinstance(value["upload_public_key"], str)
                 or not value["upload_public_key"].startswith("ssh-ed25519 ")
                 or len(value["upload_public_key"]) > 1024):
@@ -220,7 +214,7 @@ def load_credentials(paths: Paths) -> Dict[str, Any]:
 
 def consent_active(settings: Dict[str, Any], now: datetime) -> bool:
     consent = settings.get("consent")
-    if not isinstance(consent, dict) or consent.get("scope") != "one-exact-chat-text-and-captions":
+    if not isinstance(consent, dict) or consent.get("scope") != CONSENT_SCOPE:
         return False
     try:
         granted = parse_utc(consent.get("granted_at"), "consent_granted_at")
@@ -232,6 +226,34 @@ def consent_active(settings: Dict[str, Any], now: datetime) -> bool:
         granted <= current < expires
         and expires - granted <= timedelta(days=MAX_CONSENT_DAYS)
     )
+
+
+def validate_locked_chats(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_SELECTED_CHATS:
+        raise ValueError("locked chats must contain 1 to 16 entries")
+    validated: List[Dict[str, Any]] = []
+    previous: int | None = None
+    for row in value:
+        if not isinstance(row, dict) or set(row) != {
+                "chat_id", "title", "peer", "initial_message_id"}:
+            raise ValueError("locked chat has unexpected fields")
+        chat_id = row["chat_id"]
+        if type(chat_id) is not int or not -(2**63) <= chat_id < 0:
+            raise ValueError("locked chat_id is invalid")
+        if previous is not None and chat_id <= previous:
+            raise ValueError("locked chats must be unique and sorted")
+        previous = chat_id
+        if not isinstance(row["peer"], dict):
+            raise ValueError("locked peer is invalid")
+        peer = PeerSpec.from_dict(row["peer"])
+        if chat_id != peer.telegram_chat_id():
+            raise ValueError("locked chat_id does not match peer")
+        validate_chat_title(row["title"])
+        if type(row["initial_message_id"]) is not int or row[
+                "initial_message_id"] != 0:
+            raise ValueError("initial cursor must be zero")
+        validated.append(row)
+    return validated
 
 
 def save_initial_config(paths: Paths, settings: Dict[str, Any], credentials: Dict[str, Any],

@@ -1,4 +1,4 @@
-# Sunny Personal Digest — contributor rules
+# Sunny Personal Chats — contributor rules
 
 This directory is designed to become the root of the public
 `ivankozlov/sunny-umbrel-app-store` repository. It must contain no production
@@ -7,9 +7,10 @@ runtime configuration.
 
 ## Security invariants
 
-- Runtime reads one immutable `InputPeer`. Dialog enumeration is setup-only and
-  is permanently disabled for an authorized session after chat selection.
-- Changing the Telegram account, selected chat, OpenRouter key/model, or upload
+- Runtime reads one immutable set of 1–16 exact group/supergroup `InputPeer`
+  values. Dialog enumeration is setup-only and is permanently disabled for an
+  authorized session after chat selection.
+- Changing the Telegram account, selected chats, OpenRouter key/model, or upload
   endpoint requires factory reset. Before its first await, reset persists a
   blocking revocation warning; it then cancels active work, attempts Telegram
   logout, and deletes the local session, credentials, and their exact atomic
@@ -22,22 +23,35 @@ runtime configuration.
 - The web service never mounts `data/private` or `data/config`. Setup credentials
   necessarily transit its authenticated form and memory, but it does not persist
   them; its only disk view is redacted runtime state and the narrow Unix socket.
-- No raw Telegram text is written to disk or logs. The only durable content is
-  the final bounded upload payload, kept byte-for-byte until acknowledged.
-- Accepted sequence/hash/cursor/date is checkpointed locally before pending bytes
-  are deleted. Receiver rollback or chain jumps must fail before Telegram access.
-- Every run obtains `due: true` from the remote gate before Telegram or
-  OpenRouter access. Consent is checked locally before the gate and against the
-  receiver's authenticated clock immediately afterwards, then again before and
-  after fetch/LLM and immediately before/during SSH upload. A slow or skewed
-  Umbrel clock must never extend consent.
+- Daily source text is never written to disk or logs. A native mention may create
+  one explicitly consented durable event containing only its chat title, sender
+  display name, link and a sanitized snippet of at most 300 UTF-16 units. The
+  exact pending event is retained until receiver acknowledgement; no media is
+  downloaded and stable sender IDs never leave Umbrel.
+- Accepted monitor and digest sequence/hash/cursor state is checkpointed locally
+  before pending bytes are deleted. Receiver rollback or chain jumps must fail
+  before Telegram access. The two streams remain independent so a failed daily
+  digest cannot block mention delivery or read acknowledgements.
+- Every minute run obtains an authenticated remote monitor gate before Telegram
+  access. OpenRouter and the daily history scan additionally require
+  `digest.due: true`. Consent is checked locally before the gate and against the
+  receiver's authenticated clock immediately afterwards, then again around each
+  external operation. A slow or skewed Umbrel clock must never extend consent.
 - Pre-lock setup is bound to one uninterrupted one-hour monotonic lease. A
   collector restart before chat lock invalidates that lease and must require
   factory reset and a new Telegram login.
-- Chat selection must not read selected-peer history: it stores the contractual
-  `initial_message_id=0`. Only the first authenticated due gate derives the
-  72-hour lower boundary from receiver `server_time`, with an exact per-row time
-  filter before any text reaches OpenRouter.
+- Chat selection must not read selected-peer history: every selected chat stores
+  contractual `initial_message_id=0`. An explicit first activation snapshots the
+  exact current heads, durably uploads a content-free baseline, and only after its
+  receiver receipt clears existing unread state. Historical mentions are never
+  exported. The first authenticated daily due gate independently derives the
+  72-hour lower boundary per chat from receiver `server_time`, with an exact
+  per-row time filter before any text reaches OpenRouter.
+- After activation, the watcher scans every message ID after its own frozen
+  cursor and detects mentions only from Telegram's native `mentioned` flag. A
+  mention-bearing range is marked read only after its event batch has a durable
+  receiver receipt; a no-mention range is checkpointed locally before read-ACK.
+  Read-ACK always uses the exact peer and a bounded `max_id`.
 - Every OpenRouter request must set `provider.zdr=true` and
   `provider.data_collection=deny`; account/key privacy controls remain defence
   in depth and may not replace the per-request guard.

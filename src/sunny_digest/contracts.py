@@ -4,64 +4,57 @@ import hashlib
 import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .storage import canonical_json_bytes
 from .version import (
     COLLECTOR_VERSION,
+    DIGEST_UPLOAD_SCHEMA,
     GATE_SCHEMA,
     MAX_DIGEST_CHARS,
+    MAX_MENTION_EVENTS,
+    MAX_MENTION_SNIPPET_UTF16,
+    MAX_SELECTED_CHATS,
     MAX_UPLOAD_BYTES,
+    MONITOR_UPLOAD_SCHEMA,
     PROMPT_VERSION,
+    RECEIPT_SCHEMA,
     STATUS_REQUEST_SCHEMA,
-    UPLOAD_SCHEMA,
 )
 
 
-UPLOAD_KEYS = (
-    "schema",
-    "source_id",
-    "sequence",
-    "previous_sha256",
-    "digest_date",
-    "timezone",
-    "generated_at",
-    "cutoff_at",
-    "chat_id",
-    "from_message_id_exclusive",
-    "through_message_id",
-    "message_count",
-    "empty",
-    "digest",
-    "model",
-    "prompt_version",
-    "collector_version",
+CURSOR_KEYS = ("chat_id", "through_message_id")
+RANGE_KEYS = (
+    "chat_id", "from_message_id_exclusive", "through_message_id",
+)
+DIGEST_RANGE_KEYS = RANGE_KEYS + ("message_count",)
+EVENT_KEYS = (
+    "event_id", "message_id", "date", "chat_title", "sender", "snippet",
+    "link",
+)
+MONITOR_UPLOAD_KEYS = (
+    "schema", "source_id", "sequence", "previous_sha256", "kind",
+    "generated_at", "ranges", "events", "collector_version",
     "content_sha256",
 )
-
-GATE_KEYS = (
-    "schema",
-    "ok",
-    "due",
-    "reason",
-    "server_time",
-    "timezone",
-    "digest_date",
-    "prepare_not_before",
-    "accept_until",
-    "next_sequence",
-    "previous_sha256",
-    "from_message_id_exclusive",
+DIGEST_UPLOAD_KEYS = (
+    "schema", "source_id", "sequence", "previous_sha256", "digest_date",
+    "timezone", "generated_at", "cutoff_at", "chat_ranges",
+    "total_message_count", "empty", "digest", "model", "prompt_version",
+    "collector_version", "content_sha256",
+)
+GATE_KEYS = ("schema", "ok", "server_time", "timezone", "monitor", "digest")
+MONITOR_GATE_KEYS = (
+    "baseline_required", "next_sequence", "previous_sha256", "cursors",
     "max_upload_bytes",
 )
-
+DIGEST_GATE_KEYS = (
+    "due", "reason", "digest_date", "prepare_not_before", "accept_until",
+    "next_sequence", "previous_sha256", "cursors", "max_upload_bytes",
+)
 RECEIPT_KEYS = (
-    "ok",
-    "status",
-    "sequence",
-    "content_sha256",
+    "schema", "ok", "status", "stream", "sequence", "content_sha256",
     "received_at",
-    "through_message_id",
 )
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -87,6 +80,39 @@ def _source_id(value: Any) -> str:
         raise ValueError("source_id is invalid") from None
     if parsed != value:
         raise ValueError("source_id is invalid")
+    return value
+
+
+def _chat_id(value: Any, label: str = "chat_id") -> int:
+    if type(value) is not int or not -(2**63) <= value < 0:
+        raise ValueError(f"{label} is invalid")
+    return value
+
+
+def _message_id(value: Any, label: str) -> int:
+    if type(value) is not int or not 0 <= value <= 2**63 - 1:
+        raise ValueError(f"{label} is invalid")
+    return value
+
+
+def _utf16_units(value: str, label: str) -> int:
+    try:
+        return len(value.encode("utf-16-le")) // 2
+    except UnicodeEncodeError:
+        raise ValueError(f"{label} is invalid") from None
+
+
+def _safe_text(value: Any, label: str, *, maximum: int, allow_empty: bool) -> str:
+    if not isinstance(value, str) or "\r" in value:
+        raise ValueError(f"{label} is invalid")
+    if not allow_empty and not value.strip():
+        raise ValueError(f"{label} is empty")
+    if _utf16_units(value, label) > maximum:
+        raise ValueError(f"{label} is too long")
+    for char in value:
+        if ((ord(char) < 32 and char != "\n") or 127 <= ord(char) <= 159
+                or char in _BIDI_CONTROLS):
+            raise ValueError(f"{label} contains a forbidden control character")
     return value
 
 
@@ -129,49 +155,112 @@ def utc_iso(value: datetime) -> str:
         "+00:00", "Z")
 
 
-def status_request(source_id: str, chat_id: int) -> bytes:
+def _validate_chat_ids(chat_ids: Any, *, label: str = "chat_ids") -> List[int]:
+    if not isinstance(chat_ids, list) or not 1 <= len(chat_ids) <= MAX_SELECTED_CHATS:
+        raise ValueError(f"{label} must contain 1 to 16 entries")
+    result: List[int] = []
+    previous: Optional[int] = None
+    for value in chat_ids:
+        chat_id = _chat_id(value)
+        if previous is not None and chat_id <= previous:
+            raise ValueError(f"{label} must be unique and sorted")
+        previous = chat_id
+        result.append(chat_id)
+    return result
+
+
+def status_request(source_id: str, chat_ids: Sequence[int]) -> bytes:
     _source_id(source_id)
-    if type(chat_id) is not int or not -(2**63) <= chat_id < 0:
-        raise ValueError("chat_id is invalid")
+    canonical_ids = _validate_chat_ids(list(chat_ids))
     return canonical_json_bytes({
         "schema": STATUS_REQUEST_SCHEMA,
         "source_id": source_id,
-        "chat_id": chat_id,
+        "chat_ids": canonical_ids,
         "collector_version": COLLECTOR_VERSION,
     }) + b"\n"
 
 
-def validate_gate(value: Dict[str, Any]) -> Dict[str, Any]:
+def _validate_hash_chain(value: Dict[str, Any], label: str) -> None:
+    sequence = value["next_sequence"]
+    if type(sequence) is not int or not 1 <= sequence <= 2**63 - 1:
+        raise ValueError(f"{label} next_sequence is invalid")
+    previous = value["previous_sha256"]
+    if sequence == 1:
+        if previous is not None:
+            raise ValueError(f"initial {label} previous_sha256 must be null")
+    elif not isinstance(previous, str) or not _HEX64.fullmatch(previous):
+        raise ValueError(f"{label} previous_sha256 is invalid")
+
+
+def _validate_cursors(value: Any, label: str) -> List[Dict[str, int]]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} cursors are invalid")
+    ids: List[int] = []
+    rows: List[Dict[str, int]] = []
+    for row in value:
+        if not isinstance(row, dict):
+            raise ValueError(f"{label} cursor is invalid")
+        _exact_keys(row, CURSOR_KEYS, f"{label} cursor")
+        chat_id = _chat_id(row["chat_id"])
+        through = _message_id(row["through_message_id"], "through_message_id")
+        ids.append(chat_id)
+        rows.append({"chat_id": chat_id, "through_message_id": through})
+    _validate_chat_ids(ids, label=f"{label} cursor chat_ids")
+    return rows
+
+
+def _validate_upload_limit(value: Any, label: str) -> None:
+    if type(value) is not int or not 1024 <= value <= MAX_UPLOAD_BYTES:
+        raise ValueError(f"{label} max_upload_bytes is invalid")
+
+
+def validate_gate(value: Dict[str, Any], expected_chat_ids: Optional[Sequence[int]] = None) -> Dict[str, Any]:
     _exact_keys(value, GATE_KEYS, "gate response")
     if value["schema"] != GATE_SCHEMA or value["ok"] is not True:
-        raise ValueError("gate response is not successful v1")
-    if not isinstance(value["due"], bool):
-        raise ValueError("gate due must be boolean")
-    if not isinstance(value["reason"], str) or len(value["reason"]) > 120:
-        raise ValueError("gate reason is invalid")
+        raise ValueError("gate response is not successful v2")
     parse_wire_utc(value["server_time"], "server_time")
-    for key in ("prepare_not_before", "accept_until"):
-        parse_utc(value[key], key)
     if (not isinstance(value["timezone"], str) or not 1 <= len(value["timezone"]) <= 64
             or not _TOKEN.fullmatch(value["timezone"])):
         raise ValueError("gate timezone is invalid")
-    _day(value["digest_date"], "gate digest_date")
-    if type(value["next_sequence"]) is not int or not (
-            1 <= value["next_sequence"] <= 2**63 - 1):
-        raise ValueError("gate next_sequence is invalid")
-    if type(value["from_message_id_exclusive"]) is not int or value[
-            "from_message_id_exclusive"] < 0 or value[
-                "from_message_id_exclusive"] > 2**63 - 1:
-        raise ValueError("gate cursor is invalid")
-    previous = value["previous_sha256"]
-    if value["next_sequence"] == 1:
-        if previous is not None:
-            raise ValueError("initial gate previous_sha256 must be null")
-    elif not isinstance(previous, str) or not _HEX64.fullmatch(previous):
-        raise ValueError("gate previous_sha256 is invalid")
-    if type(value["max_upload_bytes"]) is not int or not (
-            1024 <= value["max_upload_bytes"] <= MAX_UPLOAD_BYTES):
-        raise ValueError("gate max_upload_bytes is invalid")
+
+    monitor = value["monitor"]
+    if not isinstance(monitor, dict):
+        raise ValueError("monitor gate is invalid")
+    _exact_keys(monitor, MONITOR_GATE_KEYS, "monitor gate")
+    if not isinstance(monitor["baseline_required"], bool):
+        raise ValueError("monitor gate baseline_required must be boolean")
+    _validate_hash_chain(monitor, "monitor gate")
+    monitor_cursors = _validate_cursors(monitor["cursors"], "monitor gate")
+    _validate_upload_limit(monitor["max_upload_bytes"], "monitor gate")
+    if monitor["baseline_required"]:
+        if (monitor["next_sequence"] != 1
+                or monitor["previous_sha256"] is not None
+                or any(row["through_message_id"] != 0 for row in monitor_cursors)):
+            raise ValueError("required baseline must start at the zero monitor chain")
+    elif monitor["next_sequence"] == 1:
+        raise ValueError("monitor sequence one must require baseline")
+
+    digest = value["digest"]
+    if not isinstance(digest, dict):
+        raise ValueError("digest gate is invalid")
+    _exact_keys(digest, DIGEST_GATE_KEYS, "digest gate")
+    if not isinstance(digest["due"], bool):
+        raise ValueError("digest gate due must be boolean")
+    if not isinstance(digest["reason"], str) or len(digest["reason"]) > 120:
+        raise ValueError("digest gate reason is invalid")
+    _day(digest["digest_date"], "digest gate digest_date")
+    parse_utc(digest["prepare_not_before"], "prepare_not_before")
+    parse_utc(digest["accept_until"], "accept_until")
+    _validate_hash_chain(digest, "digest gate")
+    digest_cursors = _validate_cursors(digest["cursors"], "digest gate")
+    _validate_upload_limit(digest["max_upload_bytes"], "digest gate")
+
+    monitor_ids = [row["chat_id"] for row in monitor_cursors]
+    digest_ids = [row["chat_id"] for row in digest_cursors]
+    if monitor_ids != digest_ids:
+        raise ValueError("monitor and digest gates bind different chats")
+    if expected_chat_ids is not None and monitor_ids != list(expected_chat_ids):
+        raise ValueError("gate chat set does not match locked settings")
     return value
 
 
@@ -181,145 +270,284 @@ def content_hash(payload_without_hash: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json_bytes(payload_without_hash)).hexdigest()
 
 
-def validate_digest_text(value: Any, *, allow_empty: bool) -> str:
-    if not isinstance(value, str) or "\r" in value:
-        raise ValueError("digest is invalid")
-    try:
-        # Telegram's message limit is defined by the UTF-16 string length used
-        # by its clients/API, not Python's Unicode code-point count. Astral
-        # characters therefore consume two units.
-        utf16_units = len(value.encode("utf-16-le")) // 2
-    except UnicodeEncodeError:
-        raise ValueError("digest is invalid") from None
-    if utf16_units > MAX_DIGEST_CHARS:
-        raise ValueError("digest is invalid")
-    for char in value:
-        if ((ord(char) < 32 and char != "\n") or 127 <= ord(char) <= 159
-                or char in _BIDI_CONTROLS):
-            raise ValueError("digest contains a forbidden control character")
-    if not allow_empty and not value.strip():
-        raise ValueError("digest is empty")
+def mention_event_id(source_id: str, chat_id: int, message_id: int) -> str:
+    _source_id(source_id)
+    _chat_id(chat_id)
+    _message_id(message_id, "message_id")
+    return hashlib.sha256(f"{source_id}:{chat_id}:{message_id}".encode("utf-8")).hexdigest()
+
+
+def _validate_range(row: Any, label: str) -> Dict[str, int]:
+    if not isinstance(row, dict):
+        raise ValueError(f"{label} is invalid")
+    _exact_keys(row, RANGE_KEYS, label)
+    chat_id = _chat_id(row["chat_id"])
+    start = _message_id(row["from_message_id_exclusive"], "from_message_id_exclusive")
+    through = _message_id(row["through_message_id"], "through_message_id")
+    if through < start:
+        raise ValueError(f"{label} moved backwards")
+    return {
+        "chat_id": chat_id,
+        "from_message_id_exclusive": start,
+        "through_message_id": through,
+    }
+
+
+def _validate_event(event: Any, source_id: str, chat_id: int) -> Dict[str, Any]:
+    if not isinstance(event, dict):
+        raise ValueError("monitor event is invalid")
+    _exact_keys(event, EVENT_KEYS, "monitor event")
+    message_id = _message_id(event["message_id"], "event message_id")
+    if event["event_id"] != mention_event_id(source_id, chat_id, message_id):
+        raise ValueError("monitor event_id mismatch")
+    parse_wire_utc(event["date"], "event date")
+    _safe_text(event["chat_title"], "event chat_title", maximum=160, allow_empty=False)
+    _safe_text(event["sender"], "event sender", maximum=160, allow_empty=False)
+    _safe_text(
+        event["snippet"], "event snippet",
+        maximum=MAX_MENTION_SNIPPET_UTF16, allow_empty=True,
+    )
+    link = event["link"]
+    if chat_id <= -1_000_000_000_000:
+        expected_peer_id = -chat_id - 1_000_000_000_000
+        expected_link = f"https://t.me/c/{expected_peer_id}/{message_id}"
+        if link != expected_link:
+            raise ValueError("event link does not match supergroup chat_id")
+    elif link is not None:
+        raise ValueError("legacy group event link must be null")
+    return event
+
+
+def build_monitor_upload(
+    *, source_id: str, gate: Dict[str, Any], kind: str,
+    ranges: Sequence[Dict[str, int]], events: Sequence[Dict[str, Any]],
+    generated_at: datetime,
+) -> Dict[str, Any]:
+    validate_gate(dict(gate))
+    monitor = gate["monitor"]
+    payload: Dict[str, Any] = {
+        "schema": MONITOR_UPLOAD_SCHEMA,
+        "source_id": source_id,
+        "sequence": monitor["next_sequence"],
+        "previous_sha256": monitor["previous_sha256"],
+        "kind": kind,
+        "generated_at": utc_iso(generated_at),
+        "ranges": list(ranges),
+        "events": list(events),
+        "collector_version": COLLECTOR_VERSION,
+    }
+    payload["content_sha256"] = content_hash(payload)
+    validate_monitor_upload(payload)
+
+    remote = {row["chat_id"]: row["through_message_id"] for row in monitor["cursors"]}
+    if (kind == "baseline") != monitor["baseline_required"]:
+        raise ValueError("monitor kind disagrees with baseline_required")
+    if kind == "baseline" and [row["chat_id"] for row in ranges] != list(remote):
+        raise ValueError("baseline must cover every locked chat")
+    for row in ranges:
+        if remote.get(row["chat_id"]) != row["from_message_id_exclusive"]:
+            raise ValueError("monitor range does not start at receiver cursor")
+    return payload
+
+
+def validate_monitor_upload(value: Dict[str, Any]) -> Dict[str, Any]:
+    _exact_keys(value, MONITOR_UPLOAD_KEYS, "monitor upload")
+    if value["schema"] != MONITOR_UPLOAD_SCHEMA:
+        raise ValueError("monitor upload schema is invalid")
+    source_id = _source_id(value["source_id"])
+    sequence = value["sequence"]
+    if type(sequence) is not int or not 1 <= sequence <= 2**63 - 1:
+        raise ValueError("monitor sequence is invalid")
+    previous = value["previous_sha256"]
+    if sequence == 1:
+        if previous is not None:
+            raise ValueError("initial monitor previous_sha256 must be null")
+    elif not isinstance(previous, str) or not _HEX64.fullmatch(previous):
+        raise ValueError("monitor previous_sha256 is invalid")
+    kind = value["kind"]
+    if kind not in ("baseline", "mentions"):
+        raise ValueError("monitor kind is invalid")
+    parse_wire_utc(value["generated_at"], "generated_at")
+    if value["collector_version"] != COLLECTOR_VERSION:
+        raise ValueError("monitor collector_version is invalid")
+    if not isinstance(value["ranges"], list):
+        raise ValueError("monitor ranges are invalid")
+    ranges = [_validate_range(row, "monitor range") for row in value["ranges"]]
+    range_ids = [row["chat_id"] for row in ranges]
+    _validate_chat_ids(range_ids, label="monitor range chat_ids")
+    if not isinstance(value["events"], list):
+        raise ValueError("monitor events are invalid")
+    if kind == "baseline":
+        if sequence != 1 or value["events"]:
+            raise ValueError("baseline must be sequence one with no events")
+    else:
+        if sequence == 1 or len(ranges) != 1 or not 1 <= len(value["events"]) <= MAX_MENTION_EVENTS:
+            raise ValueError("mentions upload shape is invalid")
+        monitor_range = ranges[0]
+        events = [
+            _validate_event(event, source_id, monitor_range["chat_id"])
+            for event in value["events"]
+        ]
+        seen: set[int] = set()
+        previous_message_id = monitor_range["from_message_id_exclusive"]
+        for event in events:
+            message_id = event["message_id"]
+            if not monitor_range["from_message_id_exclusive"] < message_id <= monitor_range[
+                    "through_message_id"]:
+                raise ValueError("monitor event escaped its message range")
+            if message_id in seen:
+                raise ValueError("monitor event message_id is duplicated")
+            if message_id <= previous_message_id:
+                raise ValueError("monitor events must be strictly increasing")
+            seen.add(message_id)
+            previous_message_id = message_id
+    if not isinstance(value["content_sha256"], str) or not _HEX64.fullmatch(
+            value["content_sha256"]):
+        raise ValueError("monitor content_sha256 is invalid")
+    expected = content_hash({
+        key: value[key] for key in MONITOR_UPLOAD_KEYS if key != "content_sha256"
+    })
+    if value["content_sha256"] != expected:
+        raise ValueError("monitor content_sha256 mismatch")
     return value
 
 
-def build_upload(
-    *, source_id: str, gate: Dict[str, Any], chat_id: int,
-    through_message_id: int, message_count: int, digest: str, model: str,
+def validate_digest_text(value: Any, *, allow_empty: bool) -> str:
+    return _safe_text(
+        value, "digest", maximum=MAX_DIGEST_CHARS, allow_empty=allow_empty,
+    )
+
+
+def _validate_digest_range(row: Any) -> Dict[str, int]:
+    if not isinstance(row, dict):
+        raise ValueError("digest range is invalid")
+    _exact_keys(row, DIGEST_RANGE_KEYS, "digest range")
+    base = _validate_range(
+        {key: row[key] for key in RANGE_KEYS}, "digest range",
+    )
+    count = _message_id(row["message_count"], "range message_count")
+    if count > base["through_message_id"] - base["from_message_id_exclusive"]:
+        raise ValueError("range message_count exceeds id span")
+    return {**base, "message_count": count}
+
+
+def build_digest_upload(
+    *, source_id: str, gate: Dict[str, Any],
+    chat_ranges: Sequence[Dict[str, int]], digest: str, model: str,
     generated_at: datetime,
 ) -> Dict[str, Any]:
-    gate = validate_gate(dict(gate))
-    if gate["due"] is not True:
-        raise ValueError("cannot build upload when gate is not due")
-    _source_id(source_id)
-    start = gate["from_message_id_exclusive"]
-    if type(through_message_id) is not int or not start <= through_message_id <= 2**63 - 1:
-        raise ValueError("through_message_id is invalid")
-    if type(message_count) is not int or not 0 <= message_count <= 2**63 - 1:
-        raise ValueError("message_count is invalid")
-    if message_count > through_message_id - start:
-        raise ValueError("message_count cannot exceed viewed message id span")
-    empty = message_count == 0
-    validate_digest_text(digest, allow_empty=empty)
-    if empty != (digest == ""):
-        raise ValueError("empty, message_count and digest disagree")
-    if not empty and through_message_id <= start:
-        raise ValueError("non-empty digest did not advance cursor")
-    if not isinstance(model, str) or not 1 <= len(model) <= 160:
-        raise ValueError("model is invalid")
-
+    validate_gate(dict(gate))
+    digest_gate = gate["digest"]
+    if digest_gate["due"] is not True:
+        raise ValueError("cannot build digest upload when gate is not due")
+    message_count = sum(row["message_count"] for row in chat_ranges)
     payload: Dict[str, Any] = {
-        "schema": UPLOAD_SCHEMA,
+        "schema": DIGEST_UPLOAD_SCHEMA,
         "source_id": source_id,
-        "sequence": gate["next_sequence"],
-        "previous_sha256": gate["previous_sha256"],
-        "digest_date": gate["digest_date"],
+        "sequence": digest_gate["next_sequence"],
+        "previous_sha256": digest_gate["previous_sha256"],
+        "digest_date": digest_gate["digest_date"],
         "timezone": gate["timezone"],
         "generated_at": utc_iso(generated_at),
-        # server_time is the remote-issued upper bound used for Telegram fetch.
         "cutoff_at": gate["server_time"],
-        "chat_id": chat_id,
-        "from_message_id_exclusive": start,
-        "through_message_id": through_message_id,
-        "message_count": message_count,
-        "empty": empty,
+        "chat_ranges": list(chat_ranges),
+        "total_message_count": message_count,
+        "empty": message_count == 0,
         "digest": digest,
         "model": model,
         "prompt_version": PROMPT_VERSION,
         "collector_version": COLLECTOR_VERSION,
     }
     payload["content_sha256"] = content_hash(payload)
-    validate_upload(payload)
+    validate_digest_upload(payload)
+    expected = digest_gate["cursors"]
+    if [row["chat_id"] for row in chat_ranges] != [row["chat_id"] for row in expected]:
+        raise ValueError("digest upload must cover every locked chat")
+    for row, cursor in zip(chat_ranges, expected):
+        if row["from_message_id_exclusive"] != cursor["through_message_id"]:
+            raise ValueError("digest range does not start at receiver cursor")
     return payload
 
 
-def validate_upload(value: Dict[str, Any]) -> Dict[str, Any]:
-    _exact_keys(value, UPLOAD_KEYS, "upload")
-    if value["schema"] != UPLOAD_SCHEMA:
-        raise ValueError("upload schema is invalid")
+def validate_digest_upload(value: Dict[str, Any]) -> Dict[str, Any]:
+    _exact_keys(value, DIGEST_UPLOAD_KEYS, "digest upload")
+    if value["schema"] != DIGEST_UPLOAD_SCHEMA:
+        raise ValueError("digest upload schema is invalid")
     _source_id(value["source_id"])
-    for name in ("sequence", "from_message_id_exclusive", "through_message_id",
-                 "message_count"):
-        if type(value[name]) is not int or not 0 <= value[name] <= 2**63 - 1:
-            raise ValueError(f"upload {name} is invalid")
-    if type(value["chat_id"]) is not int or not -(2**63) <= value["chat_id"] < 0:
-        raise ValueError("upload chat_id is invalid")
-    if value["sequence"] < 1 or value["through_message_id"] < value[
-            "from_message_id_exclusive"]:
-        raise ValueError("upload sequence/cursor is invalid")
-    if value["message_count"] > value["through_message_id"] - value[
-            "from_message_id_exclusive"]:
-        raise ValueError("upload message count exceeds id span")
-    if type(value["empty"]) is not bool or value["empty"] != (value["message_count"] == 0):
-        raise ValueError("upload empty flag disagrees with count")
-    if (value["digest"] == "") != value["empty"]:
-        raise ValueError("upload digest disagrees with empty flag")
-    validate_digest_text(value["digest"], allow_empty=value["empty"])
+    sequence = value["sequence"]
+    if type(sequence) is not int or not 1 <= sequence <= 2**63 - 1:
+        raise ValueError("digest sequence is invalid")
     previous = value["previous_sha256"]
-    if value["sequence"] == 1:
+    if sequence == 1:
         if previous is not None:
-            raise ValueError("initial upload previous_sha256 must be null")
+            raise ValueError("initial digest previous_sha256 must be null")
     elif not isinstance(previous, str) or not _HEX64.fullmatch(previous):
-        raise ValueError("upload previous_sha256 is invalid")
-    if not isinstance(value["content_sha256"], str) or not _HEX64.fullmatch(
-            value["content_sha256"]):
-        raise ValueError("upload content_sha256 is invalid")
-    _day(value["digest_date"], "upload digest_date")
+        raise ValueError("digest previous_sha256 is invalid")
+    _day(value["digest_date"], "digest_date")
     if (not isinstance(value["timezone"], str) or not 1 <= len(value["timezone"]) <= 64
             or not _TOKEN.fullmatch(value["timezone"])):
-        raise ValueError("upload timezone is invalid")
+        raise ValueError("digest timezone is invalid")
     generated = parse_wire_utc(value["generated_at"], "generated_at")
     cutoff = parse_wire_utc(value["cutoff_at"], "cutoff_at")
     if cutoff > generated or generated - cutoff > timedelta(hours=1):
-        raise ValueError("upload timestamp order is invalid")
-    token_limits = {"model": 160, "prompt_version": 80, "collector_version": 120}
-    for name, limit in token_limits.items():
-        if (not isinstance(value[name], str) or not value[name]
-                or len(value[name]) > limit or not _TOKEN.fullmatch(value[name])):
-            raise ValueError(f"upload {name} is invalid")
-    expected = content_hash({key: value[key] for key in UPLOAD_KEYS if key != "content_sha256"})
-    if value["content_sha256"] != expected:
-        raise ValueError("upload content_sha256 mismatch")
+        raise ValueError("digest timestamp order is invalid")
+    if not isinstance(value["chat_ranges"], list):
+        raise ValueError("digest chat_ranges are invalid")
+    ranges = [_validate_digest_range(row) for row in value["chat_ranges"]]
+    _validate_chat_ids([row["chat_id"] for row in ranges], label="digest range chat_ids")
+    total = _message_id(value["total_message_count"], "total_message_count")
+    if total != sum(row["message_count"] for row in ranges):
+        raise ValueError("digest aggregate message_count mismatch")
+    if type(value["empty"]) is not bool or value["empty"] != (total == 0):
+        raise ValueError("digest empty flag disagrees with count")
+    if (value["digest"] == "") != value["empty"]:
+        raise ValueError("digest text disagrees with empty flag")
+    validate_digest_text(value["digest"], allow_empty=value["empty"])
+    for name, expected in (
+            ("model", None), ("prompt_version", PROMPT_VERSION),
+            ("collector_version", COLLECTOR_VERSION)):
+        token = value[name]
+        if not isinstance(token, str) or not token or len(token) > 160 or not _TOKEN.fullmatch(token):
+            raise ValueError(f"digest {name} is invalid")
+        if expected is not None and token != expected:
+            raise ValueError(f"digest {name} is invalid")
+    if not isinstance(value["content_sha256"], str) or not _HEX64.fullmatch(
+            value["content_sha256"]):
+        raise ValueError("digest content_sha256 is invalid")
+    expected_hash = content_hash({
+        key: value[key] for key in DIGEST_UPLOAD_KEYS if key != "content_sha256"
+    })
+    if value["content_sha256"] != expected_hash:
+        raise ValueError("digest content_sha256 mismatch")
     return value
 
 
-def validate_receipt(value: Dict[str, Any], upload: Dict[str, Any]) -> Dict[str, Any]:
+def validate_receipt(value: Dict[str, Any], upload: Dict[str, Any], stream: str) -> Dict[str, Any]:
     _exact_keys(value, RECEIPT_KEYS, "receipt")
-    if value["ok"] is not True or value["status"] not in ("accepted", "duplicate"):
+    if (value["schema"] != RECEIPT_SCHEMA or value["ok"] is not True
+            or value["status"] not in ("accepted", "duplicate")):
         raise ValueError("receipt is not successful")
+    if stream not in ("monitor", "digest") or value["stream"] != stream:
+        raise ValueError("receipt stream mismatch")
     if type(value["sequence"]) is not int or value["sequence"] != upload["sequence"]:
         raise ValueError("receipt sequence mismatch")
     if value["content_sha256"] != upload["content_sha256"]:
         raise ValueError("receipt hash mismatch")
-    if (type(value["through_message_id"]) is not int
-            or value["through_message_id"] != upload["through_message_id"]):
-        raise ValueError("receipt cursor mismatch")
     parse_wire_utc(value["received_at"], "received_at")
     return value
 
 
-def canonical_upload_bytes(value: Dict[str, Any]) -> bytes:
-    validate_upload(value)
+def canonical_monitor_bytes(value: Dict[str, Any]) -> bytes:
+    validate_monitor_upload(value)
     raw = canonical_json_bytes(value) + b"\n"
     if len(raw) > MAX_UPLOAD_BYTES:
-        raise ValueError("upload exceeds hard limit")
+        raise ValueError("monitor upload exceeds hard limit")
+    return raw
+
+
+def canonical_digest_bytes(value: Dict[str, Any]) -> bytes:
+    validate_digest_upload(value)
+    raw = canonical_json_bytes(value) + b"\n"
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise ValueError("digest upload exceeds hard limit")
     return raw

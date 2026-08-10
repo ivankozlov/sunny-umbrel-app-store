@@ -2,13 +2,14 @@ manifestVersion: 1
 id: sunny-personal-digest
 disabled: true
 category: automation
-name: Sunny Personal Digest
-version: "0.1.1"
-tagline: Daily Telegram digest for one selected chat
+name: Sunny Personal Chats
+version: "0.2.0"
+tagline: Mentions, read receipts, and one digest for selected chats
 description: >-
-  Reads only one explicitly selected Telegram chat, summarizes new text and
-  captions through OpenRouter, and sends the final digest to Sunny over a
-  pinned SSH connection.
+  Watches only the explicitly selected Telegram groups, clears their unread
+  state about once a minute, forwards bounded native-mention snippets to Sunny,
+  and creates one combined daily digest through OpenRouter over a pinned SSH
+  connection.
 
 
   Telegram and provider credentials are deliberately excluded from Umbrel
@@ -17,9 +18,9 @@ description: >-
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  Privacy hardening: require OpenRouter ZDR with data collection denied, derive
-  the first 72-hour boundary from authenticated receiver time, and fail closed
-  when setup expires or the collector restarts before chat lock.
+  Breaking v0.2 generation: immutable multi-chat selection, explicit first
+  activation without historical mention alerts, durable mention-before-read
+  ordering, independent monitor/digest chains, and one combined daily digest.
 
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store
@@ -43,3 +44,5 @@ backupIgnore:
   - data/runtime/.*
   - data/config/pending-upload.json
   - data/config/.pending-upload.json.*
+  - data/config/pending-monitor-upload.json
+  - data/config/.pending-monitor-upload.json.*

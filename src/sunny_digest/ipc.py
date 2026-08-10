@@ -16,7 +16,7 @@ async def dispatch(collector: Collector, request: Dict[str, Any]) -> Dict[str, A
     command = request.get("command")
     allowed_shape = {"command"} if command in (
         "status", "list_dialogs", "run_now", "revoke_and_reset",
-        "acknowledge_manual_revocation",
+        "acknowledge_manual_revocation", "activate_monitoring",
     ) else {"command", "data"}
     if set(request) != allowed_shape:
         raise ValueError("IPC request has unexpected fields")
@@ -35,8 +35,10 @@ async def dispatch(collector: Collector, request: Dict[str, Any]) -> Dict[str, A
         return await collector.submit_password(request["data"])
     if command == "list_dialogs":
         return await collector.list_dialogs()
-    if command == "select_chat":
-        return await collector.select_chat(request["data"])
+    if command == "select_chats":
+        return await collector.select_chats(request["data"])
+    if command == "activate_monitoring":
+        return await collector.activate_monitoring()
     if command == "run_now":
         triggered = collector.trigger_run()
         status = await collector.public_status()
@@ -90,7 +92,7 @@ async def serve(paths: Paths) -> None:
     )
     os.chmod(paths.ipc_socket, 0o600)
     try:
-        raw_interval = int(os.environ.get("SUNNY_COLLECT_INTERVAL_S", "300"))
+        raw_interval = int(os.environ.get("SUNNY_COLLECT_INTERVAL_S", "60"))
         interval = max(60, min(raw_interval, 3600))
         scheduler = asyncio.create_task(_scheduler(collector, interval))
         async with server:

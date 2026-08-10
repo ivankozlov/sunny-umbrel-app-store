@@ -8,24 +8,24 @@ import urllib.request
 from typing import Any, Dict, List
 
 from .contracts import validate_digest_text
-from .models import SelectedMessage
-from .prompting import render_prompt
+from .models import DigestChat
+from .prompting import render_digest_prompt
 from .storage import canonical_json_bytes
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_WORKER_REQUEST_BYTES = 128 * 1024
-WORKER_SCHEMA = "sunny.openrouter-worker.v1"
+WORKER_SCHEMA = "sunny.personal-chats.openrouter-worker.v2"
 
 
 class OpenRouterError(RuntimeError):
     pass
 
 
-def _prompt(messages: List[SelectedMessage]) -> str:
+def _prompt(chats: List[DigestChat]) -> str:
     try:
-        return render_prompt(messages)
+        return render_digest_prompt(chats)
     except ValueError as exc:
         raise OpenRouterError("prompt exceeds bounded input size") from exc
 
@@ -38,7 +38,7 @@ def _blocking_digest_prompt(prompt: str, model: str, api_key: str) -> str:
             "data_collection": "deny",
         },
         "messages": [
-            {"role": "system", "content": "You summarize only the supplied selected-chat text."},
+            {"role": "system", "content": "You summarize only the supplied selected-groups text."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0,
@@ -52,9 +52,9 @@ def _blocking_digest_prompt(prompt: str, model: str, api_key: str) -> str:
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "sunny-personal-digest/0.1",
+            "User-Agent": "sunny-personal-chats/0.2",
             "HTTP-Referer": "https://github.com/ivankozlov/sunny-umbrel-app-store",
-            "X-Title": "Sunny Personal Digest",
+            "X-Title": "Sunny Personal Chats",
         },
     )
     try:
@@ -89,8 +89,8 @@ def _blocking_digest_prompt(prompt: str, model: str, api_key: str) -> str:
     return digest
 
 
-def _blocking_digest(messages: List[SelectedMessage], model: str, api_key: str) -> str:
-    return _blocking_digest_prompt(_prompt(messages), model, api_key)
+def _blocking_digest(chats: List[DigestChat], model: str, api_key: str) -> str:
+    return _blocking_digest_prompt(_prompt(chats), model, api_key)
 
 
 async def _terminate(process: Any) -> None:
@@ -132,15 +132,15 @@ async def _bounded_worker_exchange(process: Any, request: bytes) -> bytes:
     return b"".join(chunks)
 
 
-async def create_digest(messages: List[SelectedMessage], model: str, api_key: str,
+async def create_digest(chats: List[DigestChat], model: str, api_key: str,
                         revoked: asyncio.Event) -> str:
-    if not messages:
+    if not chats or not any(chat.messages for chat in chats):
         return ""
     if revoked.is_set():
         raise asyncio.CancelledError
     request = canonical_json_bytes({
         "schema": WORKER_SCHEMA,
-        "prompt": _prompt(messages),
+        "prompt": _prompt(chats),
         "model": model,
         "api_key": api_key,
     }) + b"\n"

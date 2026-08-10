@@ -79,7 +79,7 @@ def _layout(content: str, csrf: str, notice: str = "") -> bytes:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Sunny Personal Digest</title>
+  <title>Sunny Personal Chats</title>
   <style>
     :root {{ color-scheme: dark; --ink:#eef3ff; --muted:#97a7c7; --line:#2a3650;
       --panel:rgba(19,27,44,.88); --accent:#ffbd38; --accent2:#ff7a45; }}
@@ -124,10 +124,10 @@ def _layout(content: str, csrf: str, notice: str = "") -> bytes:
 </head>
 <body><main>
   <div class="brand"><div class="sun" aria-hidden="true"></div><div>
-    <h1>Sunny Personal Digest</h1><div class="muted">Один выбранный чат · локальная Telegram-сессия</div>
+    <h1>Sunny Personal Chats</h1><div class="muted">1–16 выбранных чатов · локальная Telegram-сессия</div>
   </div></div>
   {notice_html}<section class="card">{content}{reset_html}</section>
-  <footer>Сырые сообщения не сохраняются. Во время setup credentials проходят через web только транзитом; web их не сохраняет и никогда не монтирует private/session.</footer>
+  <footer>Сырые сообщения дайджеста не сохраняются. Финальный mention-фрагмент до 300 UTF-16, название чата, отправитель и ссылка durably передаются в Sunny. Setup credentials проходят через web только транзитом.</footer>
 </main></body></html>"""
     return document.encode("utf-8")
 
@@ -157,7 +157,7 @@ def render_status(status: Dict[str, Any], csrf: str) -> str:
 <p class="muted">Поля новой конфигурации появятся только после подтверждения.</p>"""
         return f"""
 <h2>Безопасная первичная настройка</h2>
-<p class="muted">Данные уйдут по Unix-сокету прямо в изолированный collector. После выбора чата изменить их можно только полным сбросом.</p>
+<p class="muted">Данные уйдут по Unix-сокету прямо в изолированный collector. После выбора групп изменить их можно только полным сбросом.</p>
 <form method="post" autocomplete="off">{_hidden_csrf(csrf)}
   <input type="hidden" name="action" value="configure">
   <label>Telegram API ID<input name="telegram_api_id" inputmode="numeric" required></label>
@@ -169,7 +169,8 @@ def render_status(status: Dict[str, Any], csrf: str) -> str:
   <p class="muted">SSH login фиксирован: <strong>root</strong>. Серверный forced command сразу понижает права до dedicated receiver user.</p>
   <label>Точная строка pinned known_hosts<textarea name="known_host" spellcheck="false" placeholder="host ssh-ed25519 AAAA…" required></textarea></label>
   <label>Согласие действует до (ISO 8601)<input name="consent_expires_at" placeholder="2026-10-01T00:00:00Z" required></label>
-  <p class="warn">Завершите вход и выбор чата в течение часа. Рестарт collector’а до фиксации чата потребует factory reset и нового входа.</p>
+  <label class="check"><input type="checkbox" name="confirm_data_scope" value="yes" required>Разрешаю читать текст только выбранных групп для одного дневного запроса в ZDR OpenRouter; durably отправлять в Sunny native mention с названием чата, отправителем, ссылкой и фрагментом до 300 UTF-16; после durable ACK помечать просмотренные сообщения и mentions прочитанными в Telegram.</label>
+  <p class="warn">Завершите вход и выбор групп в течение часа. Рестарт collector’а до фиксации групп потребует factory reset и нового входа.</p>
   <p class="warn">Не используйте общий OpenRouter-ключ. Создайте отдельный ключ с небольшим лимитом.</p>
   <button type="submit">Сохранить и продолжить</button>
 </form>"""
@@ -204,9 +205,9 @@ def render_status(status: Dict[str, Any], csrf: str) -> str:
 </form>"""
     if phase == "authenticated":
         return f"""
-<h2>Однократный выбор чата</h2>
-<p>Список диалогов будет прочитан ровно один раз. После выбора collector навсегда блокируется на точном Telegram peer.</p>
-<p class="warn">Повторно открыть список или сменить чат без отзыва сессии и полного сброса нельзя.</p>
+<h2>Однократный выбор групп</h2>
+<p>Список диалогов будет прочитан ровно один раз. После выбора collector навсегда блокируется на точном наборе Telegram peers.</p>
+<p class="warn">Повторно открыть список или сменить набор без отзыва сессии и полного сброса нельзя.</p>
 <form method="post">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="list_dialogs">
   <button type="submit">Показать диалоги один раз</button>
 </form>"""
@@ -216,39 +217,55 @@ def render_status(status: Dict[str, Any], csrf: str) -> str:
             if not isinstance(row, dict):
                 continue
             label = f'{row.get("title", "Без названия")} · {row.get("kind", "peer")} · {row.get("chat_id", "")}'
-            options.append(f'<option value="{_escape(row.get("chat_id", ""))}">{_escape(label)}</option>')
+            options.append(f'<label class="check"><input type="checkbox" name="chat_id" value="{_escape(row.get("chat_id", ""))}">{_escape(label)}</label>')
         return f"""
-<h2>Выберите единственный чат</h2>
+<h2>Выберите группы</h2>
 <p class="muted">После подтверждения список будет удалён, а endpoint, модель и все credentials станут неизменяемыми.</p>
-<form method="post">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="select_chat">
-  <label>Telegram chat<select name="chat_id" required>{''.join(options)}</select></label>
-  <label class="check"><input type="checkbox" name="confirm_lock" value="yes" required>Я понимаю, что смена чата потребует factory reset и нового входа в Telegram.</label>
-  <button type="submit">Зафиксировать чат и создать upload key</button>
+<form method="post">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="select_chats">
+  <div><strong>От 1 до 16 групп</strong>{''.join(options)}</div>
+  <label class="check"><input type="checkbox" name="confirm_lock" value="yes" required>Я понимаю, что смена набора групп потребует factory reset и нового входа в Telegram.</label>
+  <button type="submit">Зафиксировать группы и создать upload key</button>
 </form>"""
     if phase == "chat_locked":
         result = _escape(status.get("last_result") or "ещё не запускался")
         error = status.get("last_error_type")
         error_row = f'<dt>Последняя ошибка</dt><dd>{_escape(error)}</dd>' if error else ""
         consent = "активно" if status.get("consent_active") else "истекло"
+        chats = "<br>".join(
+            f'{_escape(row.get("title"))} <span class="muted">({_escape(row.get("chat_id"))})</span>'
+            for row in status.get("chats") or [] if isinstance(row, dict)
+        ) or "—"
+        activation = ""
+        if status.get("activation_required"):
+            activation = f"""
+<div class="notice"><strong>Нужно отдельное включение.</strong><br>
+Первый запуск durably запишет baseline в Sunny, затем пометит все старые unread и mentions выбранных групп прочитанными. Старые mentions не будут отправлены. Только после этого начнётся минутный watcher.</div>
+<form method="post">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="activate_monitoring">
+  <label class="check"><input type="checkbox" name="confirm_activation" value="yes" required>Включить мониторинг и очистить текущие старые unread/mentions после durable baseline ACK.</label>
+  <button type="submit">Включить мониторинг</button>
+</form>"""
         return f"""
-<div class="lock">● Чат зафиксирован</div><h2 style="margin-top:14px">Collector готов</h2>
+<div class="lock">● Группы зафиксированы</div><h2 style="margin-top:14px">Collector готов</h2>
 <dl>
-  <dt>Чат</dt><dd>{_escape(status.get("chat_title"))} <span class="muted">({_escape(status.get("chat_id"))})</span></dd>
+  <dt>Группы</dt><dd>{chats}</dd>
   <dt>Source ID</dt><dd>{_escape(status.get("source_id"))}</dd>
-  <dt>Первичный cursor</dt><dd>{_escape(status.get("initial_message_id"))}</dd>
+  <dt>Мониторинг</dt><dd>{_escape(status.get("monitoring_phase") or "не включён")}</dd>
   <dt>Модель</dt><dd>{_escape(status.get("model") or "зафиксирована")}</dd>
   <dt>Receiver</dt><dd>{_escape(status.get("upload_target") or "зафиксирован")}</dd>
   <dt>Согласие</dt><dd>{consent} · до {_escape(status.get("consent_expires_at") or "—")}</dd>
-  <dt>Pending payload</dt><dd>{"да" if status.get("pending_upload") else "нет"}</dd>
+  <dt>Pending monitor</dt><dd>{"да" if status.get("pending_monitor_upload") else "нет"}</dd>
+  <dt>Pending digest</dt><dd>{"да" if status.get("pending_digest_upload") else "нет"}</dd>
+  <dt>Ошибки peer</dt><dd>{_escape(status.get("failed_chat_count") or 0)}</dd>
   <dt>Последний результат</dt><dd>{result}</dd>{error_row}
 </dl>
 <p class="muted">Добавьте этот публичный ключ в конфигурацию forced-command receiver’а Sunny:</p>
 <code>{_escape(status.get("upload_public_key") or "")}</code>
 <p class="muted">Fingerprint: {_escape(status.get("upload_key_fingerprint") or "—")}</p>
-<details><summary>Продлить согласие на чтение выбранного чата</summary>
+{activation}
+<details><summary>Продлить согласие для выбранных групп</summary>
   <form method="post">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="renew_consent">
     <label>Новое окончание (ISO 8601, от 1 часа до 90 дней)<input name="consent_expires_at" placeholder="2026-10-01T00:00:00Z" required></label>
-    <label class="check"><input type="checkbox" name="confirm_renew" value="yes" required>Разрешаю продолжить чтение только уже зафиксированного чата до указанного момента.</label>
+    <label class="check"><input type="checkbox" name="confirm_renew" value="yes" required>Продлеваю тот же scope: дневной текст в ZDR OpenRouter, mention-фрагменты в Sunny и Telegram read-ACK только для уже зафиксированных групп.</label>
     <button class="secondary" type="submit">Продлить согласие</button>
   </form>
 </details>
@@ -314,7 +331,7 @@ class Handler(BaseHTTPRequestHandler):
             return True
         body = b"Authentication required\n"
         self._headers(HTTPStatus.UNAUTHORIZED, "text/plain; charset=utf-8", len(body))
-        self.send_header("WWW-Authenticate", 'Basic realm="Sunny Personal Digest", charset="UTF-8"')
+        self.send_header("WWW-Authenticate", 'Basic realm="Sunny Personal Chats", charset="UTF-8"')
         self.end_headers()
         self.wfile.write(body)
         return False
@@ -388,6 +405,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise PermissionError("CSRF validation failed")
             action = _one(form, "action")
             if action == "configure":
+                if _one(form, "confirm_data_scope") != "yes":
+                    raise PermissionError("data scope was not confirmed")
                 names = (
                     "telegram_api_id", "telegram_api_hash", "openrouter_api_key",
                     "openrouter_model", "upload_host", "upload_port",
@@ -404,10 +423,17 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.app.ipc.request("submit_password", _one(form, "password"))
             elif action == "list_dialogs":
                 result = self.app.ipc.request("list_dialogs")
-            elif action == "select_chat":
+            elif action == "select_chats":
                 if _one(form, "confirm_lock") != "yes":
                     raise PermissionError("chat lock was not confirmed")
-                result = self.app.ipc.request("select_chat", _one(form, "chat_id"))
+                selected = form.get("chat_id")
+                if not selected or not 1 <= len(selected) <= 16:
+                    raise ValueError("1 to 16 chats must be selected")
+                result = self.app.ipc.request("select_chats", selected)
+            elif action == "activate_monitoring":
+                if _one(form, "confirm_activation") != "yes":
+                    raise PermissionError("monitoring activation was not confirmed")
+                result = self.app.ipc.request("activate_monitoring")
             elif action == "run_now":
                 result = self.app.ipc.request("run_now")
             elif action == "renew_consent":

@@ -16,11 +16,13 @@ def status(phase="fresh"):
         "configured": phase != "fresh",
         "chat_locked": phase == "chat_locked",
         "consent_active": phase not in ("fresh", "unavailable"),
-        "pending_upload": False,
+        "pending_digest_upload": False,
+        "pending_monitor_upload": False,
         "source_id": None,
-        "chat_id": None,
-        "chat_title": None,
-        "initial_message_id": None,
+        "chats": [],
+        "monitoring_phase": "not_selected",
+        "activation_required": False,
+        "monitoring_active": False,
         "upload_public_key": None,
         "upload_key_fingerprint": None,
         "model": None,
@@ -31,13 +33,17 @@ def status(phase="fresh"):
         "last_result": None,
         "last_error_type": None,
         "revocation_required": False,
+        "failed_chat_count": 0,
     }
     if phase == "chat_locked":
         value.update({
             "source_id": "12345678-1234-4678-9234-567812345678",
-            "chat_id": -100123,
-            "chat_title": "Pilot group",
-            "initial_message_id": 10,
+            "chats": [
+                {"chat_id": -100124, "title": "Pilot A", "kind": "channel"},
+                {"chat_id": -100123, "title": "Pilot B", "kind": "channel"},
+            ],
+            "monitoring_phase": "activation_required",
+            "activation_required": True,
             "upload_public_key": "ssh-ed25519 AAAApublic",
             "upload_key_fingerprint": "SHA256:public",
             "model": "anthropic/example",
@@ -93,7 +99,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(denied.status, 401)
         accepted, page = self.request("GET", headers=self.auth)
         self.assertEqual(accepted.status, 200)
-        self.assertIn(b"Sunny Personal Digest", page)
+        self.assertIn(b"Sunny Personal Chats", page)
         self.assertEqual(self.ipc.calls, [("status", None)])
 
     def test_setup_secrets_are_not_reflected_and_root_login_is_fixed(self):
@@ -111,6 +117,7 @@ class WebTests(unittest.TestCase):
             "upload_port": "22",
             "known_host": "receiver.example ssh-ed25519 AAAAsecret-host-key",
             "consent_expires_at": "2026-08-05T00:00:00Z",
+            "confirm_data_scope": "yes",
         }
         headers = dict(self.auth)
         headers.update({
@@ -165,7 +172,7 @@ class WebTests(unittest.TestCase):
                 ("code_sent", 'name="action" value="submit_code"'),
                 ("password_required", 'name="action" value="submit_password"'),
                 ("authenticated", 'name="action" value="list_dialogs"'),
-                ("dialogs_listed", 'name="action" value="select_chat"')):
+                ("dialogs_listed", 'name="action" value="select_chats"')):
             with self.subTest(phase=phase):
                 value = status(phase)
                 value["consent_active"] = False
@@ -180,10 +187,58 @@ class WebTests(unittest.TestCase):
                 ("code_sent", "submit_code"),
                 ("password_required", "submit_password"),
                 ("authenticated", "list_dialogs"),
-                ("dialogs_listed", "select_chat")):
+                ("dialogs_listed", "select_chats")):
             with self.subTest(phase=phase):
                 body = render_status(status(phase), "a" * 64)
                 self.assertIn(f'name="action" value="{action}"', body)
+
+    def test_multiselect_posts_repeated_chat_ids_and_explicit_activation(self):
+        listed = status("dialogs_listed")
+        listed["dialogs"] = [
+            {"chat_id": -100124, "title": "A", "kind": "channel"},
+            {"chat_id": -100123, "title": "B", "kind": "channel"},
+        ]
+        self.ipc.value = listed
+        response, page = self.request("GET", headers=self.auth)
+        self.assertEqual(page.count(b'name="chat_id"'), 2)
+        cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+        token = re.search(rb'name="csrf" value="([0-9a-f]{64})"', page).group(1).decode()
+        headers = dict(self.auth)
+        headers.update({"Cookie": cookie,
+                        "Content-Type": "application/x-www-form-urlencoded"})
+        form = [
+            ("csrf", token), ("action", "select_chats"),
+            ("chat_id", "-100124"), ("chat_id", "-100123"),
+            ("confirm_lock", "yes"),
+        ]
+        result, _ = self.request(
+            "POST", headers=headers, body=urlencode(form).encode())
+        self.assertEqual(result.status, 200)
+        self.assertEqual(self.ipc.calls[-1],
+                         ("select_chats", ["-100124", "-100123"]))
+
+        locked = status("chat_locked")
+        self.ipc.value = locked
+        response, page = self.request("GET", headers=self.auth)
+        self.assertIn(b'name="action" value="activate_monitoring"', page)
+        cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+        token = re.search(rb'name="csrf" value="([0-9a-f]{64})"', page).group(1).decode()
+        headers["Cookie"] = cookie
+        body = urlencode({
+            "csrf": token, "action": "activate_monitoring",
+            "confirm_activation": "yes",
+        }).encode()
+        self.request("POST", headers=headers, body=body)
+        self.assertEqual(self.ipc.calls[-1], ("activate_monitoring", None))
+
+    def test_ui_discloses_exact_data_scope_and_first_activation_effect(self):
+        fresh = render_status(status("fresh"), "a" * 64)
+        self.assertIn("ZDR OpenRouter", fresh)
+        self.assertIn("фрагментом до 300 UTF-16", fresh)
+        self.assertIn("помечать просмотренные сообщения", fresh)
+        locked = render_status(status("chat_locked"), "a" * 64)
+        self.assertIn("Старые mentions не будут отправлены", locked)
+        self.assertIn("durable baseline ACK", locked)
 
 
 if __name__ == "__main__":

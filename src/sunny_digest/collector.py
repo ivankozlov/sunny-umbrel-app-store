@@ -8,15 +8,21 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .contracts import (
-    canonical_upload_bytes,
-    build_upload,
+    build_digest_upload,
+    build_monitor_upload,
+    canonical_digest_bytes,
+    canonical_monitor_bytes,
     parse_utc,
-    validate_upload,
+    utc_iso,
+    validate_digest_upload,
+    validate_gate,
+    validate_monitor_upload,
 )
-from .models import DialogCandidate, PeerSpec
+from .models import DialogCandidate, DigestChat, PeerSpec
 from .openrouter import create_digest
 from .settings import (
     MAX_CONSENT_DAYS,
+    CONSENT_SCOPE,
     consent_active,
     load_credentials,
     load_settings,
@@ -35,18 +41,24 @@ from .storage import (
     unlink_atomic_material,
 )
 from .telegram_gateway import TelethonGateway
-from .version import DEFAULT_LOOKBACK_HOURS, MAX_UPLOAD_BYTES
+from .version import (
+    DEFAULT_LOOKBACK_HOURS,
+    MAX_PROMPT_BYTES,
+    MAX_SELECTED_CHATS,
+    MAX_UPLOAD_BYTES,
+)
 
 
 GatewayFactory = Callable[[int, str], Any]
-DigestFunction = Callable[[List[Any], str, str, asyncio.Event], Awaitable[str]]
+DigestFunction = Callable[[List[DigestChat], str, str, asyncio.Event], Awaitable[str]]
 TransportFactory = Callable[[Paths, Dict[str, Any]], Any]
 KeygenFunction = Callable[[Paths, str], Awaitable[tuple[str, str]]]
 
 
-ACKNOWLEDGED_SCHEMA = "sunny.personal-digest-acknowledged.v1"
-REVOCATION_WARNING_SCHEMA = "sunny.personal-digest-revocation-warning.v1"
-SESSION_OUTSTANDING_SCHEMA = "sunny.personal-digest-session-outstanding.v1"
+DIGEST_ACKNOWLEDGED_SCHEMA = "sunny.personal-chats.digest-acknowledged.v2"
+WATCH_STATE_SCHEMA = "sunny.personal-chats.watch-state.v2"
+REVOCATION_WARNING_SCHEMA = "sunny.personal-chats.revocation-warning.v2"
+SESSION_OUTSTANDING_SCHEMA = "sunny.personal-chats.session-outstanding.v2"
 TELEGRAM_SETUP_TIMEOUT_S = 90
 TELEGRAM_DIALOG_TIMEOUT_S = 120
 TELEGRAM_FETCH_TIMEOUT_S = 180
@@ -165,16 +177,18 @@ class Collector:
 
     def _base_status(self) -> Dict[str, Any]:
         status: Dict[str, Any] = {
-            "schema": "sunny.personal-digest-local-status.v1",
+            "schema": "sunny.personal-chats.local-status.v2",
             "phase": "fresh",
             "configured": False,
             "chat_locked": False,
             "consent_active": False,
-            "pending_upload": self.paths.pending.exists(),
+            "pending_digest_upload": self.paths.pending.exists(),
+            "pending_monitor_upload": self.paths.monitor_pending.exists(),
             "source_id": None,
-            "chat_id": None,
-            "chat_title": None,
-            "initial_message_id": None,
+            "chats": [],
+            "monitoring_phase": "not_selected",
+            "activation_required": False,
+            "monitoring_active": False,
             "upload_public_key": None,
             "upload_key_fingerprint": None,
             "model": None,
@@ -187,6 +201,7 @@ class Collector:
             "last_error_type": None,
             "last_message_count": None,
             "last_through_message_id": None,
+            "failed_chat_count": 0,
             "revocation_required": self.paths.revocation_warning.exists(),
         }
         if self.paths.settings.exists():
@@ -203,11 +218,22 @@ class Collector:
                     ),
                 )
                 if settings["chat_locked"]:
+                    chats = [
+                        {"chat_id": row["chat_id"], "title": row["title"],
+                         "kind": row["peer"]["kind"]}
+                        for row in settings["chats"]
+                    ]
+                    monitoring_phase = "activation_required"
+                    if self.paths.watch_state.exists():
+                        watch = read_json(self.paths.watch_state, max_bytes=64 * 1024)
+                        if watch.get("schema") == WATCH_STATE_SCHEMA:
+                            monitoring_phase = str(watch.get("phase"))
                     status.update(
                         source_id=settings["source_id"],
-                        chat_id=settings["chat_id"],
-                        chat_title=settings["chat_title"],
-                        initial_message_id=settings["initial_message_id"],
+                        chats=chats,
+                        monitoring_phase=monitoring_phase,
+                        activation_required=not self.paths.watch_state.exists(),
+                        monitoring_active=monitoring_phase == "active",
                         upload_public_key=settings["upload_public_key"],
                         upload_key_fingerprint=settings["upload_key_fingerprint"],
                         model=settings["openrouter_model"],
@@ -239,6 +265,7 @@ class Collector:
                 for key in (
                     "last_run_at", "last_result", "last_error_type",
                     "last_message_count", "last_through_message_id",
+                    "failed_chat_count",
                 ):
                     if key in previous:
                         status[key] = previous[key]
@@ -263,8 +290,10 @@ class Collector:
             # metadata until the operator has handled the remote Telegram device.
             status.update(
                 phase="fresh", configured=False, chat_locked=False,
-                consent_active=False, pending_upload=False, source_id=None,
-                chat_id=None, chat_title=None, initial_message_id=None,
+                consent_active=False, pending_digest_upload=False,
+                pending_monitor_upload=False, source_id=None, chats=[],
+                monitoring_phase="not_selected", activation_required=False,
+                monitoring_active=False,
                 upload_public_key=None, upload_key_fingerprint=None, model=None,
                 upload_target=None, consent_expires_at=None, phone_masked=None,
                 dialogs=[], revocation_required=True,
@@ -280,12 +309,13 @@ class Collector:
         status.update(changes)
         allowed = {
             "schema", "phase", "configured", "chat_locked", "consent_active",
-            "pending_upload", "source_id", "chat_id", "chat_title",
-            "initial_message_id", "upload_public_key", "upload_key_fingerprint",
+            "pending_digest_upload", "pending_monitor_upload", "source_id", "chats",
+            "monitoring_phase", "activation_required", "monitoring_active",
+            "upload_public_key", "upload_key_fingerprint",
             "model", "upload_target", "consent_expires_at",
             "phone_masked", "dialogs", "last_run_at", "last_result",
             "last_error_type", "last_message_count", "last_through_message_id",
-            "revocation_required",
+            "failed_chat_count", "revocation_required",
         }
         status = {key: status.get(key) for key in allowed}
         atomic_write_json(self.paths.status, status, 0o600)
@@ -424,27 +454,36 @@ class Collector:
             atomic_write_json(self.paths.settings, settings)
             return self._write_status(last_result="dialogs_listed", last_error_type=None)
 
-    async def select_chat(self, chat_id: Any) -> Dict[str, Any]:
+    async def select_chats(self, chat_ids: Any) -> Dict[str, Any]:
         async with self.state_lock:
             settings = load_settings(self.paths)
             if settings["chat_locked"] or self.paths.chat_locked.exists():
-                raise RuntimeError("chat is already permanently locked for this session")
+                raise RuntimeError("chats are already permanently locked for this session")
             if settings["phase"] != "dialogs_listed":
-                raise RuntimeError("select_chat is not allowed in this phase")
-            try:
-                requested = int(chat_id)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("chat_id is invalid") from exc
-            if requested >= 0:
-                raise ValueError("only a Telegram group or supergroup can be selected")
+                raise RuntimeError("select_chats is not allowed in this phase")
+            if not isinstance(chat_ids, list) or not 1 <= len(chat_ids) <= MAX_SELECTED_CHATS:
+                raise ValueError("1 to 16 chats must be selected")
+            requested: List[int] = []
+            for raw in chat_ids:
+                try:
+                    chat_id = int(raw)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("chat_id is invalid") from exc
+                if chat_id >= 0:
+                    raise ValueError("only Telegram groups or supergroups can be selected")
+                requested.append(chat_id)
+            if len(set(requested)) != len(requested):
+                raise ValueError("selected chat_ids must be unique")
+            requested.sort()
             candidates_value = read_json(self.paths.dialog_candidates, max_bytes=512 * 1024)
             rows = candidates_value.get("dialogs")
             if not isinstance(rows, list):
                 raise ValueError("dialog candidates are invalid")
             candidates = [DialogCandidate.from_private_dict(row) for row in rows]
-            selected = next((row for row in candidates if row.chat_id == requested), None)
-            if selected is None:
+            by_id = {row.chat_id: row for row in candidates}
+            if any(chat_id not in by_id for chat_id in requested):
                 raise ValueError("chat_id was not in the one-time dialog list")
+            selected = [by_id[chat_id] for chat_id in requested]
             self._require_setup_consent(settings)
             source_id = new_source_id()
             public_key, fingerprint = await self._bounded_external(
@@ -464,12 +503,14 @@ class Collector:
                 "phase": "chat_locked",
                 "chat_locked": True,
                 "source_id": source_id,
-                "chat_id": selected.chat_id,
-                "chat_title": selected.title,
-                "peer": selected.peer.as_dict(),
-                # The authoritative 72-hour boundary is resolved only after an
-                # authenticated receiver gate supplies trusted server time.
-                "initial_message_id": 0,
+                "chats": [{
+                    "chat_id": row.chat_id,
+                    "title": row.title,
+                    "peer": row.peer.as_dict(),
+                    # The first daily boundary is resolved only after a trusted
+                    # receiver gate. Selection never reads Telegram history.
+                    "initial_message_id": 0,
+                } for row in selected],
                 "upload_public_key": public_key,
                 "upload_key_fingerprint": fingerprint,
             })
@@ -480,6 +521,39 @@ class Collector:
             safe_unlink(self.paths.setup_state)
             self._setup_deadline_mono = None
             return self._write_status(last_result="chat_locked", last_error_type=None)
+
+    async def activate_monitoring(self) -> Dict[str, Any]:
+        async with self.state_lock:
+            settings = load_settings(self.paths)
+            if not settings["chat_locked"] or settings["phase"] != "chat_locked":
+                raise RuntimeError("monitoring can only be activated for locked chats")
+            if not consent_active(settings, self.clock()):
+                raise RuntimeError("consent is expired")
+            if self.paths.watch_state.exists():
+                raise RuntimeError("monitoring activation was already requested")
+            atomic_write_json(self.paths.watch_state, {
+                "schema": WATCH_STATE_SCHEMA,
+                "source_id": settings["source_id"],
+                "phase": "activation_requested",
+                "monitor_sequence": 0,
+                "monitor_content_sha256": None,
+                "monitor_cursors": [
+                    {"chat_id": row["chat_id"], "through_message_id": 0}
+                    for row in settings["chats"]
+                ],
+                "chats": [
+                    {"chat_id": row["chat_id"], "scan_through_message_id": 0,
+                     "read_pending_through_message_id": 0,
+                     "read_acked_through_message_id": 0}
+                    for row in settings["chats"]
+                ],
+            })
+        triggered = self.trigger_run()
+        return self._write_status(
+            last_result="activation_requested", last_error_type=None,
+            monitoring_phase="activation_requested", activation_required=False,
+            monitoring_active=False, run_triggered=triggered,
+        )
 
     async def revoke_and_reset(self) -> Dict[str, Any]:
         revoked = self.revoked
@@ -525,8 +599,10 @@ class Collector:
                 self._setup_deadline_mono = None
         result = self._write_status(
             phase="fresh", configured=False, chat_locked=False,
-            consent_active=False, pending_upload=False, source_id=None,
-            chat_id=None, chat_title=None, initial_message_id=None,
+            consent_active=False, pending_digest_upload=False,
+            pending_monitor_upload=False, source_id=None, chats=[],
+            monitoring_phase="not_selected", activation_required=False,
+            monitoring_active=False,
             upload_public_key=None, upload_key_fingerprint=None,
             model=None, upload_target=None, consent_expires_at=None,
             dialogs=[], phone_masked=None, last_result="reset",
@@ -553,8 +629,10 @@ class Collector:
             self._setup_deadline_mono = None
             return self._write_status(
                 phase="fresh", configured=False, chat_locked=False,
-                consent_active=False, pending_upload=False, source_id=None,
-                chat_id=None, chat_title=None, initial_message_id=None,
+                consent_active=False, pending_digest_upload=False,
+                pending_monitor_upload=False, source_id=None, chats=[],
+                monitoring_phase="not_selected", activation_required=False,
+                monitoring_active=False,
                 upload_public_key=None, upload_key_fingerprint=None,
                 model=None, upload_target=None, consent_expires_at=None,
                 dialogs=[], phone_masked=None,
@@ -567,25 +645,27 @@ class Collector:
         async with self.state_lock:
             settings = load_settings(self.paths)
             if not settings["chat_locked"] or settings["phase"] != "chat_locked":
-                raise RuntimeError("consent can only be renewed for a locked chat")
+                raise RuntimeError("consent can only be renewed for locked chats")
             current = self.clock().astimezone(timezone.utc)
             expires = validate_consent_expiry(expires_at, current)
             settings["consent"] = {
-                "scope": "one-exact-chat-text-and-captions",
+                "scope": CONSENT_SCOPE,
                 "granted_at": current.isoformat(timespec="seconds").replace("+00:00", "Z"),
                 "expires_at": expires.isoformat(timespec="seconds").replace("+00:00", "Z"),
             }
             atomic_write_json(self.paths.settings, settings)
             return self._write_status(last_result="consent_renewed", last_error_type=None)
 
-    def _assert_active_locked(self, revoked: asyncio.Event, source_id: str,
-                              chat_id: int,
-                              trusted_now: Optional[datetime] = None) -> None:
+    def _assert_active_locked(
+        self, revoked: asyncio.Event, source_id: str, chat_ids: List[int],
+        trusted_now: Optional[datetime] = None,
+    ) -> None:
         if revoked.is_set():
             raise asyncio.CancelledError
         settings = load_settings(self.paths)
-        if not settings["chat_locked"] or settings["source_id"] != source_id or settings[
-                "chat_id"] != chat_id:
+        actual_ids = [row["chat_id"] for row in settings.get("chats", [])]
+        if (not settings["chat_locked"] or settings["source_id"] != source_id
+                or actual_ids != chat_ids):
             raise asyncio.CancelledError
         if not consent_active(settings, self.clock()):
             raise asyncio.CancelledError
@@ -597,208 +677,721 @@ class Collector:
                     or expires > trusted + timedelta(days=MAX_CONSENT_DAYS)):
                 raise asyncio.CancelledError
 
-    async def _assert_active(self, revoked: asyncio.Event, source_id: str, chat_id: int,
-                             trusted_now: Optional[datetime] = None) -> None:
+    async def _assert_active(
+        self, revoked: asyncio.Event, source_id: str, chat_ids: List[int],
+        trusted_now: Optional[datetime] = None,
+    ) -> None:
         if revoked.is_set():
             raise asyncio.CancelledError
         async with self.state_lock:
-            self._assert_active_locked(revoked, source_id, chat_id, trusted_now)
+            self._assert_active_locked(revoked, source_id, chat_ids, trusted_now)
         if revoked.is_set():
             raise asyncio.CancelledError
-
-    def _read_pending_bytes(self) -> Optional[bytes]:
-        if not self.paths.pending.exists():
-            return None
-        with self.paths.pending.open("rb") as stream:
-            raw = stream.read(MAX_UPLOAD_BYTES + 1)
-        if len(raw) > MAX_UPLOAD_BYTES:
-            raise ValueError("pending upload exceeds hard limit")
-        value = json.loads(raw.decode("utf-8"))
-        if not isinstance(value, dict):
-            raise ValueError("pending upload is invalid")
-        validate_upload(value)
-        if canonical_upload_bytes(value) != raw:
-            raise ValueError("pending upload bytes changed")
-        return raw
-
-    def _load_acknowledged(self, source_id: str, chat_id: int) -> Optional[Dict[str, Any]]:
-        if not self.paths.acknowledged.exists():
-            return None
-        value = read_json(self.paths.acknowledged, max_bytes=16 * 1024)
-        if set(value) != {
-                "schema", "source_id", "chat_id", "sequence", "content_sha256",
-                "through_message_id", "digest_date"}:
-            raise ValueError("acknowledged checkpoint has unexpected fields")
-        if (value.get("schema") != ACKNOWLEDGED_SCHEMA
-                or value.get("source_id") != source_id
-                or value.get("chat_id") != chat_id
-                or type(value.get("sequence")) is not int
-                or not 1 <= value["sequence"] <= 2**63 - 1
-                or type(value.get("through_message_id")) is not int
-                or not 0 <= value["through_message_id"] <= 2**63 - 1
-                or not isinstance(value.get("content_sha256"), str)
-                or re.fullmatch(r"[0-9a-f]{64}", value["content_sha256"]) is None):
-            raise ValueError("acknowledged checkpoint is invalid")
-        try:
-            checkpoint_day = date.fromisoformat(value.get("digest_date"))
-        except (TypeError, ValueError):
-            raise ValueError("acknowledged checkpoint date is invalid") from None
-        if checkpoint_day.isoformat() != value["digest_date"]:
-            raise ValueError("acknowledged checkpoint date is invalid")
-        return value
-
-    def _save_acknowledged(self, upload: Dict[str, Any]) -> None:
-        validate_upload(upload)
-        atomic_write_json(self.paths.acknowledged, {
-            "schema": ACKNOWLEDGED_SCHEMA,
-            "source_id": upload["source_id"],
-            "chat_id": upload["chat_id"],
-            "sequence": upload["sequence"],
-            "content_sha256": upload["content_sha256"],
-            "through_message_id": upload["through_message_id"],
-            "digest_date": upload["digest_date"],
-        })
-
-    @staticmethod
-    def _position(sequence: int, previous: Optional[str], cursor: int) -> tuple[Any, ...]:
-        return sequence, previous, cursor
-
-    def _validate_gate_chain(
-        self,
-        gate: Dict[str, Any],
-        acknowledged: Optional[Dict[str, Any]],
-        pending: Optional[Dict[str, Any]],
-        initial_message_id: int,
-        source_id: str,
-        chat_id: int,
-    ) -> None:
-        """Reject receiver rollback/jumps before Telegram can be contacted."""
-        if acknowledged is None:
-            base = self._position(1, None, initial_message_id)
-            last_day: Optional[date] = None
-        else:
-            base = self._position(
-                acknowledged["sequence"] + 1,
-                acknowledged["content_sha256"],
-                acknowledged["through_message_id"],
-            )
-            last_day = date.fromisoformat(acknowledged["digest_date"])
-
-        allowed = {base}
-        if pending is not None:
-            if (pending["source_id"] != source_id or pending["chat_id"] != chat_id
-                    or self._position(
-                        pending["sequence"], pending["previous_sha256"],
-                        pending["from_message_id_exclusive"],
-                    ) != base):
-                raise RuntimeError("pending upload is not linked to local checkpoint")
-            if (last_day is not None
-                    and date.fromisoformat(pending["digest_date"]) <= last_day):
-                raise RuntimeError("pending digest date did not advance")
-            allowed.add(self._position(
-                pending["sequence"] + 1,
-                pending["content_sha256"],
-                pending["through_message_id"],
-            ))
-
-        remote = self._position(
-            gate["next_sequence"], gate["previous_sha256"],
-            gate["from_message_id_exclusive"],
-        )
-        if remote not in allowed:
-            raise RuntimeError("receiver chain rolled back or jumped")
-        if gate["due"] and last_day is not None:
-            try:
-                gate_day = date.fromisoformat(gate["digest_date"])
-            except ValueError:
-                raise RuntimeError("receiver digest date is invalid") from None
-            if gate_day <= last_day:
-                raise RuntimeError("receiver digest date did not advance")
 
     def _generated_at(self, gate: Dict[str, Any], gate_received_mono: float) -> datetime:
         elapsed = self.monotonic() - gate_received_mono
         if elapsed < 0 or elapsed > 3600:
             raise RuntimeError("gate age is outside the generation bound")
-        # Artifact timestamps stay entirely in the receiver's clock domain;
-        # Umbrel's wall clock may be arbitrarily ahead or behind.
-        return parse_utc(gate["server_time"], "server_time") + timedelta(
-            seconds=elapsed)
+        return parse_utc(gate["server_time"], "server_time") + timedelta(seconds=elapsed)
 
-    async def _handle_pending(self, raw: bytes, gate: Dict[str, Any], transport: Any,
-                              revoked: asyncio.Event, source_id: str,
-                              chat_id: int,
-                              gate_received_mono: float) -> Optional[Dict[str, Any]]:
-        pending = json.loads(raw.decode("utf-8"))
-        accepted = (
-            gate["next_sequence"] == pending["sequence"] + 1
-            and gate["previous_sha256"] == pending["content_sha256"]
-            and gate["from_message_id_exclusive"] == pending["through_message_id"]
-        )
-        if accepted:
-            # Remote chain is authoritative only once mirrored locally.  Write
-            # the checkpoint before deleting pending so every crash window can
-            # either replay bytes or prove the accepted position.
-            async with self.state_lock:
-                self._assert_active_locked(
-                    revoked, source_id, chat_id,
-                    self._generated_at(gate, gate_received_mono),
-                )
-                self._save_acknowledged(pending)
-                safe_unlink(self.paths.pending)
-            return self._write_status(
-                last_run_at=self.clock().isoformat(), last_result="reconciled",
-                last_error_type=None, pending_upload=False,
-                last_message_count=pending["message_count"],
-                last_through_message_id=pending["through_message_id"],
-            )
-        same_position = (
-            gate["next_sequence"] == pending["sequence"]
-            and gate["previous_sha256"] == pending["previous_sha256"]
-            and gate["from_message_id_exclusive"] == pending["from_message_id_exclusive"]
-        )
-        if not same_position:
-            raise RuntimeError("pending upload does not match remote chain")
-        plan_changed = (
-            gate["digest_date"] != pending["digest_date"]
-            or gate["timezone"] != pending["timezone"]
-        )
-        if plan_changed and gate["due"]:
-            # The receiver never accepted the old final payload. Once it issues
-            # a different due plan at the same chain position (next local day or
-            # a timezone change), that summary is deterministically obsolete;
-            # no raw text is involved. Accepted lost-ACK is handled above first.
-            safe_unlink(self.paths.pending)
+    @staticmethod
+    def _cursor_map(rows: List[Dict[str, Any]]) -> Dict[int, int]:
+        return {row["chat_id"]: row["through_message_id"] for row in rows}
+
+    @staticmethod
+    def _cursor_rows(cursors: Dict[int, int]) -> List[Dict[str, int]]:
+        return [
+            {"chat_id": chat_id, "through_message_id": cursors[chat_id]}
+            for chat_id in sorted(cursors)
+        ]
+
+    def _load_watch_state(self, source_id: str, chat_ids: List[int]) -> Dict[str, Any]:
+        value = read_json(self.paths.watch_state, max_bytes=64 * 1024)
+        if set(value) != {
+                "schema", "source_id", "phase", "monitor_sequence",
+                "monitor_content_sha256", "monitor_cursors", "chats"}:
+            raise ValueError("watch state has unexpected fields")
+        if (value["schema"] != WATCH_STATE_SCHEMA or value["source_id"] != source_id
+                or value["phase"] not in (
+                    "activation_requested", "baseline_read_pending", "active")):
+            raise ValueError("watch state identity/phase is invalid")
+        sequence = value["monitor_sequence"]
+        previous = value["monitor_content_sha256"]
+        if type(sequence) is not int or not 0 <= sequence <= 2**63 - 1:
+            raise ValueError("watch monitor sequence is invalid")
+        if ((sequence == 0 and previous is not None)
+                or (sequence > 0 and (
+                    not isinstance(previous, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", previous) is None))):
+            raise ValueError("watch monitor hash is invalid")
+        monitor_rows = value["monitor_cursors"]
+        chat_rows = value["chats"]
+        if not isinstance(monitor_rows, list) or not isinstance(chat_rows, list):
+            raise ValueError("watch cursors are invalid")
+        if [row.get("chat_id") for row in monitor_rows if isinstance(row, dict)] != chat_ids:
+            raise ValueError("watch monitor chat set is invalid")
+        if [row.get("chat_id") for row in chat_rows if isinstance(row, dict)] != chat_ids:
+            raise ValueError("watch local chat set is invalid")
+        monitor_cursors: Dict[int, int] = {}
+        for row in monitor_rows:
+            if set(row) != {"chat_id", "through_message_id"}:
+                raise ValueError("watch monitor cursor is invalid")
+            through = row["through_message_id"]
+            if type(through) is not int or not 0 <= through <= 2**63 - 1:
+                raise ValueError("watch monitor cursor is invalid")
+            monitor_cursors[row["chat_id"]] = through
+        for row in chat_rows:
+            if set(row) != {
+                    "chat_id", "scan_through_message_id",
+                    "read_pending_through_message_id",
+                    "read_acked_through_message_id"}:
+                raise ValueError("watch local cursor is invalid")
+            scan = row["scan_through_message_id"]
+            pending = row["read_pending_through_message_id"]
+            acked = row["read_acked_through_message_id"]
+            if (any(type(item) is not int for item in (scan, pending, acked))
+                    or not 0 <= acked <= pending == scan <= 2**63 - 1
+                    or monitor_cursors[row["chat_id"]] > scan):
+                raise ValueError("watch local cursor ordering is invalid")
+        if value["phase"] == "activation_requested" and (
+                sequence != 0 or any(row["through_message_id"] != 0 for row in monitor_rows)
+                or any(row["scan_through_message_id"] != 0 for row in chat_rows)):
+            raise ValueError("activation state must start at zero")
+        return value
+
+    def _read_pending(self, path: Any, stream: str) -> Optional[bytes]:
+        if not path.exists():
             return None
-        same_plan = (
-            gate["digest_date"] == pending["digest_date"]
-            and gate["timezone"] == pending["timezone"]
+        with path.open("rb") as file:
+            raw = file.read(MAX_UPLOAD_BYTES + 1)
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise ValueError(f"pending {stream} upload exceeds hard limit")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise ValueError(f"pending {stream} upload is invalid") from None
+        if not isinstance(value, dict):
+            raise ValueError(f"pending {stream} upload is invalid")
+        canonical = (
+            canonical_monitor_bytes(validate_monitor_upload(value))
+            if stream == "monitor"
+            else canonical_digest_bytes(validate_digest_upload(value))
         )
-        if not same_plan:
-            raise RuntimeError("pending upload does not match remote plan")
-        if not gate["due"]:
-            return self._write_status(
-                last_run_at=self.clock().isoformat(), last_result="pending_not_due",
-                last_error_type=None, pending_upload=True)
-        if len(raw) > gate["max_upload_bytes"]:
-            raise RuntimeError("pending upload exceeds receiver limit")
-        await self._assert_active(
-            revoked, source_id, chat_id,
-            self._generated_at(gate, gate_received_mono),
+        if canonical != raw:
+            raise ValueError(f"pending {stream} upload bytes changed")
+        return raw
+
+    def _apply_monitor_payload(
+        self, state: Dict[str, Any], payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if state["monitor_sequence"] == payload["sequence"]:
+            if state["monitor_content_sha256"] != payload["content_sha256"]:
+                raise RuntimeError("monitor checkpoint hash mismatch")
+            return state
+        if (payload["sequence"] != state["monitor_sequence"] + 1
+                or payload["previous_sha256"] != state["monitor_content_sha256"]):
+            raise RuntimeError("monitor payload is not linked to local checkpoint")
+        remote = self._cursor_map(state["monitor_cursors"])
+        local = {row["chat_id"]: row for row in state["chats"]}
+        for row in payload["ranges"]:
+            chat_id = row["chat_id"]
+            if remote.get(chat_id) != row["from_message_id_exclusive"]:
+                raise RuntimeError("monitor payload skipped remote cursor")
+            through = row["through_message_id"]
+            if through < local[chat_id]["scan_through_message_id"]:
+                raise RuntimeError("monitor payload moved local cursor backwards")
+            remote[chat_id] = through
+            local[chat_id]["scan_through_message_id"] = through
+            local[chat_id]["read_pending_through_message_id"] = through
+        if payload["kind"] == "baseline":
+            if state["phase"] != "activation_requested":
+                raise RuntimeError("baseline does not match local activation phase")
+            state["phase"] = "baseline_read_pending"
+        elif state["phase"] != "active":
+            raise RuntimeError("mentions require active monitoring")
+        state["monitor_sequence"] = payload["sequence"]
+        state["monitor_content_sha256"] = payload["content_sha256"]
+        state["monitor_cursors"] = self._cursor_rows(remote)
+        state["chats"] = [local[chat_id] for chat_id in sorted(local)]
+        return state
+
+    @staticmethod
+    def _monitor_position(gate_section: Dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            gate_section["next_sequence"], gate_section["previous_sha256"],
+            tuple((row["chat_id"], row["through_message_id"])
+                  for row in gate_section["cursors"]),
         )
-        await transport.upload(raw, revoked)
-        async with self.state_lock:
-            self._assert_active_locked(
-                revoked, source_id, chat_id,
+
+    def _expected_monitor_position(self, state: Dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            state["monitor_sequence"] + 1,
+            state["monitor_content_sha256"],
+            tuple((row["chat_id"], row["through_message_id"])
+                  for row in state["monitor_cursors"]),
+        )
+
+    def _position_after_monitor_payload(
+        self, state: Dict[str, Any], payload: Dict[str, Any],
+    ) -> tuple[Any, ...]:
+        cursors = self._cursor_map(state["monitor_cursors"])
+        for row in payload["ranges"]:
+            cursors[row["chat_id"]] = row["through_message_id"]
+        return (
+            payload["sequence"] + 1, payload["content_sha256"],
+            tuple(sorted(cursors.items())),
+        )
+
+    async def _handle_monitor_pending(
+        self, raw: bytes, gate: Dict[str, Any], transport: Any,
+        revoked: asyncio.Event, source_id: str, chat_ids: List[int],
+        gate_received_mono: float,
+    ) -> Dict[str, Any]:
+        payload = json.loads(raw.decode("utf-8"))
+        state = self._load_watch_state(source_id, chat_ids)
+        remote = self._monitor_position(gate["monitor"])
+        local = self._expected_monitor_position(state)
+        accepted = remote == self._position_after_monitor_payload(state, payload)
+        if not accepted and remote != local:
+            raise RuntimeError("pending monitor upload does not match remote chain")
+        if not accepted:
+            if len(raw) > gate["monitor"]["max_upload_bytes"]:
+                raise RuntimeError("pending monitor upload exceeds receiver limit")
+            await self._assert_active(
+                revoked, source_id, chat_ids,
                 self._generated_at(gate, gate_received_mono),
             )
-            self._save_acknowledged(pending)
-            safe_unlink(self.paths.pending)
-        return self._write_status(
-            last_run_at=self.clock().isoformat(), last_result="uploaded_pending",
-            last_error_type=None, pending_upload=False,
-            last_message_count=pending["message_count"],
-            last_through_message_id=pending["through_message_id"],
+            await transport.upload_monitor(raw, revoked)
+        async with self.state_lock:
+            self._assert_active_locked(
+                revoked, source_id, chat_ids,
+                self._generated_at(gate, gate_received_mono),
+            )
+            state = self._load_watch_state(source_id, chat_ids)
+            state = self._apply_monitor_payload(state, payload)
+            atomic_write_json(self.paths.watch_state, state)
+            safe_unlink(self.paths.monitor_pending)
+        return state
+
+    async def _retry_read_acks(
+        self, state: Dict[str, Any], gateway: Any, session: str,
+        chats: List[Dict[str, Any]], revoked: asyncio.Event, source_id: str,
+        chat_ids: List[int], gate: Dict[str, Any], gate_received_mono: float,
+    ) -> tuple[Dict[str, Any], List[int]]:
+        by_id = {row["chat_id"]: row for row in chats}
+        targets: List[tuple[int, PeerSpec, int]] = []
+        expected: Dict[int, int] = {}
+        for cursor in state["chats"]:
+            pending = cursor["read_pending_through_message_id"]
+            if pending <= cursor["read_acked_through_message_id"]:
+                continue
+            chat = by_id[cursor["chat_id"]]
+            targets.append((
+                cursor["chat_id"], PeerSpec.from_dict(chat["peer"]), pending,
+            ))
+            expected[cursor["chat_id"]] = pending
+        if targets:
+            await self._assert_active(
+                revoked, source_id, chat_ids,
+                self._generated_at(gate, gate_received_mono),
+            )
+            succeeded, failed = await self._bounded_external(
+                gateway.acknowledge_reads(session, targets),
+                TELEGRAM_FETCH_TIMEOUT_S,
+            )
+            expected_ids = set(expected)
+            if (not isinstance(succeeded, list) or not isinstance(failed, list)
+                    or len(succeeded) != len(set(succeeded))
+                    or len(failed) != len(set(failed))
+                    or set(succeeded).intersection(failed)
+                    or set(succeeded).union(failed) != expected_ids):
+                raise RuntimeError("Telegram read acknowledgement result is invalid")
+            async with self.state_lock:
+                self._assert_active_locked(
+                    revoked, source_id, chat_ids,
+                    self._generated_at(gate, gate_received_mono),
+                )
+                latest = self._load_watch_state(source_id, chat_ids)
+                for chat_id in succeeded:
+                    latest_row = next(
+                        row for row in latest["chats"] if row["chat_id"] == chat_id)
+                    if latest_row["read_pending_through_message_id"] != expected[chat_id]:
+                        raise RuntimeError("read acknowledgement target changed")
+                    latest_row["read_acked_through_message_id"] = expected[chat_id]
+                atomic_write_json(self.paths.watch_state, latest)
+                state = latest
+        else:
+            failed = []
+        if (state["phase"] == "baseline_read_pending"
+                and all(row["read_acked_through_message_id"]
+                        == row["read_pending_through_message_id"]
+                        for row in state["chats"])):
+            async with self.state_lock:
+                latest = self._load_watch_state(source_id, chat_ids)
+                latest["phase"] = "active"
+                atomic_write_json(self.paths.watch_state, latest)
+                state = latest
+        return state, failed
+
+    async def _fresh_gate(
+        self, transport: Any, source_id: str, chat_ids: List[int],
+        revoked: asyncio.Event,
+    ) -> tuple[Dict[str, Any], float]:
+        gate = await transport.gate(source_id, chat_ids, revoked)
+        validate_gate(gate, chat_ids)
+        received = self.monotonic()
+        await self._assert_active(
+            revoked, source_id, chat_ids, self._generated_at(gate, received))
+        return gate, received
+
+    async def _run_monitor(
+        self, gate: Dict[str, Any], gate_received_mono: float, transport: Any,
+        gateway: Any, settings: Dict[str, Any], session: str,
+        revoked: asyncio.Event,
+    ) -> tuple[Dict[str, Any], float, int, int]:
+        source_id = settings["source_id"]
+        chats = settings["chats"]
+        chat_ids = [row["chat_id"] for row in chats]
+        state = self._load_watch_state(source_id, chat_ids)
+        pending_raw = self._read_pending(self.paths.monitor_pending, "monitor")
+        allowed = {self._expected_monitor_position(state)}
+        if pending_raw is not None:
+            pending = json.loads(pending_raw.decode("utf-8"))
+            allowed.add(self._position_after_monitor_payload(state, pending))
+        if self._monitor_position(gate["monitor"]) not in allowed:
+            raise RuntimeError("receiver monitor chain rolled back or jumped")
+        if pending_raw is not None:
+            state = await self._handle_monitor_pending(
+                pending_raw, gate, transport, revoked, source_id, chat_ids,
+                gate_received_mono,
+            )
+            # A remote mutation makes the old monitor gate stale.
+            gate, gate_received_mono = await self._fresh_gate(
+                transport, source_id, chat_ids, revoked)
+        failed_chat_count = 0
+
+        # Baseline completion is its own durable phase. A retry tick performs
+        # only the outstanding read batch; active scans start on the next tick,
+        # keeping the watcher at no more than two Telegram connections per tick.
+        if state["phase"] == "baseline_read_pending":
+            state, failed_chat_ids = await self._retry_read_acks(
+                state, gateway, session, chats, revoked, source_id, chat_ids,
+                gate, gate_received_mono,
+            )
+            return gate, gate_received_mono, 0, len(failed_chat_ids)
+
+        if state["phase"] == "activation_requested":
+            if not gate["monitor"]["baseline_required"]:
+                raise RuntimeError("receiver refused required baseline")
+            selected = [
+                (row["chat_id"], PeerSpec.from_dict(row["peer"])) for row in chats
+            ]
+            await self._assert_active(
+                revoked, source_id, chat_ids,
+                self._generated_at(gate, gate_received_mono),
+            )
+            tops = await self._bounded_external(
+                gateway.snapshot_tops(session, selected), TELEGRAM_FETCH_TIMEOUT_S)
+            ranges = [
+                {"chat_id": row["chat_id"],
+                 "from_message_id_exclusive": gate["monitor"]["cursors"][index][
+                     "through_message_id"],
+                 "through_message_id": tops[row["chat_id"]]}
+                for index, row in enumerate(chats)
+            ]
+            payload = build_monitor_upload(
+                source_id=source_id, gate=gate, kind="baseline", ranges=ranges,
+                events=[], generated_at=self._generated_at(gate, gate_received_mono),
+            )
+            pending = canonical_monitor_bytes(payload)
+            if len(pending) > gate["monitor"]["max_upload_bytes"]:
+                raise RuntimeError("baseline exceeds receiver max_upload_bytes")
+            async with self.state_lock:
+                self._assert_active_locked(
+                    revoked, source_id, chat_ids,
+                    self._generated_at(gate, gate_received_mono),
+                )
+                atomic_write_bytes(self.paths.monitor_pending, pending, 0o600)
+            await transport.upload_monitor(pending, revoked)
+            async with self.state_lock:
+                self._assert_active_locked(
+                    revoked, source_id, chat_ids,
+                    self._generated_at(gate, gate_received_mono),
+                )
+                state = self._load_watch_state(source_id, chat_ids)
+                state = self._apply_monitor_payload(state, payload)
+                atomic_write_json(self.paths.watch_state, state)
+                safe_unlink(self.paths.monitor_pending)
+            state, read_failures = await self._retry_read_acks(
+                state, gateway, session, chats, revoked, source_id, chat_ids,
+                gate, gate_received_mono,
+            )
+            # Do not scan beyond the frozen baseline without a fresh status.
+            fresh_gate, fresh_mono = await self._fresh_gate(
+                transport, source_id, chat_ids, revoked)
+            return fresh_gate, fresh_mono, 0, len(set(read_failures))
+
+        if state["phase"] != "active" or gate["monitor"]["baseline_required"]:
+            raise RuntimeError("local and remote baseline state disagree")
+
+        selected = []
+        for row in chats:
+            local_row = next(
+                item for item in state["chats"] if item["chat_id"] == row["chat_id"])
+            selected.append((
+                row["chat_id"], PeerSpec.from_dict(row["peer"]), row["title"],
+                local_row["scan_through_message_id"],
+            ))
+        await self._assert_active(
+            revoked, source_id, chat_ids,
+            self._generated_at(gate, gate_received_mono),
         )
+        _, scans, scan_failures = await self._bounded_external(
+            gateway.snapshot_and_scan_mentions(session, source_id, selected),
+            TELEGRAM_FETCH_TIMEOUT_S,
+        )
+        await self._assert_active(
+            revoked, source_id, chat_ids,
+            self._generated_at(gate, gate_received_mono),
+        )
+        if (not isinstance(scans, dict) or not isinstance(scan_failures, list)
+                or len(scan_failures) != len(set(scan_failures))
+                or set(scans).intersection(scan_failures)
+                or set(scans).union(scan_failures) != set(chat_ids)):
+            raise RuntimeError("Telegram mention scan result is invalid")
+        failed_chat_ids = set(scan_failures)
+        mention_count = 0
+        for chat in chats:
+            chat_id = chat["chat_id"]
+            if chat_id not in scans:
+                continue
+            local_row = next(row for row in state["chats"] if row["chat_id"] == chat_id)
+            start = local_row["scan_through_message_id"]
+            scan = scans[chat_id]
+            await self._assert_active(
+                revoked, source_id, chat_ids,
+                self._generated_at(gate, gate_received_mono),
+            )
+            if scan.through_message_id < start:
+                raise RuntimeError("mention scan moved backwards")
+            if scan.events:
+                remote_cursor = next(
+                    row["through_message_id"] for row in gate["monitor"]["cursors"]
+                    if row["chat_id"] == chat_id)
+                wire_events = [{
+                    "event_id": event.event_id,
+                    "message_id": event.message_id,
+                    "date": utc_iso(event.sent_at),
+                    "chat_title": event.chat_title,
+                    "sender": event.sender,
+                    "snippet": event.snippet,
+                    "link": event.link,
+                } for event in scan.events]
+                payload = build_monitor_upload(
+                    source_id=source_id, gate=gate, kind="mentions",
+                    ranges=[{
+                        "chat_id": chat_id,
+                        "from_message_id_exclusive": remote_cursor,
+                        "through_message_id": scan.through_message_id,
+                    }],
+                    events=wire_events,
+                    generated_at=self._generated_at(gate, gate_received_mono),
+                )
+                pending = canonical_monitor_bytes(payload)
+                if len(pending) > gate["monitor"]["max_upload_bytes"]:
+                    raise RuntimeError("mentions exceed receiver max_upload_bytes")
+                async with self.state_lock:
+                    self._assert_active_locked(
+                        revoked, source_id, chat_ids,
+                        self._generated_at(gate, gate_received_mono),
+                    )
+                    atomic_write_bytes(self.paths.monitor_pending, pending, 0o600)
+                await transport.upload_monitor(pending, revoked)
+                async with self.state_lock:
+                    self._assert_active_locked(
+                        revoked, source_id, chat_ids,
+                        self._generated_at(gate, gate_received_mono),
+                    )
+                    state = self._load_watch_state(source_id, chat_ids)
+                    state = self._apply_monitor_payload(state, payload)
+                    atomic_write_json(self.paths.watch_state, state)
+                    safe_unlink(self.paths.monitor_pending)
+                mention_count += len(scan.events)
+                gate, gate_received_mono = await self._fresh_gate(
+                    transport, source_id, chat_ids, revoked)
+            else:
+                async with self.state_lock:
+                    self._assert_active_locked(
+                        revoked, source_id, chat_ids,
+                        self._generated_at(gate, gate_received_mono),
+                    )
+                    state = self._load_watch_state(source_id, chat_ids)
+                    row = next(item for item in state["chats"] if item["chat_id"] == chat_id)
+                    row["scan_through_message_id"] = scan.through_message_id
+                    row["read_pending_through_message_id"] = scan.through_message_id
+                    atomic_write_json(self.paths.watch_state, state)
+        state, read_failures = await self._retry_read_acks(
+            state, gateway, session, chats, revoked, source_id, chat_ids,
+            gate, gate_received_mono,
+        )
+        failed_chat_ids.update(read_failures)
+        failed_chat_count = len(failed_chat_ids)
+        return gate, gate_received_mono, mention_count, failed_chat_count
+
+    def _load_digest_ack(
+        self, source_id: str, chat_ids: List[int],
+    ) -> Optional[Dict[str, Any]]:
+        if not self.paths.acknowledged.exists():
+            return None
+        value = read_json(self.paths.acknowledged, max_bytes=32 * 1024)
+        if set(value) != {
+                "schema", "source_id", "sequence", "content_sha256",
+                "digest_date", "cursors"}:
+            raise ValueError("digest checkpoint has unexpected fields")
+        if (value["schema"] != DIGEST_ACKNOWLEDGED_SCHEMA
+                or value["source_id"] != source_id
+                or type(value["sequence"]) is not int or value["sequence"] < 1
+                or not isinstance(value["content_sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", value["content_sha256"]) is None):
+            raise ValueError("digest checkpoint is invalid")
+        try:
+            if date.fromisoformat(value["digest_date"]).isoformat() != value["digest_date"]:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("digest checkpoint date is invalid") from None
+        rows = value["cursors"]
+        if (not isinstance(rows, list)
+                or [row.get("chat_id") for row in rows if isinstance(row, dict)] != chat_ids):
+            raise ValueError("digest checkpoint chat set is invalid")
+        for row in rows:
+            if (set(row) != {"chat_id", "through_message_id"}
+                    or type(row["through_message_id"]) is not int
+                    or row["through_message_id"] < 0):
+                raise ValueError("digest checkpoint cursor is invalid")
+        return value
+
+    def _save_digest_ack(self, payload: Dict[str, Any]) -> None:
+        validate_digest_upload(payload)
+        atomic_write_json(self.paths.acknowledged, {
+            "schema": DIGEST_ACKNOWLEDGED_SCHEMA,
+            "source_id": payload["source_id"],
+            "sequence": payload["sequence"],
+            "content_sha256": payload["content_sha256"],
+            "digest_date": payload["digest_date"],
+            "cursors": [
+                {"chat_id": row["chat_id"],
+                 "through_message_id": row["through_message_id"]}
+                for row in payload["chat_ranges"]
+            ],
+        })
+
+    @staticmethod
+    def _digest_position(section: Dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            section["next_sequence"], section["previous_sha256"],
+            tuple((row["chat_id"], row["through_message_id"])
+                  for row in section["cursors"]),
+        )
+
+    def _digest_base(
+        self, acknowledged: Optional[Dict[str, Any]], chat_ids: List[int],
+    ) -> tuple[Any, ...]:
+        if acknowledged is None:
+            return 1, None, tuple((chat_id, 0) for chat_id in chat_ids)
+        return (
+            acknowledged["sequence"] + 1, acknowledged["content_sha256"],
+            tuple((row["chat_id"], row["through_message_id"])
+                  for row in acknowledged["cursors"]),
+        )
+
+    @staticmethod
+    def _digest_after(payload: Dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            payload["sequence"] + 1, payload["content_sha256"],
+            tuple((row["chat_id"], row["through_message_id"])
+                  for row in payload["chat_ranges"]),
+        )
+
+    async def _run_digest(
+        self, gate: Dict[str, Any], gate_received_mono: float, transport: Any,
+        gateway: Any, settings: Dict[str, Any], credentials: Dict[str, Any],
+        session: str, revoked: asyncio.Event,
+    ) -> tuple[str, int]:
+        source_id = settings["source_id"]
+        chats = settings["chats"]
+        chat_ids = [row["chat_id"] for row in chats]
+        acknowledged = self._load_digest_ack(source_id, chat_ids)
+        pending_raw = self._read_pending(self.paths.pending, "digest")
+        pending_value = json.loads(pending_raw.decode("utf-8")) if pending_raw else None
+        base = self._digest_base(acknowledged, chat_ids)
+        allowed = {base}
+        stale_local_pending = False
+        if pending_value is not None:
+            pending_base = (
+                pending_value["sequence"], pending_value["previous_sha256"],
+                tuple((row["chat_id"], row["from_message_id_exclusive"])
+                      for row in pending_value["chat_ranges"]),
+            )
+            if pending_base == base:
+                allowed.add(self._digest_after(pending_value))
+            elif (acknowledged is not None
+                  and pending_value["sequence"] == acknowledged["sequence"]
+                  and pending_value["content_sha256"] == acknowledged["content_sha256"]
+                  and pending_value["digest_date"] == acknowledged["digest_date"]
+                  and self._digest_after(pending_value) == base):
+                # The acknowledged checkpoint was fsynced before unlinking the
+                # pending file. A power loss in that tiny window leaves both.
+                stale_local_pending = True
+            else:
+                raise RuntimeError("pending digest is not linked to local checkpoint")
+        remote = self._digest_position(gate["digest"])
+        if remote not in allowed:
+            raise RuntimeError("receiver digest chain rolled back or jumped")
+        if stale_local_pending:
+            async with self.state_lock:
+                self._assert_active_locked(
+                    revoked, source_id, chat_ids,
+                    self._generated_at(gate, gate_received_mono),
+                )
+                safe_unlink(self.paths.pending)
+            pending_raw = None
+            pending_value = None
+        if pending_value is not None:
+            if remote == self._digest_after(pending_value):
+                async with self.state_lock:
+                    self._assert_active_locked(
+                        revoked, source_id, chat_ids,
+                        self._generated_at(gate, gate_received_mono),
+                    )
+                    self._save_digest_ack(pending_value)
+                    safe_unlink(self.paths.pending)
+                acknowledged = pending_value
+                pending_raw = None
+            else:
+                same_plan = (
+                    gate["digest"]["digest_date"] == pending_value["digest_date"]
+                    and gate["timezone"] == pending_value["timezone"])
+                if not same_plan and gate["digest"]["due"]:
+                    safe_unlink(self.paths.pending)
+                    pending_raw = None
+                elif not same_plan:
+                    raise RuntimeError("pending digest does not match remote plan")
+                elif not gate["digest"]["due"]:
+                    return "pending_digest_not_due", 0
+                else:
+                    if len(pending_raw) > gate["digest"]["max_upload_bytes"]:
+                        raise RuntimeError("pending digest exceeds receiver limit")
+                    await transport.upload_digest(pending_raw, revoked)
+                    async with self.state_lock:
+                        self._assert_active_locked(
+                            revoked, source_id, chat_ids,
+                            self._generated_at(gate, gate_received_mono),
+                        )
+                        self._save_digest_ack(pending_value)
+                        safe_unlink(self.paths.pending)
+                    return "uploaded_pending_digest", pending_value["total_message_count"]
+        if not gate["digest"]["due"]:
+            return "watched_not_due", 0
+
+        if acknowledged is not None:
+            last_day = date.fromisoformat(acknowledged["digest_date"])
+            if date.fromisoformat(gate["digest"]["digest_date"]) <= last_day:
+                raise RuntimeError("receiver digest date did not advance")
+        now_mono = self.monotonic()
+        sequence = gate["digest"]["next_sequence"]
+        if (self._last_attempt and self._last_attempt[0] == sequence
+                and now_mono - self._last_attempt[1] < 300):
+            return "digest_cooldown", 0
+        self._last_attempt = (sequence, now_mono)
+
+        cutoff = parse_utc(gate["server_time"], "server_time")
+        first = acknowledged is None and sequence == 1
+        per_chat_budget = max(1024, MAX_PROMPT_BYTES // len(chats))
+        digest_chats: List[DigestChat] = []
+        ranges: List[Dict[str, int]] = []
+        for chat, cursor in zip(chats, gate["digest"]["cursors"]):
+            peer = PeerSpec.from_dict(chat["peer"])
+            start = cursor["through_message_id"]
+            effective = start
+            not_before: Optional[datetime] = None
+            if first:
+                not_before = cutoff - timedelta(hours=DEFAULT_LOOKBACK_HOURS)
+                await self._assert_active(
+                    revoked, source_id, chat_ids,
+                    self._generated_at(gate, gate_received_mono),
+                )
+                trusted_cursor = await self._bounded_external(
+                    gateway.bootstrap_cursor(session, peer, cutoff),
+                    TELEGRAM_FETCH_TIMEOUT_S,
+                )
+                await self._assert_active(
+                    revoked, source_id, chat_ids,
+                    self._generated_at(gate, gate_received_mono),
+                )
+                effective = max(start, trusted_cursor)
+            await self._assert_active(
+                revoked, source_id, chat_ids,
+                self._generated_at(gate, gate_received_mono),
+            )
+            fetched = await self._bounded_external(
+                gateway.fetch(
+                    session, peer, chat["chat_id"], effective, cutoff,
+                    not_before_at=not_before, max_prompt_bytes=per_chat_budget,
+                    chat_title=chat["title"],
+                ),
+                TELEGRAM_FETCH_TIMEOUT_S,
+            )
+            await self._assert_active(
+                revoked, source_id, chat_ids,
+                self._generated_at(gate, gate_received_mono),
+            )
+            if fetched.through_message_id < effective:
+                raise RuntimeError("Telegram digest cursor moved backwards")
+            ranges.append({
+                "chat_id": chat["chat_id"],
+                "from_message_id_exclusive": start,
+                "through_message_id": fetched.through_message_id,
+                "message_count": len(fetched.messages),
+            })
+            if fetched.messages:
+                digest_chats.append(DigestChat(chat["title"], fetched.messages))
+
+        total = sum(row["message_count"] for row in ranges)
+        digest = "" if total == 0 else await self._bounded_external(
+            self.digest_function(
+                digest_chats, settings["openrouter_model"],
+                credentials["openrouter_api_key"], revoked,
+            ),
+            OPENROUTER_TIMEOUT_S,
+        )
+        await self._assert_active(
+            revoked, source_id, chat_ids,
+            self._generated_at(gate, gate_received_mono),
+        )
+        payload = build_digest_upload(
+            source_id=source_id, gate=gate, chat_ranges=ranges, digest=digest,
+            model=settings["openrouter_model"],
+            generated_at=self._generated_at(gate, gate_received_mono),
+        )
+        pending = canonical_digest_bytes(payload)
+        if len(pending) > gate["digest"]["max_upload_bytes"]:
+            raise RuntimeError("digest exceeds receiver max_upload_bytes")
+        async with self.state_lock:
+            self._assert_active_locked(
+                revoked, source_id, chat_ids,
+                self._generated_at(gate, gate_received_mono),
+            )
+            atomic_write_bytes(self.paths.pending, pending, 0o600)
+        await transport.upload_digest(pending, revoked)
+        async with self.state_lock:
+            self._assert_active_locked(
+                revoked, source_id, chat_ids,
+                self._generated_at(gate, gate_received_mono),
+            )
+            self._save_digest_ack(payload)
+            safe_unlink(self.paths.pending)
+        self._last_attempt = None
+        return "uploaded_digest", total
 
     async def run_once(self) -> Dict[str, Any]:
         async with self.run_lock:
@@ -810,156 +1403,60 @@ class Collector:
                     settings = load_settings(self.paths)
                     credentials = load_credentials(self.paths)
                     if not settings["chat_locked"] or not self.paths.chat_locked.exists():
-                        raise RuntimeError("chat is not locked")
+                        raise RuntimeError("chats are not locked")
                     if not consent_active(settings, self.clock()):
                         raise RuntimeError("consent is expired")
+                    if not self.paths.watch_state.exists():
+                        return self._write_status(
+                            last_run_at=self.clock().isoformat(),
+                            last_result="activation_required", last_error_type=None,
+                        )
                     session = self._session_text()
                     source_id = settings["source_id"]
-                    chat_id = settings["chat_id"]
-                    peer = PeerSpec.from_dict(settings["peer"])
-                    initial_message_id = settings["initial_message_id"]
-                    model = settings["openrouter_model"]
+                    chat_ids = [row["chat_id"] for row in settings["chats"]]
                     upload_config = dict(settings["upload"])
                 transport = self.transport_factory(self.paths, upload_config)
-
-                # The remote gate is always queried before Telegram or OpenRouter.
-                gate = await transport.gate(source_id, chat_id, revoked)
-                gate_received_mono = self.monotonic()
-                await self._assert_active(
-                    revoked, source_id, chat_id,
-                    self._generated_at(gate, gate_received_mono),
-                )
-                pending_raw = self._read_pending_bytes()
-                pending_value = (
-                    json.loads(pending_raw.decode("utf-8"))
-                    if pending_raw is not None else None
-                )
-                acknowledged = self._load_acknowledged(source_id, chat_id)
-                self._validate_gate_chain(
-                    gate, acknowledged, pending_value, initial_message_id,
-                    source_id, chat_id,
-                )
-                if pending_raw is not None:
-                    pending_result = await self._handle_pending(
-                        pending_raw, gate, transport, revoked, source_id, chat_id,
-                        gate_received_mono)
-                    if pending_result is not None:
-                        return pending_result
-                if not gate["due"]:
-                    return self._write_status(
-                        last_run_at=self.clock().isoformat(), last_result="not_due",
-                        last_error_type=None, pending_upload=False)
-
-                # Limit repeated paid attempts for one server-issued plan.
-                now_mono = self.monotonic()
-                if self._last_attempt and self._last_attempt[0] == gate["next_sequence"] \
-                        and now_mono - self._last_attempt[1] < 300:
-                    return self._write_status(
-                        last_run_at=self.clock().isoformat(), last_result="cooldown",
-                        last_error_type=None)
-                self._last_attempt = (gate["next_sequence"], now_mono)
-
-                # The receiver round-trip may outlive the consent window. Check
-                # again immediately before the first operation that reads the
-                # selected Telegram peer, then again after it completes.
-                await self._assert_active(
-                    revoked, source_id, chat_id,
-                    self._generated_at(gate, gate_received_mono),
-                )
-                cutoff = parse_utc(gate["server_time"], "server_time")
-                effective_from = gate["from_message_id_exclusive"]
-                not_before: Optional[datetime] = None
                 gateway = self._gateway(credentials)
-                if acknowledged is None and gate["next_sequence"] == 1:
-                    not_before = cutoff - timedelta(hours=DEFAULT_LOOKBACK_HOURS)
-                    trusted_cursor = await self._bounded_external(
-                        gateway.bootstrap_cursor(session, peer, cutoff),
-                        TELEGRAM_FETCH_TIMEOUT_S,
+                gate, gate_received_mono = await self._fresh_gate(
+                    transport, source_id, chat_ids, revoked)
+                gate, gate_received_mono, mentions, failed_chat_count = await self._run_monitor(
+                    gate, gate_received_mono, transport, gateway, settings,
+                    session, revoked,
+                )
+                watch = self._load_watch_state(source_id, chat_ids)
+                if watch["phase"] != "active":
+                    return self._write_status(
+                        last_run_at=self.clock().isoformat(),
+                        last_result="baseline_read_pending", last_error_type=None,
+                        failed_chat_count=failed_chat_count,
                     )
-                    await self._assert_active(
-                        revoked, source_id, chat_id,
-                        self._generated_at(gate, gate_received_mono),
-                    )
-                    effective_from = max(effective_from, trusted_cursor)
-                fetched = await self._bounded_external(
-                    gateway.fetch(
-                        session, peer, chat_id,
-                        effective_from, cutoff, not_before_at=not_before,
-                    ),
-                    TELEGRAM_FETCH_TIMEOUT_S,
+                result, message_count = await self._run_digest(
+                    gate, gate_received_mono, transport, gateway, settings,
+                    credentials, session, revoked,
                 )
-                if fetched.through_message_id < effective_from:
-                    raise RuntimeError("Telegram cursor moved behind the effective boundary")
-                await self._assert_active(
-                    revoked, source_id, chat_id,
-                    self._generated_at(gate, gate_received_mono),
-                )
-
-                # Empty text selection (for example media/service-only events)
-                # advances the cursor without contacting OpenRouter.
-                digest = "" if not fetched.messages else await self._bounded_external(
-                    self.digest_function(
-                        fetched.messages, model,
-                        credentials["openrouter_api_key"], revoked,
-                    ),
-                    OPENROUTER_TIMEOUT_S,
-                )
-                await self._assert_active(
-                    revoked, source_id, chat_id,
-                    self._generated_at(gate, gate_received_mono),
-                )
-
-                payload = build_upload(
-                    source_id=source_id,
-                    gate=gate,
-                    chat_id=chat_id,
-                    through_message_id=fetched.through_message_id,
-                    message_count=len(fetched.messages),
-                    digest=digest,
-                    model=model,
-                    generated_at=self._generated_at(gate, gate_received_mono),
-                )
-                pending = canonical_upload_bytes(payload)
-                if len(pending) > gate["max_upload_bytes"]:
-                    raise RuntimeError("digest exceeds receiver max_upload_bytes")
-                # Persist exactly the bytes that SSH receives. A crash or uncertain
-                # receipt can only retry/reconcile this immutable payload. The
-                # final revocation check and write share the reset lock: reset
-                # therefore either deletes this file afterwards or wins first.
-                async with self.state_lock:
-                    self._assert_active_locked(
-                        revoked, source_id, chat_id,
-                        self._generated_at(gate, gate_received_mono),
-                    )
-                    atomic_write_bytes(self.paths.pending, pending, 0o600)
-                await self._assert_active(
-                    revoked, source_id, chat_id,
-                    self._generated_at(gate, gate_received_mono),
-                )
-                await transport.upload(pending, revoked)
-                async with self.state_lock:
-                    self._assert_active_locked(
-                        revoked, source_id, chat_id,
-                        self._generated_at(gate, gate_received_mono),
-                    )
-                    self._save_acknowledged(payload)
-                    safe_unlink(self.paths.pending)
-                self._last_attempt = None
                 return self._write_status(
-                    last_run_at=self.clock().isoformat(), last_result="uploaded",
-                    last_error_type=None, pending_upload=False,
-                    last_message_count=len(fetched.messages),
-                    last_through_message_id=fetched.through_message_id,
+                    last_run_at=self.clock().isoformat(), last_result=result,
+                    last_error_type=None, last_message_count=message_count,
+                    pending_digest_upload=self.paths.pending.exists(),
+                    pending_monitor_upload=self.paths.monitor_pending.exists(),
+                    failed_chat_count=failed_chat_count,
                 )
             except asyncio.CancelledError:
                 return self._write_status(
                     last_run_at=self.clock().isoformat(), last_result="revoked",
-                    last_error_type=None, pending_upload=self.paths.pending.exists())
+                    last_error_type=None,
+                    pending_digest_upload=self.paths.pending.exists(),
+                    pending_monitor_upload=self.paths.monitor_pending.exists(),
+                    failed_chat_count=0,
+                )
             except Exception as exc:
                 return self._write_status(
                     last_run_at=self.clock().isoformat(), last_result="error",
                     last_error_type=type(exc).__name__,
-                    pending_upload=self.paths.pending.exists())
+                    pending_digest_upload=self.paths.pending.exists(),
+                    pending_monitor_upload=self.paths.monitor_pending.exists(),
+                    failed_chat_count=0,
+                )
             finally:
                 if self._active_run_task is current_task:
                     self._active_run_task = None

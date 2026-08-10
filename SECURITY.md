@@ -12,7 +12,8 @@ does not neutralize a stolen live session. Revoke the device named
 `Sunny Umbrel` in Telegram immediately if the host or app is suspected to be
 compromised.
 
-The design limits ordinary operation to one exact peer, but host root — or a
+The design limits ordinary operation to one immutable set of exact group peers,
+but host root — or a
 container that effectively gains host root — can still copy the session. The
 app therefore has no host mounts, Docker socket access, host network, privileged
 mode, or backups of `data/private`. Any separately installed Portainer with Docker
@@ -20,22 +21,30 @@ socket access is nevertheless part of the trusted computing base: protect it wit
 strong authentication, expose it only to trusted LAN/Tailscale clients, and stop
 it when it is not needed.
 
-Raw selected-chat text is memory-only. OpenRouter receives prompt-local
-`participant-N` labels instead of stable Telegram sender/message IDs. The bounded
-final digest is still sensitive derived content while awaiting SSH acknowledgement,
-so it is excluded from Umbrel backups together with its atomic temporary files.
-The local acknowledged chain checkpoint contains only metadata and prevents a
-rolled-back receiver from causing old messages to be read again.
+Daily selected-chat text is memory-only. OpenRouter receives chat-local
+`participant-N` labels instead of stable Telegram sender/message IDs. Native
+mentions are the narrow exception: a durable event may contain a sanitized snippet
+of at most 300 UTF-16 units, chat title, sender display name and message link. It is
+persisted byte-for-byte until the receiver acknowledges it and is then retained by
+Sunny's normal outbox/Telegram delivery path. Media is never downloaded and sender
+IDs are not exported. Pending digest and mention payloads are excluded from Umbrel
+backups together with their atomic temporary files. Local acknowledged checkpoints
+contain only metadata and prevent a rolled-back receiver from causing old messages
+to be scanned or delivered again.
 
 Every OpenRouter request forces `provider.zdr=true` and
 `provider.data_collection=deny`; a dedicated key, a small spend limit, disabled
 account logging/opt-in training, and narrow model/provider policy remain required
 defence in depth. Setup has one uninterrupted one-hour monotonic lease. A collector
 restart before chat lock invalidates that lease and requires factory reset and a
-new login. Chat selection stores `initial_message_id=0` without reading selected-peer
-history; only the first authenticated `due=true` gate derives the 72-hour lower
-boundary from receiver `server_time`, and rows older than that timestamp are
-discarded before OpenRouter.
+new login. Chat selection stores `initial_message_id=0` for every selected peer
+without reading history. A separate explicit activation first durably records the
+current exact heads and only then clears pre-existing unread state, without
+exporting historical mentions. The first authenticated daily `due=true` gate
+independently derives each 72-hour lower boundary from receiver `server_time`, and
+rows older than that timestamp are discarded before OpenRouter. Thereafter a
+mention-bearing range is marked read only after its bounded event has a durable
+receiver receipt; no-mention ranges are checkpointed locally before read-ACK.
 
 ## Incident response
 

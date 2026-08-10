@@ -6,15 +6,16 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sunny_digest.models import DialogCandidate, PeerSpec
+from sunny_digest.models import DialogCandidate, PeerSpec, validate_chat_title
 from sunny_digest.settings import (
+    CONSENT_SCOPE,
     SETTINGS_SCHEMA,
     consent_active,
     load_settings,
     normalize_known_host,
     validate_configure,
 )
-from sunny_digest.storage import Paths, atomic_write_json
+from sunny_digest.storage import Paths, atomic_write_bytes, atomic_write_json
 
 
 NOW = datetime(2026, 8, 4, 0, 30, tzinfo=timezone.utc)
@@ -95,7 +96,7 @@ class TestBugConsentInterval20260810(unittest.TestCase):
         expires = NOW + timedelta(hours=1)
         settings = {
             "consent": {
-                "scope": "one-exact-chat-text-and-captions",
+                "scope": CONSENT_SCOPE,
                 "granted_at": granted.isoformat().replace("+00:00", "Z"),
                 "expires_at": expires.isoformat().replace("+00:00", "Z"),
             },
@@ -120,7 +121,7 @@ class TestBugConsentInterval20260810(unittest.TestCase):
                 "openrouter_model": "anthropic/example",
                 "upload": {"host": "receiver.example", "port": 22, "user": "root"},
                 "consent": {
-                    "scope": "one-exact-chat-text-and-captions",
+                    "scope": CONSENT_SCOPE,
                     "granted_at": NOW.isoformat().replace("+00:00", "Z"),
                     "expires_at": (
                         NOW + timedelta(days=90, seconds=1)
@@ -128,6 +129,106 @@ class TestBugConsentInterval20260810(unittest.TestCase):
                 },
             })
             with self.assertRaisesRegex(ValueError, "consent interval"):
+                load_settings(paths)
+
+
+class LockedChatsV2Tests(unittest.TestCase):
+    def _locked(self, paths, chats):
+        atomic_write_json(paths.settings, {
+            "schema": SETTINGS_SCHEMA,
+            "phase": "chat_locked",
+            "chat_locked": True,
+            "openrouter_model": "anthropic/example",
+            "upload": {"host": "receiver.example", "port": 22, "user": "root"},
+            "consent": {
+                "scope": CONSENT_SCOPE,
+                "granted_at": NOW.isoformat().replace("+00:00", "Z"),
+                "expires_at": (NOW + timedelta(days=1)).isoformat().replace(
+                    "+00:00", "Z"),
+            },
+            "source_id": "12345678-1234-4678-9234-567812345678",
+            "chats": chats,
+            "upload_public_key": "ssh-ed25519 AAAAtest source",
+            "upload_key_fingerprint": "SHA256:test",
+        })
+        (paths.chat_locked).write_bytes(b"locked\n")
+
+    def test_v2_locked_settings_accept_sorted_unique_group_set(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = Paths(root / "config", root / "private", root / "runtime",
+                          root / "runtime" / "control.sock")
+            paths.ensure()
+            chats = [
+                {"chat_id": -1_000_000_000_124, "title": "A",
+                 "peer": PeerSpec("channel", 124, 9).as_dict(),
+                 "initial_message_id": 0},
+                {"chat_id": -123, "title": "B",
+                 "peer": PeerSpec("chat", 123, None).as_dict(),
+                 "initial_message_id": 0},
+            ]
+            self._locked(paths, chats)
+            self.assertEqual(load_settings(paths)["chats"], chats)
+
+    def test_v2_locked_settings_reject_invalid_chat_sets_and_v1(self):
+        base = {"chat_id": -123, "title": "B",
+                "peer": PeerSpec("chat", 123, None).as_dict(),
+                "initial_message_id": 0}
+        invalid_sets = (
+            [],
+            [base, dict(base)],
+            [dict(base, initial_message_id=1)],
+            [dict(base, chat_id=-124)],
+            [dict(base, chat_id=1)],
+            [dict(base, title="bad\u202etitle")],
+            [dict(base, title="bad\ntitle")],
+            [dict(base, title="😀" * 81)],
+            [dict(base, chat_id=-(index + 1),
+                  peer=PeerSpec("chat", index + 1, None).as_dict())
+             for index in reversed(range(17))],
+        )
+        for chats in invalid_sets:
+            with self.subTest(chats=len(chats)):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    paths = Paths(root / "config", root / "private", root / "runtime",
+                                  root / "runtime" / "control.sock")
+                    paths.ensure()
+                    self._locked(paths, chats)
+                    with self.assertRaises(ValueError):
+                        load_settings(paths)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = Paths(root / "config", root / "private", root / "runtime",
+                          root / "runtime" / "control.sock")
+            paths.ensure()
+            self._locked(paths, [base])
+            value = __import__("json").loads(paths.settings.read_text())
+            value["schema"] = "sunny.personal-digest-settings.v1"
+            atomic_write_json(paths.settings, value)
+            with self.assertRaisesRegex(ValueError, "schema"):
+                load_settings(paths)
+
+    def test_chat_title_rejects_lone_surrogate(self):
+        with self.assertRaises(ValueError):
+            validate_chat_title("\ud800")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = Paths(root / "config", root / "private", root / "runtime",
+                          root / "runtime" / "control.sock")
+            paths.ensure()
+            self._locked(paths, [{
+                "chat_id": -123,
+                "title": "B",
+                "peer": PeerSpec("chat", 123, None).as_dict(),
+                "initial_message_id": 0,
+            }])
+            tampered = paths.settings.read_bytes().replace(
+                b'"title":"B"', b'"title":"\\ud800"')
+            atomic_write_bytes(paths.settings, tampered)
+            with self.assertRaises(ValueError):
                 load_settings(paths)
 
 

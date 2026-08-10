@@ -147,7 +147,9 @@ def main() -> int:
     for ignored in (
             "data/private/*", "data/private/.*", "data/runtime/*",
             "data/runtime/.*", "data/config/pending-upload.json",
-            "data/config/.pending-upload.json.*"):
+            "data/config/.pending-upload.json.*",
+            "data/config/pending-monitor-upload.json",
+            "data/config/.pending-monitor-upload.json.*"):
         checks.require(f"  - {ignored}" in manifest,
                        f"backupIgnore is missing {ignored}")
     checks.require("deterministicPassword: true" in manifest,
@@ -204,6 +206,8 @@ def main() -> int:
         "sunny-personal-digest/data/config/acknowledged.json",
         "sunny-personal-digest/data/config/pending-upload.json",
         "sunny-personal-digest/data/config/.pending-upload.json.crash",
+        "sunny-personal-digest/data/config/pending-monitor-upload.json",
+        "sunny-personal-digest/data/config/.pending-monitor-upload.json.crash",
         "sunny-personal-digest/data/private/telegram.session.txt",
         "sunny-personal-digest/data/runtime/status.json",
     ):

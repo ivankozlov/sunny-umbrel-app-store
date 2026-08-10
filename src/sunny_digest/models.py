@@ -6,6 +6,19 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
+def validate_chat_title(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("chat title is invalid")
+    try:
+        utf16_units = len(value.encode("utf-16-le")) // 2
+    except UnicodeEncodeError:
+        raise ValueError("chat title is invalid") from None
+    if utf16_units > 160 or any(
+            unicodedata.category(char) in ("Cc", "Cf", "Cs") for char in value):
+        raise ValueError("chat title is invalid")
+    return value
+
+
 @dataclass(frozen=True)
 class PeerSpec:
     kind: str
@@ -60,11 +73,7 @@ class DialogCandidate:
             raise ValueError("dialog candidate has unexpected fields")
         if type(value["chat_id"]) is not int or not -(2**63) <= value["chat_id"] < 0:
             raise ValueError("dialog chat_id is invalid")
-        if (not isinstance(value["title"], str) or not value["title"]
-                or len(value["title"]) > 160
-                or any(unicodedata.category(char) in ("Cc", "Cf")
-                       for char in value["title"])):
-            raise ValueError("dialog title is invalid")
+        validate_chat_title(value["title"])
         if not isinstance(value["peer"], dict):
             raise ValueError("dialog peer is invalid")
         peer = PeerSpec.from_dict(value["peer"])
@@ -88,3 +97,27 @@ class SelectedMessage:
 class FetchResult:
     through_message_id: int
     messages: List[SelectedMessage]
+
+
+@dataclass(frozen=True)
+class DigestChat:
+    title: str
+    messages: List[SelectedMessage]
+
+
+@dataclass(frozen=True)
+class MentionEvent:
+    event_id: str
+    chat_id: int
+    message_id: int
+    sent_at: datetime
+    chat_title: str
+    sender: str
+    snippet: str
+    link: Optional[str]
+
+
+@dataclass(frozen=True)
+class MentionScanResult:
+    through_message_id: int
+    events: List[MentionEvent]
