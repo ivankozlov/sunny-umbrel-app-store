@@ -1,4 +1,4 @@
-COLLECTOR_VERSION = "0.1.0"
+COLLECTOR_VERSION = "0.1.1"
 PROMPT_VERSION = "personal-digest-v1"
 UPLOAD_SCHEMA = "sunny.personal-digest.v1"
 GATE_SCHEMA = "sunny.personal-digest-gate.v1"

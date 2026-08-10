@@ -5,9 +5,10 @@ one explicitly selected Telegram group, creates a daily Russian digest through
 OpenRouter, and uploads only the final bounded payload to Sunny over a pinned
 SSH forced command.
 
-> **Release gate:** this checkout is intentionally not installable yet. The app
-> manifest is disabled and Compose contains a digest placeholder until the
-> public `linux/amd64` + `linux/arm64` GHCR image is built and verified.
+> **Release gate:** install only a commit whose manifest has `disabled: false`
+> and whose two Compose services pin the same real immutable digest. A checkout
+> with `disabled: true` or `RELEASE_GATE_MULTIARCH_DIGEST` is a pre-publish
+> artifact and must not be installed.
 
 ## Security model
 
@@ -15,9 +16,12 @@ Telegram does not let an API ID/hash or an authorized user session restrict
 itself to selected chats. The containment is therefore implemented locally and
 fail-closed:
 
-- setup may enumerate dialogs exactly once; only groups/supergroups are shown;
+- setup may enumerate dialogs exactly once; only groups/supergroups are shown.
+  It must finish in one uninterrupted one-hour monotonic lease; a collector
+  restart before chat lock fails closed and requires factory reset and login;
 - selection stores one exact `InputPeer` (`kind`, ID, access hash), deletes the
-  dialog list, and permanently locks the Telegram session to that peer;
+  dialog list, and permanently locks the Telegram session to that peer without
+  reading selected-peer history. The contractual initial cursor is the sentinel `0`;
 - runtime never calls generic entity resolution, receives no push updates, and
   never downloads media;
 - changing the account, chat, model, provider key, or receiver endpoint requires
@@ -32,9 +36,14 @@ fail-closed:
   clock cannot extend an expired consent window;
 - each run asks Sunny's authenticated `status-v1` gate before Telegram or
   OpenRouter. `due: false` means neither service is contacted;
+- the first due run derives its 72-hour lower boundary from authenticated
+  receiver `server_time`, not the Umbrel clock or setup time, and also filters
+  every row by that exact timestamp before it can enter the prompt;
 - raw chat text exists only in collector memory. The only durable content is an
   exact final upload payload awaiting acknowledgement. Sender and message IDs are
   replaced with prompt-local `participant-N` labels before OpenRouter;
+- every OpenRouter request requires Zero Data Retention and rejects data-collecting
+  providers with `provider.zdr=true` and `provider.data_collection=deny`;
 - after an accepted upload, an atomic local checkpoint records the sequence, hash,
   cursor, and date before pending bytes are deleted. A rolled-back or jumped Sunny
   receiver state is rejected before Telegram is contacted;
@@ -87,16 +96,21 @@ Provision in this order:
    the client application but do **not** limit which chats the user session can
    access.
 2. Create a dedicated OpenRouter key with a small spending limit. Do not reuse a
-   general-purpose account key.
+   general-purpose account key. Also disable input/output logging and opt-in use
+   of prompts in the account, and restrict the key/model/provider set as narrowly
+   as practical; the app independently forces ZDR and rejects data collection on
+   every request.
 3. Obtain the DO Ed25519 SSH host-key line through a trusted channel. Never
    bootstrap trust with `ssh-keyscan` from the Umbrel.
 4. Publish the collector image and complete the release gate below.
 5. Add the public Community App Store URL in Umbrel, then install
    `Sunny Personal Digest`. The additional username is `sunny`; the password is
    the deterministic app password shown by Umbrel.
-6. Complete Telegram setup, lock the exact group, then use the displayed public
-   bootstrap values to install Sunny's forced-command receiver binding. Until
-   this binding exists, the app fails closed before Telegram runtime access.
+6. Complete Telegram setup and lock the exact group within one uninterrupted
+   hour. If collector restarts before lock, factory-reset and log in again. Then
+   use the displayed public bootstrap values to install Sunny's forced-command
+   receiver binding. Until this binding exists, the app fails closed before
+   Telegram runtime access.
 
 The setup UI collects API credentials, receiver host/port, the exact pinned
 `known_hosts` line, and a consent expiration. SSH login is deliberately fixed to
@@ -105,16 +119,29 @@ command immediately executes the receiver as the dedicated non-root service
 user. Telegram sends a login code and, when enabled, asks for the 2FA password.
 
 After login, open the dialog list once and select the pilot group. The UI then
-shows a canonical source UUID, bootstrap message cursor, upload public key, and
-fingerprint. Register exactly that public key in Sunny's receiver configuration.
-Until the server binding is installed, runs fail closed before Telegram access
-because the authenticated status request cannot succeed.
+shows a canonical source UUID, `chat_id`, contractual `initial_message_id=0`,
+upload public key, and fingerprint. `0` is a receiver-chain sentinel, not a read
+of Telegram history. Register exactly that public key in Sunny's receiver
+configuration. Until the server binding is installed, runs fail closed before
+Telegram access because the authenticated status request cannot succeed.
 
-The bootstrap cursor is the newest selected-peer message strictly before the
-72-hour lookback boundary. No raw bootstrap messages are stored. Daily scans use
-a server-issued cutoff snapshot and a deterministic 96 KiB prompt budget; text
-not included stays behind the cursor for a later due run. Media/service-only
-events can advance the cursor without an OpenRouter request.
+On the first authenticated due run, the collector asks the exact peer for the
+newest message strictly before `receiver server_time - 72 hours`. It uses the
+newer of that boundary cursor and the receiver cursor, while the upload preserves
+the receiver's contractual `from_message_id_exclusive`. Rows older than the exact
+time boundary are filtered even if Telegram IDs are anomalous. No raw bootstrap
+messages are stored. Daily scans use a server-issued cutoff snapshot and a
+deterministic 96 KiB prompt budget; text not included stays behind the cursor for
+a later due run. Media/service-only events can advance the cursor without an
+OpenRouter request. Because peer access is first exercised at that due run, a
+stale/revoked access hash may surface only after lock and then requires factory
+reset.
+
+After the UI has shown the public bootstrap values, stop the Umbrel app and verify
+the collector is no longer running before applying the DO receiver binding. Keep
+it stopped throughout `--apply`; only after apply succeeds, explicitly start the
+app. Starting arms the scheduler after its initial delay and may immediately read
+Telegram and call OpenRouter when the authenticated gate says `due: true`.
 
 ## Local verification
 
@@ -164,7 +191,8 @@ pull without registry credentials.
 2. Protect the `ghcr-release` GitHub Environment with branch `main` and Ivan as
    required reviewer. For the first and only package bootstrap, run the pinned
    `Publish image` workflow with version `0.1.0` and
-   `bootstrap_empty_package=true`; leave that input `false` for every later run.
+   `bootstrap_empty_package=true`; for `0.1.1` and every later run that input must
+   remain `false`.
    The publish job itself is also restricted to `main`. It runs all offline gates,
    refuses to overwrite an existing version tag, builds both
    supported architectures, pushes the tag, emits an SBOM/provenance

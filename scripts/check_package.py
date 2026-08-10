@@ -220,6 +220,11 @@ def main() -> int:
             checks.require(re.fullmatch(r"[0-9a-f]{40}", ref) is not None,
                            f"workflow action is not SHA-pinned: {action}")
     publish = text(ROOT / ".github/workflows/publish.yml")
+    if version_match:
+        checks.require(
+            f'        default: "{version_match.group(1)}"' in publish,
+            "publish workflow default and manifest versions differ",
+        )
     for invariant in (
         "gate:", "needs: gate", "persist-credentials: false",
         "python -m unittest discover", "python scripts/check_package.py",

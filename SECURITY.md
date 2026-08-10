@@ -27,6 +27,16 @@ so it is excluded from Umbrel backups together with its atomic temporary files.
 The local acknowledged chain checkpoint contains only metadata and prevents a
 rolled-back receiver from causing old messages to be read again.
 
+Every OpenRouter request forces `provider.zdr=true` and
+`provider.data_collection=deny`; a dedicated key, a small spend limit, disabled
+account logging/opt-in training, and narrow model/provider policy remain required
+defence in depth. Setup has one uninterrupted one-hour monotonic lease. A collector
+restart before chat lock invalidates that lease and requires factory reset and a
+new login. Chat selection stores `initial_message_id=0` without reading selected-peer
+history; only the first authenticated `due=true` gate derives the 72-hour lower
+boundary from receiver `server_time`, and rows older than that timestamp are
+discarded before OpenRouter.
+
 ## Incident response
 
 1. In Telegram, terminate the `Sunny Umbrel` session.

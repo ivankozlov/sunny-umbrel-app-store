@@ -35,7 +35,7 @@ from .storage import (
     unlink_atomic_material,
 )
 from .telegram_gateway import TelethonGateway
-from .version import MAX_UPLOAD_BYTES
+from .version import DEFAULT_LOOKBACK_HOURS, MAX_UPLOAD_BYTES
 
 
 GatewayFactory = Callable[[int, str], Any]
@@ -52,6 +52,7 @@ TELEGRAM_DIALOG_TIMEOUT_S = 120
 TELEGRAM_FETCH_TIMEOUT_S = 180
 KEYGEN_TIMEOUT_S = 30
 OPENROUTER_TIMEOUT_S = 120
+SETUP_CONSENT_LEASE_S = 3600
 
 
 def _now() -> datetime:
@@ -90,6 +91,10 @@ class Collector:
         self._active_run_task: Optional[asyncio.Task[Any]] = None
         self._external_tasks: set[asyncio.Task[Any]] = set()
         self._last_attempt: Optional[tuple[int, float]] = None
+        # Pre-lock Telegram metadata access has no authenticated server clock.
+        # A single in-process monotonic lease prevents wall-clock rollback from
+        # extending setup; restart before chat lock therefore fails closed.
+        self._setup_deadline_mono: Optional[float] = None
         # This non-secret marker survives backup while StringSession does not.
         # Restoring config alone must not make a possibly live remote session
         # look revoked merely because its local credential is absent.
@@ -191,7 +196,11 @@ class Collector:
                     phase=settings["phase"],
                     configured=True,
                     chat_locked=settings["chat_locked"],
-                    consent_active=consent_active(settings, self.clock()),
+                    consent_active=(
+                        consent_active(settings, self.clock())
+                        if settings["chat_locked"]
+                        else self._setup_consent_active(settings)
+                    ),
                 )
                 if settings["chat_locked"]:
                     status.update(
@@ -208,7 +217,9 @@ class Collector:
                         ),
                         consent_expires_at=settings["consent"]["expires_at"],
                     )
-                elif settings["phase"] == "dialogs_listed" and self.paths.dialog_candidates.exists():
+                elif (status["consent_active"]
+                      and settings["phase"] == "dialogs_listed"
+                      and self.paths.dialog_candidates.exists()):
                     private = read_json(self.paths.dialog_candidates, max_bytes=512 * 1024)
                     rows = private.get("dialogs")
                     if isinstance(rows, list):
@@ -284,6 +295,17 @@ class Collector:
     async def public_status(self) -> Dict[str, Any]:
         return self._write_status()
 
+    def _setup_consent_active(self, settings: Dict[str, Any]) -> bool:
+        return (
+            consent_active(settings, self.clock())
+            and self._setup_deadline_mono is not None
+            and self.monotonic() < self._setup_deadline_mono
+        )
+
+    def _require_setup_consent(self, settings: Dict[str, Any]) -> None:
+        if not self._setup_consent_active(settings):
+            raise RuntimeError("setup consent is expired")
+
     async def configure(self, data: Dict[str, Any]) -> Dict[str, Any]:
         async with self.state_lock:
             if (self.paths.revocation_warning.exists()
@@ -294,6 +316,7 @@ class Collector:
                 raise RuntimeError("factory reset is required before configuration")
             settings, credentials, known_host = validate_configure(data, self.clock())
             save_initial_config(self.paths, settings, credentials, known_host)
+            self._setup_deadline_mono = self.monotonic() + SETUP_CONSENT_LEASE_S
             return self._write_status(last_result="configured", last_error_type=None)
 
     async def send_code(self, phone: Any) -> Dict[str, Any]:
@@ -301,6 +324,7 @@ class Collector:
             settings = load_settings(self.paths)
             if settings["chat_locked"] or settings["phase"] != "configured":
                 raise RuntimeError("send_code is not allowed in this phase")
+            self._require_setup_consent(settings)
             if not isinstance(phone, str) or not re.fullmatch(r"\+[0-9]{7,15}", phone):
                 raise ValueError("phone must use international +digits format")
             # Arm before the first authorization network call. There is no
@@ -313,6 +337,7 @@ class Collector:
                 TELEGRAM_SETUP_TIMEOUT_S,
             )
             self._save_session(session)
+            self._require_setup_consent(settings)
             atomic_write_json(self.paths.setup_state, {
                 "phone": phone,
                 "phone_masked": _masked_phone(phone),
@@ -327,6 +352,7 @@ class Collector:
             settings = load_settings(self.paths)
             if settings["chat_locked"] or settings["phase"] != "code_sent":
                 raise RuntimeError("submit_code is not allowed in this phase")
+            self._require_setup_consent(settings)
             if not isinstance(code, str) or not re.fullmatch(r"[0-9]{3,8}", code):
                 raise ValueError("Telegram code is invalid")
             setup = read_json(self.paths.setup_state, max_bytes=16 * 1024)
@@ -339,6 +365,7 @@ class Collector:
                 TELEGRAM_SETUP_TIMEOUT_S,
             )
             self._save_session(session)
+            self._require_setup_consent(settings)
             settings["phase"] = "password_required" if needs_password else "authenticated"
             atomic_write_json(self.paths.settings, settings)
             if not needs_password:
@@ -353,6 +380,7 @@ class Collector:
             settings = load_settings(self.paths)
             if settings["chat_locked"] or settings["phase"] != "password_required":
                 raise RuntimeError("submit_password is not allowed in this phase")
+            self._require_setup_consent(settings)
             if not isinstance(password, str) or not 1 <= len(password) <= 512:
                 raise ValueError("Telegram 2FA password is invalid")
             credentials = load_credentials(self.paths)
@@ -362,6 +390,7 @@ class Collector:
                 TELEGRAM_SETUP_TIMEOUT_S,
             )
             self._save_session(session)
+            self._require_setup_consent(settings)
             settings["phase"] = "authenticated"
             atomic_write_json(self.paths.settings, settings)
             safe_unlink(self.paths.setup_state)
@@ -375,11 +404,13 @@ class Collector:
                 raise RuntimeError("dialog listing is permanently disabled for the locked session")
             if settings["phase"] != "authenticated" or self.paths.dialog_candidates.exists():
                 raise RuntimeError("dialog listing has already been used or is unavailable")
+            self._require_setup_consent(settings)
             credentials = load_credentials(self.paths)
             dialogs = await self._bounded_external(
                 self._gateway(credentials).list_dialogs(self._session_text()),
                 TELEGRAM_DIALOG_TIMEOUT_S,
             )
+            self._require_setup_consent(settings)
             dialogs = [
                 DialogCandidate.from_private_dict(candidate.as_private_dict())
                 for candidate in dialogs
@@ -414,15 +445,21 @@ class Collector:
             selected = next((row for row in candidates if row.chat_id == requested), None)
             if selected is None:
                 raise ValueError("chat_id was not in the one-time dialog list")
-            credentials = load_credentials(self.paths)
-            initial_id = await self._bounded_external(
-                self._gateway(credentials).bootstrap_cursor(
-                    self._session_text(), selected.peer, self.clock()),
-                TELEGRAM_SETUP_TIMEOUT_S,
-            )
+            self._require_setup_consent(settings)
             source_id = new_source_id()
             public_key, fingerprint = await self._bounded_external(
                 self.keygen_function(self.paths, source_id), KEYGEN_TIMEOUT_S)
+            try:
+                self._require_setup_consent(settings)
+            except RuntimeError:
+                # The real key generator has already created this exact pair.
+                # Remove it before returning to dialogs_listed so a confirmed
+                # reset/retry cannot be trapped by stale key material.
+                unlink_atomic_material((
+                    self.paths.upload_key,
+                    self.paths.upload_public_key,
+                ))
+                raise
             settings.update({
                 "phase": "chat_locked",
                 "chat_locked": True,
@@ -430,7 +467,9 @@ class Collector:
                 "chat_id": selected.chat_id,
                 "chat_title": selected.title,
                 "peer": selected.peer.as_dict(),
-                "initial_message_id": initial_id,
+                # The authoritative 72-hour boundary is resolved only after an
+                # authenticated receiver gate supplies trusted server time.
+                "initial_message_id": 0,
                 "upload_public_key": public_key,
                 "upload_key_fingerprint": fingerprint,
             })
@@ -439,6 +478,7 @@ class Collector:
             atomic_write_json(self.paths.settings, settings)
             safe_unlink(self.paths.dialog_candidates)
             safe_unlink(self.paths.setup_state)
+            self._setup_deadline_mono = None
             return self._write_status(last_result="chat_locked", last_error_type=None)
 
     async def revoke_and_reset(self) -> Dict[str, Any]:
@@ -482,6 +522,7 @@ class Collector:
                 # Old runs retain the set Event object; new setup receives a new one.
                 self.revoked = asyncio.Event()
                 self._last_attempt = None
+                self._setup_deadline_mono = None
         result = self._write_status(
             phase="fresh", configured=False, chat_locked=False,
             consent_active=False, pending_upload=False, source_id=None,
@@ -509,6 +550,7 @@ class Collector:
                 self.paths.telegram_session_outstanding,
                 self.paths.revocation_warning,
             ))
+            self._setup_deadline_mono = None
             return self._write_status(
                 phase="fresh", configured=False, chat_locked=False,
                 consent_active=False, pending_upload=False, source_id=None,
@@ -548,9 +590,10 @@ class Collector:
         if not consent_active(settings, self.clock()):
             raise asyncio.CancelledError
         if trusted_now is not None:
+            granted = parse_utc(settings["consent"]["granted_at"], "consent_granted_at")
             expires = parse_utc(settings["consent"]["expires_at"], "consent_expires_at")
             trusted = trusted_now.astimezone(timezone.utc)
-            if (trusted >= expires
+            if (not granted <= trusted < expires
                     or expires > trusted + timedelta(days=MAX_CONSENT_DAYS)):
                 raise asyncio.CancelledError
 
@@ -824,13 +867,29 @@ class Collector:
                     self._generated_at(gate, gate_received_mono),
                 )
                 cutoff = parse_utc(gate["server_time"], "server_time")
+                effective_from = gate["from_message_id_exclusive"]
+                not_before: Optional[datetime] = None
+                gateway = self._gateway(credentials)
+                if acknowledged is None and gate["next_sequence"] == 1:
+                    not_before = cutoff - timedelta(hours=DEFAULT_LOOKBACK_HOURS)
+                    trusted_cursor = await self._bounded_external(
+                        gateway.bootstrap_cursor(session, peer, cutoff),
+                        TELEGRAM_FETCH_TIMEOUT_S,
+                    )
+                    await self._assert_active(
+                        revoked, source_id, chat_id,
+                        self._generated_at(gate, gate_received_mono),
+                    )
+                    effective_from = max(effective_from, trusted_cursor)
                 fetched = await self._bounded_external(
-                    self._gateway(credentials).fetch(
+                    gateway.fetch(
                         session, peer, chat_id,
-                        gate["from_message_id_exclusive"], cutoff,
+                        effective_from, cutoff, not_before_at=not_before,
                     ),
                     TELEGRAM_FETCH_TIMEOUT_S,
                 )
+                if fetched.through_message_id < effective_from:
+                    raise RuntimeError("Telegram cursor moved behind the effective boundary")
                 await self._assert_active(
                     revoked, source_id, chat_id,
                     self._generated_at(gate, gate_received_mono),

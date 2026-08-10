@@ -169,9 +169,17 @@ def render_status(status: Dict[str, Any], csrf: str) -> str:
   <p class="muted">SSH login фиксирован: <strong>root</strong>. Серверный forced command сразу понижает права до dedicated receiver user.</p>
   <label>Точная строка pinned known_hosts<textarea name="known_host" spellcheck="false" placeholder="host ssh-ed25519 AAAA…" required></textarea></label>
   <label>Согласие действует до (ISO 8601)<input name="consent_expires_at" placeholder="2026-10-01T00:00:00Z" required></label>
+  <p class="warn">Завершите вход и выбор чата в течение часа. Рестарт collector’а до фиксации чата потребует factory reset и нового входа.</p>
   <p class="warn">Не используйте общий OpenRouter-ключ. Создайте отдельный ключ с небольшим лимитом.</p>
   <button type="submit">Сохранить и продолжить</button>
 </form>"""
+    if (phase in (
+            "configured", "code_sent", "password_required", "authenticated",
+            "dialogs_listed") and not status.get("consent_active")):
+        return """
+<h2>Согласие истекло</h2>
+<p>Настройка и чтение Telegram заблокированы. Выполните factory reset,
+затем настройте приложение заново с новым сроком согласия.</p>"""
     if phase == "configured":
         return f"""
 <h2>Вход в Telegram</h2><p class="muted">Telegram пришлёт код в уже авторизованное приложение.</p>

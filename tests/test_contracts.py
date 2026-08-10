@@ -231,6 +231,20 @@ class ContractTests(unittest.TestCase):
             self.assertNotIn(stable_id, rendered)
 
 
+class TestBugOpenRouterPrivacy20260810(unittest.TestCase):
+    def test_every_request_denies_collection_and_requires_zdr(self):
+        with patch("sunny_digest.openrouter.urllib.request.urlopen",
+                   return_value=FakeResponse("Готово")) as urlopen:
+            _blocking_digest([], "anthropic/example", "secret")
+
+        request = urlopen.call_args.args[0]
+        body = json.loads(request.data)
+        self.assertEqual(
+            body["provider"],
+            {"zdr": True, "data_collection": "deny"},
+        )
+
+
 class OpenRouterProcessTests(unittest.IsolatedAsyncioTestCase):
     async def test_revocation_terminates_blocking_openrouter_worker_process(self):
         worker = FakeHungWorker()

@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Digest
-version: "0.1.0"
+version: "0.1.1"
 tagline: Daily Telegram digest for one selected chat
 description: >-
   Reads only one explicitly selected Telegram chat, summarizes new text and
@@ -13,10 +13,13 @@ description: >-
 
   Telegram and provider credentials are deliberately excluded from Umbrel
   backups. A restored config requires manual confirmation that the previous
-  Telegram device was terminated before reauthorization. This package remains
-  disabled until its public multi-architecture GHCR image has been published
-  and pinned by digest.
-releaseNotes: ""
+  Telegram device was terminated before reauthorization. Installation is enabled
+  only after a public multi-architecture GHCR image has been published, verified,
+  and pinned by immutable digest.
+releaseNotes: >-
+  Privacy hardening: require OpenRouter ZDR with data collection denied, derive
+  the first 72-hour boundary from authenticated receiver time, and fail closed
+  when setup expires or the collector restarts before chat lock.
 
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store

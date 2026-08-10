@@ -15,7 +15,7 @@ def status(phase="fresh"):
         "phase": phase,
         "configured": phase != "fresh",
         "chat_locked": phase == "chat_locked",
-        "consent_active": phase == "chat_locked",
+        "consent_active": phase not in ("fresh", "unavailable"),
         "pending_upload": False,
         "source_id": None,
         "chat_id": None,
@@ -158,6 +158,32 @@ class WebTests(unittest.TestCase):
         self.assertIn('name="action" value="ack_manual_revocation"', body)
         self.assertIn('name="confirm_manual_revocation"', body)
         self.assertNotIn("Telegram API ID", body)
+
+    def test_expired_prelock_consent_hides_chat_read_actions(self):
+        for phase, forbidden in (
+                ("configured", 'name="action" value="send_code"'),
+                ("code_sent", 'name="action" value="submit_code"'),
+                ("password_required", 'name="action" value="submit_password"'),
+                ("authenticated", 'name="action" value="list_dialogs"'),
+                ("dialogs_listed", 'name="action" value="select_chat"')):
+            with self.subTest(phase=phase):
+                value = status(phase)
+                value["consent_active"] = False
+                body = render_status(value, "a" * 64)
+                self.assertIn("Согласие истекло", body)
+                self.assertIn("factory reset", body)
+                self.assertNotIn(forbidden, body)
+
+    def test_active_prelock_consent_keeps_each_setup_action_visible(self):
+        for phase, action in (
+                ("configured", "send_code"),
+                ("code_sent", "submit_code"),
+                ("password_required", "submit_password"),
+                ("authenticated", "list_dialogs"),
+                ("dialogs_listed", "select_chat")):
+            with self.subTest(phase=phase):
+                body = render_status(status(phase), "a" * 64)
+                self.assertIn(f'name="action" value="{action}"', body)
 
 
 if __name__ == "__main__":

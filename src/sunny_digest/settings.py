@@ -164,7 +164,7 @@ def load_settings(paths: Paths) -> Dict[str, Any]:
         raise ValueError("settings consent is invalid")
     granted = parse_utc(consent["granted_at"], "consent granted_at")
     expires = parse_utc(consent["expires_at"], "consent expires_at")
-    if granted >= expires:
+    if granted >= expires or expires - granted > timedelta(days=MAX_CONSENT_DAYS):
         raise ValueError("settings consent interval is invalid")
     if value["chat_locked"] != paths.chat_locked.exists():
         raise ValueError("settings lock marker mismatch")
@@ -223,10 +223,15 @@ def consent_active(settings: Dict[str, Any], now: datetime) -> bool:
     if not isinstance(consent, dict) or consent.get("scope") != "one-exact-chat-text-and-captions":
         return False
     try:
+        granted = parse_utc(consent.get("granted_at"), "consent_granted_at")
         expires = parse_utc(consent.get("expires_at"), "consent_expires_at")
     except ValueError:
         return False
-    return now.astimezone(timezone.utc) < expires
+    current = now.astimezone(timezone.utc)
+    return (
+        granted <= current < expires
+        and expires - granted <= timedelta(days=MAX_CONSENT_DAYS)
+    )
 
 
 def save_initial_config(paths: Paths, settings: Dict[str, Any], credentials: Dict[str, Any],

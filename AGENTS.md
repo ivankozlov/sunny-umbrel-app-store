@@ -31,6 +31,16 @@ runtime configuration.
   receiver's authenticated clock immediately afterwards, then again before and
   after fetch/LLM and immediately before/during SSH upload. A slow or skewed
   Umbrel clock must never extend consent.
+- Pre-lock setup is bound to one uninterrupted one-hour monotonic lease. A
+  collector restart before chat lock invalidates that lease and must require
+  factory reset and a new Telegram login.
+- Chat selection must not read selected-peer history: it stores the contractual
+  `initial_message_id=0`. Only the first authenticated due gate derives the
+  72-hour lower boundary from receiver `server_time`, with an exact per-row time
+  filter before any text reaches OpenRouter.
+- Every OpenRouter request must set `provider.zdr=true` and
+  `provider.data_collection=deny`; account/key privacy controls remain defence
+  in depth and may not replace the per-request guard.
 - SSH must use the generated dedicated Ed25519 key and the exact pinned
   `known_hosts` entry. Never add `StrictHostKeyChecking=no` or `ssh-keyscan`.
 - Do not add host networking, raw ports, Docker socket mounts, `privileged`,

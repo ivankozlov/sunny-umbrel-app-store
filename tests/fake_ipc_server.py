@@ -16,7 +16,7 @@ def fixture(phase: str):
         "phase": phase,
         "configured": phase != "fresh",
         "chat_locked": phase == "chat_locked",
-        "consent_active": phase == "chat_locked",
+        "consent_active": phase not in ("fresh", "unavailable"),
         "pending_upload": False,
         "source_id": None,
         "chat_id": None,

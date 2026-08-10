@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import base64
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from sunny_digest.models import DialogCandidate, PeerSpec
-from sunny_digest.settings import normalize_known_host, validate_configure
+from sunny_digest.settings import (
+    SETTINGS_SCHEMA,
+    consent_active,
+    load_settings,
+    normalize_known_host,
+    validate_configure,
+)
+from sunny_digest.storage import Paths, atomic_write_json
 
 
 NOW = datetime(2026, 8, 4, 0, 30, tzinfo=timezone.utc)
@@ -76,6 +85,50 @@ class SettingsTests(unittest.TestCase):
             validate_configure(configure(expires=too_soon), NOW)
         with self.assertRaises(ValueError):
             validate_configure(configure(expires=too_late), NOW)
+
+
+class TestBugConsentInterval20260810(unittest.TestCase):
+    """Consent is active only inside its bounded half-open interval."""
+
+    def test_consent_active_is_half_open_interval(self):
+        granted = NOW
+        expires = NOW + timedelta(hours=1)
+        settings = {
+            "consent": {
+                "scope": "one-exact-chat-text-and-captions",
+                "granted_at": granted.isoformat().replace("+00:00", "Z"),
+                "expires_at": expires.isoformat().replace("+00:00", "Z"),
+            },
+        }
+        self.assertFalse(consent_active(settings, granted - timedelta(seconds=1)))
+        self.assertTrue(consent_active(settings, granted))
+        self.assertTrue(consent_active(settings, expires - timedelta(microseconds=1)))
+        self.assertFalse(consent_active(settings, expires))
+
+    def test_load_settings_rejects_consent_interval_over_ninety_days(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = Paths(
+                root / "config", root / "private", root / "runtime",
+                root / "runtime" / "control.sock",
+            )
+            paths.ensure()
+            atomic_write_json(paths.settings, {
+                "schema": SETTINGS_SCHEMA,
+                "phase": "configured",
+                "chat_locked": False,
+                "openrouter_model": "anthropic/example",
+                "upload": {"host": "receiver.example", "port": 22, "user": "root"},
+                "consent": {
+                    "scope": "one-exact-chat-text-and-captions",
+                    "granted_at": NOW.isoformat().replace("+00:00", "Z"),
+                    "expires_at": (
+                        NOW + timedelta(days=90, seconds=1)
+                    ).isoformat().replace("+00:00", "Z"),
+                },
+            })
+            with self.assertRaisesRegex(ValueError, "consent interval"):
+                load_settings(paths)
 
 
 if __name__ == "__main__":

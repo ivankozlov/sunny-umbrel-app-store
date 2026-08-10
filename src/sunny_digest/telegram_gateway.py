@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 from .models import DialogCandidate, FetchResult, PeerSpec, SelectedMessage
 from .prompting import prompt_size, truncate_first_to_budget
@@ -138,12 +138,19 @@ class TelethonGateway:
             await client.disconnect()
 
     async def fetch(self, session_text: str, peer: PeerSpec, expected_chat_id: int,
-                    from_message_id_exclusive: int, cutoff_at: datetime) -> FetchResult:
+                    from_message_id_exclusive: int, cutoff_at: datetime,
+                    not_before_at: Optional[datetime] = None) -> FetchResult:
         _, utils, _, _, _, _, _ = self._modules()
         client = self._client(session_text)
         await client.connect()
         through = from_message_id_exclusive
         selected: List[SelectedMessage] = []
+        if not_before_at is not None and not_before_at.tzinfo is None:
+            raise ValueError("Telegram lower time boundary must be timezone-aware")
+        not_before = (
+            not_before_at.astimezone(timezone.utc)
+            if not_before_at is not None else None
+        )
         try:
             if not await client.is_user_authorized():
                 raise RuntimeError("Telegram session is not authorized")
@@ -172,19 +179,23 @@ class TelethonGateway:
                 actual_chat_id = int(utils.get_peer_id(message.peer_id))
                 if actual_chat_id != expected_chat_id:
                     raise RuntimeError("Telegram returned a message from an unexpected peer")
+                sent_at = message.date
+                if sent_at.tzinfo is None:
+                    sent_at = sent_at.replace(tzinfo=timezone.utc)
+                sent_at = sent_at.astimezone(timezone.utc)
+                if not_before is not None and sent_at < not_before:
+                    through = max(through, message_id)
+                    continue
                 text = str(message.message or "").strip()
                 if not text:
                     # Cursor follows fully viewed media/service events. No media
                     # download method is ever called.
                     through = max(through, message_id)
                     continue
-                sent_at = message.date
-                if sent_at.tzinfo is None:
-                    sent_at = sent_at.replace(tzinfo=timezone.utc)
                 candidate = SelectedMessage(
                     message_id=message_id,
                     sender_id=int(message.sender_id) if message.sender_id is not None else None,
-                    sent_at=sent_at.astimezone(timezone.utc),
+                    sent_at=sent_at,
                     text=text,
                 )
                 if prompt_size(selected + [candidate]) > MAX_PROMPT_BYTES:

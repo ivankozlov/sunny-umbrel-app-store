@@ -14,12 +14,13 @@ CHAT_ID = -1_000_000_100_123
 CUTOFF = datetime(2026, 8, 4, 0, 30, tzinfo=timezone.utc)
 
 
-def message(message_id: int, *, text: str | None = None):
+def message(message_id: int, *, text: str | None = None,
+            sent_at: datetime = CUTOFF):
     return SimpleNamespace(
         id=message_id,
         peer_id=CHAT_ID,
         message=text if text is not None else f"message-{message_id}",
-        date=CUTOFF,
+        date=sent_at,
         sender_id=7,
     )
 
@@ -172,6 +173,41 @@ class TelegramFetchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.messages), 1)
         self.assertTrue(result.messages[0].text.endswith("[обрезано]"))
         self.assertLessEqual(prompt_size(result.messages), MAX_PROMPT_BYTES)
+
+
+class TestBugTrustedLookback20260810(unittest.IsolatedAsyncioTestCase):
+    """The first fetch excludes rows older than the trusted 72-hour boundary."""
+
+    async def test_first_fetch_excludes_before_boundary_and_includes_boundary(self):
+        boundary = CUTOFF - timedelta(hours=72)
+        rows = [
+            message(5, sent_at=boundary - timedelta(seconds=1)),
+            message(6, sent_at=boundary - timedelta(microseconds=1)),
+            message(7, sent_at=boundary),
+            message(8, sent_at=boundary + timedelta(seconds=1)),
+        ]
+        client = FakeClient(rows, upper_id=8)
+        gateway = GatewayUnderTest(client)
+        result = await gateway.fetch(
+            "session", PeerSpec("channel", 100123, 998877), CHAT_ID,
+            5, CUTOFF, not_before_at=boundary,
+        )
+        self.assertEqual([row.message_id for row in result.messages], [7, 8])
+        self.assertEqual(result.through_message_id, 8)
+        self.assertEqual(client.iter_calls[0][1]["min_id"], 5)
+
+    async def test_old_rows_after_cursor_advance_without_reaching_prompt(self):
+        boundary = CUTOFF - timedelta(hours=72)
+        client = FakeClient([
+            message(6, sent_at=boundary - timedelta(microseconds=1)),
+        ], upper_id=6)
+        gateway = GatewayUnderTest(client)
+        result = await gateway.fetch(
+            "session", PeerSpec("channel", 100123, 998877), CHAT_ID,
+            5, CUTOFF, not_before_at=boundary,
+        )
+        self.assertEqual(result.messages, [])
+        self.assertEqual(result.through_message_id, 6)
 
 
 if __name__ == "__main__":

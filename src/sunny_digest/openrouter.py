@@ -33,6 +33,10 @@ def _prompt(messages: List[SelectedMessage]) -> str:
 def _blocking_digest_prompt(prompt: str, model: str, api_key: str) -> str:
     request_body = canonical_json_bytes({
         "model": model,
+        "provider": {
+            "zdr": True,
+            "data_collection": "deny",
+        },
         "messages": [
             {"role": "system", "content": "You summarize only the supplied selected-chat text."},
             {"role": "user", "content": prompt},
