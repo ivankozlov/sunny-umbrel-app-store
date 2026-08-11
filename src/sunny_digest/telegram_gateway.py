@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlsplit
 
 from .models import (
     DialogCandidate,
@@ -22,6 +26,123 @@ from .version import (
     MAX_PROMPT_BYTES,
     MAX_SCAN_MESSAGES,
 )
+
+
+_MESSAGE_LINK_HOSTS = frozenset(("t.me", "telegram.me"))
+_MESSAGE_LINK_QUERY_KEYS = frozenset(("single", "thread", "t", "task", "option"))
+_RESERVED_MESSAGE_LINK_ROOTS = frozenset((
+    "a", "addemoji", "addlist", "addstickers", "addstyle", "addtheme",
+    "auction", "auth", "bg", "boost", "c", "call", "confirmphone", "contact",
+    "giftcode", "invoice", "iv", "joinchat", "k", "login", "m", "msg",
+    "newbot", "nft", "oauth", "proxy", "setlanguage", "share", "socks",
+    "web", "z",
+))
+_USERNAME = re.compile(r"^[A-Za-z0-9_]{1,32}$")
+_DECIMAL = re.compile(r"^[1-9][0-9]*$")
+_MEDIA_TIMESTAMP = re.compile(
+    r"(?:[0-9]+|[0-9]+:[0-9]{1,2}|"
+    r"(?:(?:[0-9]+h)?(?:[0-9]{1,2}m)?(?:[0-9]{1,2}s)?))"
+)
+_BASE64URL = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
+
+
+def _positive_decimal(value: str, label: str, *, maximum: int = 2**63 - 1) -> int:
+    if not _DECIMAL.fullmatch(value):
+        raise ValueError(f"Telegram message link {label} is invalid")
+    number = int(value)
+    if number > maximum:
+        raise ValueError(f"Telegram message link {label} is invalid")
+    return number
+
+
+def _message_link_query(query: str, *, path_has_thread: bool) -> Dict[str, str]:
+    if "%" in query:
+        raise ValueError("Telegram message link query is invalid")
+    if not query:
+        return {}
+    fields = query.split("&")
+    if (len(fields) > len(_MESSAGE_LINK_QUERY_KEYS)
+            or any(not field for field in fields)):
+        raise ValueError("Telegram message link query is invalid")
+    values: Dict[str, str] = {}
+    for field in fields:
+        key, separator, value = field.partition("=")
+        if not separator:
+            value = ""
+        if key in values:
+            raise ValueError("Telegram message link query is ambiguous")
+        values[key] = value
+    if not set(values).issubset(_MESSAGE_LINK_QUERY_KEYS):
+        # `comment` targets a message in another linked discussion group, so
+        # treating the path peer as the selected chat would be unsafe.
+        raise ValueError("Telegram message link query is unsupported")
+    if "single" in values and values["single"]:
+        raise ValueError("Telegram message link single flag is invalid")
+    if "thread" in values:
+        if path_has_thread:
+            raise ValueError("Telegram message link thread is ambiguous")
+        _positive_decimal(values["thread"], "thread id", maximum=2**31 - 1)
+    if "t" in values and (
+            not 1 <= len(values["t"]) <= 32
+            or not _MEDIA_TIMESTAMP.fullmatch(values["t"])):
+        raise ValueError("Telegram message link timestamp is invalid")
+    if "task" in values:
+        _positive_decimal(values["task"], "task id", maximum=2**31 - 1)
+    if "option" in values:
+        option = values["option"]
+        if not 1 <= len(option) <= 1024 or not _BASE64URL.fullmatch(option):
+            raise ValueError("Telegram message link option is invalid")
+        try:
+            base64.urlsafe_b64decode(option + "=" * (-len(option) % 4)).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            raise ValueError("Telegram message link option is invalid") from None
+    return values
+
+
+def parse_message_link(value: Any) -> Tuple[str, Any]:
+    """Return an exact group locator without fetching or following the URL."""
+    if (not isinstance(value, str) or not 1 <= len(value) <= 2048
+            or value != value.strip()
+            or any(ord(char) > 127 or ord(char) < 32 or ord(char) == 127
+                   or unicodedata.category(char) in ("Cf", "Cs")
+                   for char in value)):
+        raise ValueError("Telegram message link is invalid")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("Telegram message link is invalid") from None
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Telegram message link is invalid")
+
+    if parsed.scheme == "https":
+        if parsed.netloc.lower() not in _MESSAGE_LINK_HOSTS or port is not None:
+            raise ValueError("Telegram message link host is invalid")
+        if ("%" in parsed.path or "\\" in parsed.path
+                or not parsed.path.startswith("/") or parsed.path.endswith("/")):
+            raise ValueError("Telegram message link path is invalid")
+        parts = parsed.path[1:].split("/")
+        if any(not part for part in parts):
+            raise ValueError("Telegram message link path is invalid")
+        if parts[0] == "c":
+            if len(parts) not in (3, 4):
+                raise ValueError("Telegram private message link path is invalid")
+            _message_link_query(parsed.query, path_has_thread=len(parts) == 4)
+            channel_id = _positive_decimal(parts[1], "channel")
+            for part in parts[2:]:
+                _positive_decimal(part, "message id", maximum=2**31 - 1)
+            if channel_id > 2**63 - 1 - 1_000_000_000_000:
+                raise ValueError("Telegram message link channel is invalid")
+            return "channel", channel_id
+        if (len(parts) not in (2, 3)
+                or parts[0].lower() in _RESERVED_MESSAGE_LINK_ROOTS
+                or not _USERNAME.fullmatch(parts[0])):
+            raise ValueError("Telegram public message link path is invalid")
+        _message_link_query(parsed.query, path_has_thread=len(parts) == 3)
+        for part in parts[1:]:
+            _positive_decimal(part, "message id", maximum=2**31 - 1)
+        return "username", parts[0].lower()
+    raise ValueError("Telegram message link scheme is invalid")
 
 
 def _truncate_first_to_budget(message: SelectedMessage,
@@ -155,22 +276,31 @@ class TelethonGateway:
         finally:
             await client.disconnect()
 
-    async def list_dialogs(self, session_text: str) -> List[DialogCandidate]:
+    async def resolve_message_links(
+            self, session_text: str, links: Sequence[str]) -> List[DialogCandidate]:
+        """Match locators to exact accessible peers without fetching linked messages."""
+        targets = [parse_message_link(link) for link in links]
+        wanted_channels = {locator for kind, locator in targets if kind == "channel"}
+        wanted_usernames = {locator for kind, locator in targets if kind == "username"}
         _, utils, _, _, InputPeerChannel, InputPeerChat, InputPeerUser = self._modules()
         client = self._client(session_text)
         await client.connect()
-        candidates: List[DialogCandidate] = []
+        by_channel: Dict[int, DialogCandidate] = {}
+        by_username: Dict[str, DialogCandidate] = {}
         try:
             if not await client.is_user_authorized():
                 raise RuntimeError("Telegram session is not authorized")
             async for dialog in client.iter_dialogs(limit=500):
-                # Only groups/supergroups can enter the immutable selected set.
-                # Private users and broadcast-only channels are not selectable.
-                if not bool(getattr(dialog, "is_group", False)) or int(dialog.id) >= 0:
+                entity = dialog.entity
+                if (not bool(getattr(dialog, "is_group", False))
+                        or bool(getattr(entity, "left", False))
+                        or bool(getattr(entity, "broadcast", False))
+                        or int(dialog.id) >= 0):
                     continue
-                input_peer = utils.get_input_peer(dialog.entity)
+                input_peer = utils.get_input_peer(entity)
                 if isinstance(input_peer, InputPeerChannel):
-                    peer = PeerSpec("channel", int(input_peer.channel_id), int(input_peer.access_hash))
+                    peer = PeerSpec(
+                        "channel", int(input_peer.channel_id), int(input_peer.access_hash))
                 elif isinstance(input_peer, InputPeerChat):
                     peer = PeerSpec("chat", int(input_peer.chat_id), None)
                 elif isinstance(input_peer, InputPeerUser):
@@ -180,8 +310,48 @@ class TelethonGateway:
                 title = _clean_text(
                     dialog.name or "Unnamed chat", max_utf16_units=160,
                 ) or "Unnamed chat"
-                candidates.append(DialogCandidate(int(dialog.id), title, peer))
-            return candidates
+                candidate = DialogCandidate(int(dialog.id), title, peer)
+                if peer.kind == "channel" and peer.peer_id in wanted_channels:
+                    if peer.peer_id in by_channel:
+                        raise RuntimeError("Telegram returned a duplicated group peer")
+                    by_channel[peer.peer_id] = candidate
+                usernames: List[str] = []
+                primary = getattr(entity, "username", None)
+                if isinstance(primary, str):
+                    usernames.append(primary)
+                for row in getattr(entity, "usernames", None) or ():
+                    username = getattr(row, "username", None)
+                    if getattr(row, "active", False) and isinstance(username, str):
+                        usernames.append(username)
+                for username in usernames:
+                    canonical = username.lower()
+                    if canonical not in wanted_usernames:
+                        continue
+                    previous = by_username.get(canonical)
+                    if previous is not None and previous.chat_id != candidate.chat_id:
+                        raise RuntimeError("Telegram returned an ambiguous group username")
+                    by_username[canonical] = candidate
+                if (wanted_channels.issubset(by_channel)
+                        and wanted_usernames.issubset(by_username)):
+                    break
+
+            selected: List[DialogCandidate] = []
+            seen = set()
+            for kind, locator in targets:
+                candidate = (
+                    by_channel.get(locator)
+                    if kind == "channel"
+                    else by_username.get(locator)
+                )
+                if candidate is None:
+                    raise ValueError(
+                        "Telegram message link does not identify an accessible group")
+                if candidate.chat_id in seen:
+                    raise ValueError(
+                        "message links identify the same Telegram group more than once")
+                seen.add(candidate.chat_id)
+                selected.append(candidate)
+            return selected
         finally:
             await client.disconnect()
 

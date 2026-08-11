@@ -8,8 +8,11 @@ runtime configuration.
 ## Security invariants
 
 - Runtime reads one immutable set of 1–16 exact group/supergroup `InputPeer`
-  values. Dialog enumeration is setup-only and is permanently disabled for an
-  authorized session after chat selection.
+  values. Setup accepts one message link per group, durably enters a one-shot
+  `resolving_links` phase before paged dialog enumeration, and permanently disables lookup
+  after either an interrupted attempt or chat selection. Telegram may include
+  the latest messages for up to 500 dialogs across those responses; the app may use
+  only peer/title metadata and must not persist links or returned message text.
 - Changing the Telegram account, selected chats, OpenRouter key/model, or upload
   endpoint requires factory reset. Before its first await, reset persists a
   blocking revocation warning; it then cancels active work, attempts Telegram
@@ -40,8 +43,10 @@ runtime configuration.
 - Pre-lock setup is bound to one uninterrupted one-hour monotonic lease. A
   collector restart before chat lock invalidates that lease and must require
   factory reset and a new Telegram login.
-- Chat selection must not read selected-peer history: every selected chat stores
-  contractual `initial_message_id=0`. An explicit first activation snapshots the
+- Chat selection must not fetch the linked message or scan selected-peer history:
+  every selected chat stores contractual `initial_message_id=0`. A forum-topic
+  link selects the whole group, duplicate links to one peer fail closed, and an
+  explicit first activation snapshots the
   exact current heads, durably uploads a content-free baseline, and only after its
   receiver receipt clears existing unread state. Historical mentions are never
   exported. The first authenticated daily due gate independently derives the

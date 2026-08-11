@@ -30,6 +30,7 @@ def status(phase="fresh"):
         "consent_expires_at": None,
         "phone_masked": None,
         "dialogs": [],
+        "selection_id": None,
         "last_result": None,
         "last_error_type": None,
         "revocation_required": False,
@@ -146,7 +147,8 @@ class WebTests(unittest.TestCase):
 
     def test_reset_is_visible_in_every_phase_and_renewal_is_explicit(self):
         for phase in ("fresh", "configured", "code_sent", "password_required",
-                      "authenticated", "dialogs_listed", "chat_locked", "unavailable"):
+                      "authenticated", "resolving_links", "dialogs_listed",
+                      "chat_locked", "unavailable"):
             with self.subTest(phase=phase):
                 body = _layout(render_status(status(phase), "a" * 64), "a" * 64).decode()
                 self.assertIn('name="action" value="reset"', body)
@@ -171,7 +173,8 @@ class WebTests(unittest.TestCase):
                 ("configured", 'name="action" value="send_code"'),
                 ("code_sent", 'name="action" value="submit_code"'),
                 ("password_required", 'name="action" value="submit_password"'),
-                ("authenticated", 'name="action" value="list_dialogs"'),
+                ("authenticated", 'name="action" value="resolve_chat_links"'),
+                ("resolving_links", 'name="action" value="resolve_chat_links"'),
                 ("dialogs_listed", 'name="action" value="select_chats"')):
             with self.subTest(phase=phase):
                 value = status(phase)
@@ -186,14 +189,42 @@ class WebTests(unittest.TestCase):
                 ("configured", "send_code"),
                 ("code_sent", "submit_code"),
                 ("password_required", "submit_password"),
-                ("authenticated", "list_dialogs"),
+                ("authenticated", "resolve_chat_links"),
                 ("dialogs_listed", "select_chats")):
             with self.subTest(phase=phase):
                 body = render_status(status(phase), "a" * 64)
                 self.assertIn(f'name="action" value="{action}"', body)
 
-    def test_multiselect_posts_repeated_chat_ids_and_explicit_activation(self):
+    def test_message_links_then_multiselect_and_explicit_activation(self):
+        self.ipc.value = status("authenticated")
+        response, page = self.request("GET", headers=self.auth)
+        self.assertIn(b'name="chat_links"', page)
+        self.assertNotIn(b'name="chat_id"', page)
+        cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+        token = re.search(
+            rb'name="csrf" value="([0-9a-f]{64})"', page).group(1).decode()
+        headers = dict(self.auth)
+        headers.update({"Cookie": cookie,
+                        "Content-Type": "application/x-www-form-urlencoded"})
+        body = urlencode({
+            "csrf": token,
+            "action": "resolve_chat_links",
+            "chat_links": (
+                " https://t.me/c/124/10 \n\n"
+                "https://t.me/public_group/20\n"
+            ),
+        }).encode()
+        result, rendered = self.request("POST", headers=headers, body=body)
+        self.assertEqual(result.status, 200)
+        self.assertNotIn(b"https://t.me/c/124/10", rendered)
+        self.assertNotIn(b"https://t.me/public_group/20", rendered)
+        self.assertEqual(self.ipc.calls[-1], (
+            "resolve_chat_links",
+            ["https://t.me/c/124/10", "https://t.me/public_group/20"],
+        ))
+
         listed = status("dialogs_listed")
+        listed["selection_id"] = "22345678-1234-4678-9234-567812345678"
         listed["dialogs"] = [
             {"chat_id": -100124, "title": "A", "kind": "channel"},
             {"chat_id": -100123, "title": "B", "kind": "channel"},
@@ -208,14 +239,17 @@ class WebTests(unittest.TestCase):
                         "Content-Type": "application/x-www-form-urlencoded"})
         form = [
             ("csrf", token), ("action", "select_chats"),
+            ("selection_id", listed["selection_id"]),
             ("chat_id", "-100124"), ("chat_id", "-100123"),
             ("confirm_lock", "yes"),
         ]
         result, _ = self.request(
             "POST", headers=headers, body=urlencode(form).encode())
         self.assertEqual(result.status, 200)
-        self.assertEqual(self.ipc.calls[-1],
-                         ("select_chats", ["-100124", "-100123"]))
+        self.assertEqual(self.ipc.calls[-1], ("select_chats", {
+            "selection_id": listed["selection_id"],
+            "chat_ids": ["-100124", "-100123"],
+        }))
 
         locked = status("chat_locked")
         self.ipc.value = locked
@@ -231,11 +265,37 @@ class WebTests(unittest.TestCase):
         self.request("POST", headers=headers, body=body)
         self.assertEqual(self.ipc.calls[-1], ("activate_monitoring", None))
 
+    def test_message_link_count_is_bounded_before_ipc(self):
+        self.ipc.value = status("authenticated")
+        response, page = self.request("GET", headers=self.auth)
+        cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+        token = re.search(
+            rb'name="csrf" value="([0-9a-f]{64})"', page).group(1).decode()
+        headers = dict(self.auth)
+        headers.update({"Cookie": cookie,
+                        "Content-Type": "application/x-www-form-urlencoded"})
+        before = list(self.ipc.calls)
+        body = urlencode({
+            "csrf": token,
+            "action": "resolve_chat_links",
+            "chat_links": "\n".join(
+                f"https://t.me/group_{index}/1" for index in range(17)),
+        }).encode()
+        result, page = self.request("POST", headers=headers, body=body)
+        self.assertEqual(result.status, 200)
+        self.assertIn("Проверьте ссылки".encode(), page)
+        self.assertEqual(self.ipc.calls, before + [("status", None)])
+
     def test_ui_discloses_exact_data_scope_and_first_activation_effect(self):
         fresh = render_status(status("fresh"), "a" * 64)
         self.assertIn("ZDR OpenRouter", fresh)
         self.assertIn("фрагментом до 300 UTF-16", fresh)
         self.assertIn("помечать просмотренные сообщения", fresh)
+        authenticated = render_status(status("authenticated"), "a" * 64)
+        self.assertIn("включая последние сообщения", authenticated)
+        self.assertIn("не сохраняет ссылки или полученные тексты", authenticated)
+        interrupted = render_status(status("resolving_links"), "a" * 64)
+        self.assertIn("Повторный запрос заблокирован", interrupted)
         locked = render_status(status("chat_locked"), "a" * 64)
         self.assertIn("Старые mentions не будут отправлены", locked)
         self.assertIn("durable baseline ACK", locked)

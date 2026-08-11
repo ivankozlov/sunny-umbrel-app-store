@@ -145,7 +145,7 @@ def load_settings(paths: Paths) -> Dict[str, Any]:
         raise ValueError("settings schema is invalid")
     if value.get("phase") not in (
             "configured", "code_sent", "password_required", "authenticated",
-            "dialogs_listed", "chat_locked"):
+            "resolving_links", "dialogs_listed", "chat_locked"):
         raise ValueError("settings phase is invalid")
     if not isinstance(value.get("chat_locked"), bool):
         raise ValueError("settings chat_locked is invalid")

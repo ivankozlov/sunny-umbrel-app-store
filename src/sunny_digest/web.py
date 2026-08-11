@@ -5,6 +5,7 @@ import binascii
 import html
 import json
 import os
+import re
 import secrets
 import socket
 from http import HTTPStatus
@@ -136,6 +137,25 @@ def _hidden_csrf(csrf: str) -> str:
     return f'<input type="hidden" name="csrf" value="{_escape(csrf)}">'
 
 
+def _safe_failure_notice(status: Dict[str, Any], exc: Exception) -> str:
+    # IPC only exposes a bounded exception class name; never reflect its message.
+    error_type = (
+        str(exc)
+        if isinstance(exc, RuntimeError)
+        and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", str(exc))
+        else type(exc).__name__
+    )
+    phase = status.get("phase")
+    if phase == "authenticated" and error_type == "ValueError":
+        return (
+            "Проверьте ссылки: HTTPS t.me, по одной ссылке на сообщение в строке, "
+            "без повторов и comment-ссылок."
+        )
+    if phase == "dialogs_listed" and error_type == "ValueError":
+        return "Подтверждение набора устарело или повреждено. Обновите страницу."
+    return f"Операция не выполнена ({error_type})."
+
+
 def render_status(status: Dict[str, Any], csrf: str) -> str:
     phase = status.get("phase")
     if phase == "fresh":
@@ -176,7 +196,7 @@ def render_status(status: Dict[str, Any], csrf: str) -> str:
 </form>"""
     if (phase in (
             "configured", "code_sent", "password_required", "authenticated",
-            "dialogs_listed") and not status.get("consent_active")):
+            "resolving_links", "dialogs_listed") and not status.get("consent_active")):
         return """
 <h2>Согласие истекло</h2>
 <p>Настройка и чтение Telegram заблокированы. Выполните factory reset,
@@ -205,23 +225,33 @@ def render_status(status: Dict[str, Any], csrf: str) -> str:
 </form>"""
     if phase == "authenticated":
         return f"""
-<h2>Однократный выбор групп</h2>
-<p>Список диалогов будет прочитан ровно один раз. После выбора collector навсегда блокируется на точном наборе Telegram peers.</p>
-<p class="warn">Повторно открыть список или сменить набор без отзыва сессии и полного сброса нельзя.</p>
-<form method="post">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="list_dialogs">
-  <button type="submit">Показать диалоги один раз</button>
+<h2>Выбор групп по ссылкам</h2>
+<p>Скопируйте ссылку на любое сообщение из каждой нужной группы. Одна ссылка — одна строка, от 1 до 16 строк.</p>
+<p class="muted">Поддерживаются обычные публичные и приватные ссылки <strong>t.me</strong>, включая сообщения в forum topics; ссылка на comment в связанной группе не поддерживается. Старые basic groups без ссылки на сообщение выбрать нельзя.</p>
+<p class="muted">Для точной привязки выполняется одна setup-операция: Telegram постранично возвращает до 500 последних диалогов, включая последние сообщения в ответах API. Collector использует только peer и название группы, не открывает указанное сообщение отдельно и не сохраняет ссылки или полученные тексты.</p>
+<p class="warn">Попытка проверки однократна, даже если сеть оборвётся. Повтор и смена набора потребуют отзыва сессии и полного factory reset.</p>
+<form method="post">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="resolve_chat_links">
+  <label>Ссылки на сообщения<textarea name="chat_links" spellcheck="false" placeholder="https://t.me/c/1234567890/42&#10;https://t.me/my_group/314" required></textarea></label>
+  <button type="submit">Проверить ссылки</button>
 </form>"""
+    if phase == "resolving_links":
+        return """
+<h2>Однократная проверка ссылок не завершена</h2>
+<p>Collector уже начал получать список диалогов Telegram, но не зафиксировал полный результат. Повторный запрос заблокирован, чтобы не читать список второй раз.</p>
+<p class="warn">Выполните factory reset, завершите старое устройство Sunny Umbrel в Telegram и начните настройку заново.</p>"""
     if phase == "dialogs_listed":
+        selection_id = _escape(status.get("selection_id") or "")
         options = []
         for row in status.get("dialogs") or []:
             if not isinstance(row, dict):
                 continue
-            label = f'{row.get("title", "Без названия")} · {row.get("kind", "peer")} · {row.get("chat_id", "")}'
-            options.append(f'<label class="check"><input type="checkbox" name="chat_id" value="{_escape(row.get("chat_id", ""))}">{_escape(label)}</label>')
+            label = f'{row.get("title", "Без названия")} · {row.get("kind", "peer")}'
+            options.append(f'<label class="check"><input type="checkbox" name="chat_id" value="{_escape(row.get("chat_id", ""))}" checked>{_escape(label)}</label>')
         return f"""
-<h2>Выберите группы</h2>
-<p class="muted">После подтверждения список будет удалён, а endpoint, модель и все credentials станут неизменяемыми.</p>
+<h2>Проверьте найденные группы</h2>
+<p class="muted">Снимите галочку, если группа не нужна. После подтверждения список будет удалён, а endpoint, модель и все credentials станут неизменяемыми.</p>
 <form method="post">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="select_chats">
+  <input type="hidden" name="selection_id" value="{selection_id}">
   <div><strong>От 1 до 16 групп</strong>{''.join(options)}</div>
   <label class="check"><input type="checkbox" name="confirm_lock" value="yes" required>Я понимаю, что смена набора групп потребует factory reset и нового входа в Telegram.</label>
   <button type="submit">Зафиксировать группы и создать upload key</button>
@@ -421,15 +451,25 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.app.ipc.request("submit_code", _one(form, "code"))
             elif action == "submit_password":
                 result = self.app.ipc.request("submit_password", _one(form, "password"))
-            elif action == "list_dialogs":
-                result = self.app.ipc.request("list_dialogs")
+            elif action == "resolve_chat_links":
+                links = [
+                    line.strip()
+                    for line in _one(form, "chat_links").splitlines()
+                    if line.strip()
+                ]
+                if not 1 <= len(links) <= 16:
+                    raise ValueError("1 to 16 message links are required")
+                result = self.app.ipc.request("resolve_chat_links", links)
             elif action == "select_chats":
                 if _one(form, "confirm_lock") != "yes":
                     raise PermissionError("chat lock was not confirmed")
                 selected = form.get("chat_id")
                 if not selected or not 1 <= len(selected) <= 16:
                     raise ValueError("1 to 16 chats must be selected")
-                result = self.app.ipc.request("select_chats", selected)
+                result = self.app.ipc.request("select_chats", {
+                    "selection_id": _one(form, "selection_id"),
+                    "chat_ids": selected,
+                })
             elif action == "activate_monitoring":
                 if _one(form, "confirm_activation") != "yes":
                     raise PermissionError("monitoring activation was not confirmed")
@@ -464,8 +504,7 @@ class Handler(BaseHTTPRequestHandler):
                 status = self.app.ipc.request("status")
             except Exception:
                 status = {"phase": "unavailable"}
-            # Only the exception class crosses into HTML; provider errors may carry secrets.
-            self._page(status, f"Операция не выполнена ({type(exc).__name__}).")
+            self._page(status, _safe_failure_notice(status, exc))
 
 
 def serve() -> None:

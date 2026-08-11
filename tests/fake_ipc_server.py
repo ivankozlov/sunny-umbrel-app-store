@@ -31,6 +31,7 @@ def fixture(phase: str):
         "consent_expires_at": None,
         "phone_masked": None,
         "dialogs": [],
+        "selection_id": None,
         "last_run_at": None,
         "last_result": None,
         "last_error_type": None,
@@ -40,9 +41,10 @@ def fixture(phase: str):
         "revocation_required": False,
     }
     if phase == "dialogs_listed":
+        base["selection_id"] = "22345678-1234-4678-9234-567812345678"
         base["dialogs"] = [
             {"chat_id": -1001234567890, "title": "Тестовая группа", "kind": "channel"},
-            {"chat_id": -987654321, "title": "Семейный чат", "kind": "chat"},
+            {"chat_id": -1009876543210, "title": "Семейный чат", "kind": "channel"},
         ]
     if phase == "chat_locked":
         base.update({
@@ -50,8 +52,8 @@ def fixture(phase: str):
             "chats": [
                 {"chat_id": -1001234567890, "title": "Тестовая группа",
                  "kind": "channel"},
-                {"chat_id": -987654321, "title": "Семейный чат",
-                 "kind": "chat"},
+                {"chat_id": -1009876543210, "title": "Семейный чат",
+                 "kind": "channel"},
             ],
             "monitoring_phase": "activation_required",
             "activation_required": True,
@@ -90,7 +92,7 @@ def main():
     parser.add_argument(
         "--phase", default="fresh",
         choices=("fresh", "configured", "code_sent", "password_required",
-                 "authenticated", "dialogs_listed", "chat_locked"),
+                 "authenticated", "resolving_links", "dialogs_listed", "chat_locked"),
     )
     args = parser.parse_args()
     path = Path(args.socket)

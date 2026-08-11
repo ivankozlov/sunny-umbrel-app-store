@@ -8,8 +8,14 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
-from sunny_digest.collector import Collector, WATCH_STATE_SCHEMA
+import sunny_digest.collector as collector_module
+from sunny_digest.collector import (
+    Collector,
+    DIALOG_CANDIDATES_SCHEMA,
+    WATCH_STATE_SCHEMA,
+)
 from sunny_digest.contracts import (
     canonical_digest_bytes,
     canonical_monitor_bytes,
@@ -29,6 +35,7 @@ from sunny_digest.storage import Paths, atomic_write_bytes, atomic_write_json, r
 
 NOW = datetime(2026, 8, 4, 0, 30, tzinfo=timezone.utc)
 SOURCE_ID = "12345678-1234-4678-9234-567812345678"
+SELECTION_ID = "22345678-1234-4678-9234-567812345678"
 PEERS = [PeerSpec("channel", 124, 91), PeerSpec("channel", 123, 92)]
 CHAT_IDS = [peer.telegram_chat_id() for peer in PEERS]
 TITLES = ["Первый чат", "Второй чат"]
@@ -248,9 +255,11 @@ class FakeGateway:
             DialogCandidate(chat_id, title, peer)
             for chat_id, title, peer in zip(CHAT_IDS, TITLES, PEERS)
         ]
+        self.resolve_calls = []
         self.logout_calls = 0
 
-    async def list_dialogs(self, _session):
+    async def resolve_message_links(self, _session, links):
+        self.resolve_calls.append(list(links))
         return self.dialogs
 
     async def snapshot_tops(self, _session, selected):
@@ -374,6 +383,8 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             atomic_write_bytes(paths.telegram_session, b"session")
             gateway = FakeGateway(paths)
             atomic_write_json(paths.dialog_candidates, {
+                "schema": DIALOG_CANDIDATES_SCHEMA,
+                "selection_id": SELECTION_ID,
                 "dialogs": [row.as_private_dict() for row in reversed(gateway.dialogs)],
             })
 
@@ -385,7 +396,34 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
                 paths, gateway_factory=lambda *_: gateway,
                 keygen_function=keygen, clock=lambda: NOW)
             collector._setup_deadline_mono = collector.monotonic() + 3600
-            status = await collector.select_chats(list(reversed(CHAT_IDS)))
+            with self.assertRaisesRegex(ValueError, "stale"):
+                await collector.select_chats({
+                    "selection_id": "32345678-1234-4678-9234-567812345678",
+                    "chat_ids": CHAT_IDS,
+                })
+            with self.assertRaisesRegex(ValueError, "chat_id is invalid"):
+                await collector.select_chats({
+                    "selection_id": SELECTION_ID,
+                    "chat_ids": [f" {CHAT_IDS[0]}", CHAT_IDS[1]],
+                })
+            with self.assertRaisesRegex(ValueError, "chat_id is invalid"):
+                await collector.select_chats({
+                    "selection_id": SELECTION_ID,
+                    "chat_ids": [float(CHAT_IDS[0]), CHAT_IDS[1]],
+                })
+            corrupted = read_json(paths.dialog_candidates)
+            corrupted["unexpected"] = True
+            atomic_write_json(paths.dialog_candidates, corrupted)
+            with self.assertRaisesRegex(ValueError, "dialog candidates are invalid"):
+                await collector.select_chats({
+                    "selection_id": SELECTION_ID, "chat_ids": CHAT_IDS,
+                })
+            del corrupted["unexpected"]
+            atomic_write_json(paths.dialog_candidates, corrupted)
+            status = await collector.select_chats({
+                "selection_id": SELECTION_ID,
+                "chat_ids": list(reversed(CHAT_IDS)),
+            })
             self.assertEqual([row["chat_id"] for row in status["chats"]], CHAT_IDS)
             settings = read_json(paths.settings)
             self.assertEqual([row["initial_message_id"] for row in settings["chats"]], [0, 0])
@@ -393,12 +431,157 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(gateway.snapshot_calls, 0)
             self.assertEqual(gateway.aggregate_scan_calls, 0)
             with self.assertRaises(RuntimeError):
-                await collector.select_chats(CHAT_IDS)
+                await collector.select_chats({
+                    "selection_id": SELECTION_ID, "chat_ids": CHAT_IDS,
+                })
 
             collector.trigger_run = lambda: True
             activated = await collector.activate_monitoring()
             self.assertEqual(activated["monitoring_phase"], "activation_requested")
             self.assertEqual(read_json(paths.watch_state)["phase"], "activation_requested")
+
+    async def test_message_links_resolve_without_fetching_the_linked_message(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            paths.ensure()
+            atomic_write_json(paths.settings, {
+                "schema": SETTINGS_SCHEMA, "phase": "authenticated",
+                "chat_locked": False, "openrouter_model": "anthropic/example",
+                "upload": {"host": "receiver.example", "port": 22, "user": "root"},
+                "consent": {"scope": CONSENT_SCOPE,
+                            "granted_at": "2026-08-04T00:00:00Z",
+                            "expires_at": "2026-08-05T00:00:00Z"},
+            })
+            atomic_write_json(paths.credentials, {
+                "schema": CREDENTIALS_SCHEMA, "telegram_api_id": 1,
+                "telegram_api_hash": "a" * 32,
+                "openrouter_api_key": "secret-key-123456",
+            })
+            atomic_write_bytes(paths.telegram_session, b"session")
+            gateway = FakeGateway(paths)
+            collector = Collector(
+                paths, gateway_factory=lambda *_: gateway, clock=lambda: NOW)
+            collector._setup_deadline_mono = collector.monotonic() + 3600
+            with self.assertRaisesRegex(ValueError, "1 to 16 message links"):
+                await collector.resolve_chat_links([])
+            with self.assertRaises(ValueError):
+                await collector.resolve_chat_links(["https://t.me.evil.example/group/1"])
+            with self.assertRaises(ValueError):
+                await collector.resolve_chat_links(["https://t.me/contact/12345"])
+            with self.assertRaises(ValueError):
+                await collector.resolve_chat_links(["https://t.me/C/124/10"])
+            with self.assertRaisesRegex(ValueError, "duplicate group locator"):
+                await collector.resolve_chat_links([
+                    "https://t.me/c/124/10",
+                    "https://t.me/c/124/11",
+                ])
+            self.assertEqual(read_json(paths.settings)["phase"], "authenticated")
+            self.assertEqual(gateway.resolve_calls, [])
+            links = [
+                "https://t.me/c/124/10",
+                "https://t.me/public_group/20",
+            ]
+            result = await collector.resolve_chat_links(links)
+            self.assertEqual(result["phase"], "dialogs_listed")
+            self.assertEqual(gateway.resolve_calls, [links])
+            self.assertEqual(
+                read_json(paths.dialog_candidates)["dialogs"],
+                [row.as_private_dict() for row in gateway.dialogs],
+            )
+            self.assertEqual(
+                read_json(paths.dialog_candidates)["schema"],
+                DIALOG_CANDIDATES_SCHEMA,
+            )
+            uuid.UUID(result["selection_id"])
+            self.assertEqual(gateway.snapshot_calls, 0)
+            self.assertEqual(gateway.aggregate_scan_calls, 0)
+            self.assertEqual(gateway.bootstrap_calls, [])
+            self.assertEqual(gateway.fetch_calls, [])
+            persisted = paths.dialog_candidates.read_bytes() + paths.settings.read_bytes()
+            self.assertNotIn(b"https://t.me/", persisted)
+
+    async def test_link_resolution_attempt_is_durable_and_never_repeated_after_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            paths.ensure()
+            atomic_write_json(paths.settings, {
+                "schema": SETTINGS_SCHEMA, "phase": "authenticated",
+                "chat_locked": False, "openrouter_model": "anthropic/example",
+                "upload": {"host": "receiver.example", "port": 22, "user": "root"},
+                "consent": {"scope": CONSENT_SCOPE,
+                            "granted_at": "2026-08-04T00:00:00Z",
+                            "expires_at": "2026-08-05T00:00:00Z"},
+            })
+            atomic_write_json(paths.credentials, {
+                "schema": CREDENTIALS_SCHEMA, "telegram_api_id": 1,
+                "telegram_api_hash": "a" * 32,
+                "openrouter_api_key": "secret-key-123456",
+            })
+            atomic_write_bytes(paths.telegram_session, b"session")
+            gateway = FakeGateway(paths)
+
+            async def fail_once(_session, links):
+                self.assertEqual(
+                    read_json(paths.settings)["phase"], "resolving_links")
+                gateway.resolve_calls.append(list(links))
+                raise TimeoutError("simulated")
+
+            gateway.resolve_message_links = fail_once
+            collector = Collector(
+                paths, gateway_factory=lambda *_: gateway, clock=lambda: NOW)
+            collector._setup_deadline_mono = collector.monotonic() + 3600
+            links = ["https://t.me/c/124/10"]
+            with self.assertRaises(TimeoutError):
+                await collector.resolve_chat_links(links)
+            self.assertEqual(read_json(paths.settings)["phase"], "resolving_links")
+            self.assertFalse(paths.dialog_candidates.exists())
+            with self.assertRaisesRegex(RuntimeError, "already been used"):
+                await collector.resolve_chat_links(links)
+            self.assertEqual(gateway.resolve_calls, [links])
+
+    async def test_candidate_write_without_phase_commit_never_reenumerates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            paths.ensure()
+            atomic_write_json(paths.settings, {
+                "schema": SETTINGS_SCHEMA, "phase": "authenticated",
+                "chat_locked": False, "openrouter_model": "anthropic/example",
+                "upload": {"host": "receiver.example", "port": 22, "user": "root"},
+                "consent": {"scope": CONSENT_SCOPE,
+                            "granted_at": "2026-08-04T00:00:00Z",
+                            "expires_at": "2026-08-05T00:00:00Z"},
+            })
+            atomic_write_json(paths.credentials, {
+                "schema": CREDENTIALS_SCHEMA, "telegram_api_id": 1,
+                "telegram_api_hash": "a" * 32,
+                "openrouter_api_key": "secret-key-123456",
+            })
+            atomic_write_bytes(paths.telegram_session, b"session")
+            gateway = FakeGateway(paths)
+            collector = Collector(
+                paths, gateway_factory=lambda *_: gateway, clock=lambda: NOW)
+            collector._setup_deadline_mono = collector.monotonic() + 3600
+            original_write = collector_module.atomic_write_json
+
+            def fail_final_phase(path, value, mode=0o600):
+                if path == paths.settings and value.get("phase") == "dialogs_listed":
+                    raise OSError("simulated")
+                return original_write(path, value, mode)
+
+            links = [
+                "https://t.me/c/124/10",
+                "https://t.me/public_group/20",
+            ]
+            with patch.object(
+                    collector_module, "atomic_write_json",
+                    side_effect=fail_final_phase):
+                with self.assertRaises(OSError):
+                    await collector.resolve_chat_links(links)
+            self.assertTrue(paths.dialog_candidates.exists())
+            self.assertEqual(read_json(paths.settings)["phase"], "resolving_links")
+            with self.assertRaisesRegex(RuntimeError, "already been used"):
+                await collector.resolve_chat_links(links)
+            self.assertEqual(gateway.resolve_calls, [links])
 
     async def test_baseline_upload_is_durable_before_receiver_ack_and_read_batch(self):
         with tempfile.TemporaryDirectory() as temporary:

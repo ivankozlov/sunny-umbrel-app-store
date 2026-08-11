@@ -16,10 +16,17 @@ generation and does not migrate the unpublished v0.1 pilot state.
 
 ## Product contract
 
-- Setup lists Telegram groups once and accepts an immutable selection of 1–16.
-  A forum is selected as a whole chat; individual topics are not selected.
-- Selection itself does not read selected-peer history or mutate read state.
-  Runtime access starts only after the user explicitly activates monitoring.
+- Setup accepts one Telegram message link from each of 1–16 groups, resolves the
+  exact accessible peers once, and shows their titles for immutable confirmation.
+  A forum-message link selects the whole chat; individual topics are not selected.
+- The linked message ID is syntax-only: setup neither fetches that message nor scans
+  selected-peer history, and it does not mutate read state. Resolving links uses one
+  setup-only paged enumeration of up to 500 recent dialogs; Telegram may include
+  their latest messages across the `getDialogs` responses, but the app uses only peer/title metadata
+  and persists neither submitted links nor returned message text.
+- Link resolution is one-shot even if the network or process fails. An interrupted
+  attempt requires factory reset and a fresh Telegram login. Runtime access starts
+  only after link confirmation and the user's separate activation.
 - First activation captures a frozen head for every exact peer, durably uploads
   a baseline with no mention events, and only after its receiver receipt marks
   existing unread messages through those heads as read. Historical mentions are
@@ -41,9 +48,10 @@ generation and does not migrate the unpublished v0.1 pilot state.
 Telegram API credentials and a user StringSession cannot restrict themselves to
 specific chats. Containment is enforced locally and fails closed:
 
-- dialog enumeration is setup-only; the setup must finish within one continuous
-  one-hour monotonic lease. A collector restart before chat lock requires factory
-  reset and a fresh Telegram login;
+- link resolution durably enters `resolving_links` before its single setup-only
+  paged dialog enumeration. The setup must finish within one continuous one-hour monotonic
+  lease; an interrupted lookup or collector restart before chat lock requires
+  factory reset and a fresh Telegram login;
 - locked settings store exact `InputPeer` values. Runtime never calls generic
   entity resolution, receives no push updates, and never downloads media;
 - every runtime tick first obtains authenticated `status-v2` from the forced-command
@@ -60,8 +68,9 @@ specific chats. Containment is enforced locally and fails closed:
   `provider.data_collection=deny`;
 - bounded mention events are an explicit privacy exception: they are durable on
   Umbrel while pending, in DO receiver/inbox/backups, and in Sunny's Telegram
-  outbox. Health/status never contains titles, snippets, digest text, phone,
-  credentials, or session data;
+  outbox. Locked runtime health/status never contains titles, snippets, digest
+  text, phone, credentials, or session data. During setup, the authenticated UI
+  may show a masked phone number and resolved group titles for confirmation;
 - two independent sequence/hash/cursor chains reject rollback, gaps, equivocation,
   and cross-stream confusion before Telegram read state advances;
 - SSH uses a dedicated generated Ed25519 key, an exact externally verified
@@ -114,14 +123,20 @@ Telegram, acknowledge that action in the UI, and provision a fresh credential ep
 6. Enter Telegram/OpenRouter/SSH settings and consent. Consent explicitly covers
    daily selected-chat text sent to ZDR OpenRouter, bounded native-mention events
    sent to Sunny, and read acknowledgements visible on every Telegram client.
-7. Finish Telegram login, enumerate groups once, select 1–16 checkboxes, and lock
-   the exact set within the same one-hour collector process.
+7. Finish Telegram login, paste one message link from each of 1–16 groups, then
+   verify the resolved titles and lock the exact checkbox set within the same
+   one-hour collector process. Do not submit two links from the same group.
 
-The UI then displays only public bootstrap data: source UUID, locked chat IDs/titles,
-uploader public key/fingerprint, and endpoint metadata. It never displays the private
-key or session. Do not activate monitoring until the receiver and Sunny `chats` topic
-are ready. Changing the selection, model, endpoint, or credentials requires factory
-reset and a new receiver generation.
+Accepted links are ordinary public or private `https://t.me/...` message links,
+including forum-topic links; a forum link selects the whole group. Linked-discussion
+`comment=` URLs and legacy basic groups without message links are unsupported. The
+raw links and referenced message IDs are not retained after resolution.
+
+After lock, the UI displays only public bootstrap data: source UUID, locked chat
+IDs/titles, uploader public key/fingerprint, and endpoint metadata. It never displays
+the private key or session. Do not activate monitoring until the receiver and Sunny
+`chats` topic are ready. Changing the selection, model, endpoint, or credentials
+requires factory reset and a new receiver generation.
 
 On explicit activation, baseline upload precedes every read acknowledgement. If the
 daily gate is already due, the same runtime cycle may immediately scan up to the
@@ -160,7 +175,8 @@ PYTHONPATH=src python3 -m sunny_digest.main web
 ```
 
 Open `http://127.0.0.1:18080/` and authenticate as `sunny` / `test-only`.
-Use the fixture phases to inspect login, multi-select, locked, and activation screens.
+Use the fixture phases to inspect login, message-link confirmation, locked, and
+activation screens.
 
 ## Two-phase GitHub/GHCR release
 
@@ -169,10 +185,10 @@ The target repository is
 `ghcr.io/ivankozlov/sunny-personal-digest` must be public so umbrelOS can clone and
 pull without registry credentials.
 
-1. Push a disabled `0.2.0` source commit with the digest placeholder.
+1. Push a disabled `0.2.1` source commit with the digest placeholder.
 2. Run the pinned `Publish image` workflow from `main` through the protected
    `ghcr-release` Environment. `bootstrap_empty_package=true` remains permanently
-   limited to the original `0.1.0`; it must be false for `0.2.0`.
+   limited to the original `0.1.0`; it must be false for `0.2.1`.
 3. Verify the public OCI index contains `linux/amd64` and `linux/arm64`.
 4. Pin the exact workflow digest in both Compose services, set `disabled: false`,
    and keep manifest/image/runtime versions in lockstep.

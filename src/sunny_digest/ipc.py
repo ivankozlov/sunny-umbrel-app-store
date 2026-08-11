@@ -15,7 +15,7 @@ MAX_IPC_BYTES = 512 * 1024
 async def dispatch(collector: Collector, request: Dict[str, Any]) -> Dict[str, Any]:
     command = request.get("command")
     allowed_shape = {"command"} if command in (
-        "status", "list_dialogs", "run_now", "revoke_and_reset",
+        "status", "run_now", "revoke_and_reset",
         "acknowledge_manual_revocation", "activate_monitoring",
     ) else {"command", "data"}
     if set(request) != allowed_shape:
@@ -33,8 +33,8 @@ async def dispatch(collector: Collector, request: Dict[str, Any]) -> Dict[str, A
         return await collector.submit_code(request["data"])
     if command == "submit_password":
         return await collector.submit_password(request["data"])
-    if command == "list_dialogs":
-        return await collector.list_dialogs()
+    if command == "resolve_chat_links":
+        return await collector.resolve_chat_links(request["data"])
     if command == "select_chats":
         return await collector.select_chats(request["data"])
     if command == "activate_monitoring":

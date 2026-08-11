@@ -35,12 +35,17 @@ to be scanned or delivered again.
 Every OpenRouter request forces `provider.zdr=true` and
 `provider.data_collection=deny`; a dedicated key, a small spend limit, disabled
 account logging/opt-in training, and narrow model/provider policy remain required
-defence in depth. Setup has one uninterrupted one-hour monotonic lease. A collector
-restart before chat lock invalidates that lease and requires factory reset and a
-new login. Chat selection stores `initial_message_id=0` for every selected peer
-without reading history. A separate explicit activation first durably records the
-current exact heads and only then clears pre-existing unread state, without
-exporting historical mentions. The first authenticated daily `due=true` gate
+defence in depth. Setup has one uninterrupted one-hour monotonic lease. Message-link
+resolution durably enters a one-shot phase before Telegram access; an interrupted
+attempt or collector restart before chat lock requires factory reset and a new
+login. Resolving links uses one bounded setup enumeration of up to 500 recent dialogs.
+Telegram may include their latest messages across the paged `getDialogs` responses, but
+the collector uses only peer/title metadata, does not fetch or follow the linked
+message, and persists neither submitted links nor returned message text. Chat
+selection stores `initial_message_id=0` for every selected peer without scanning
+its history. A separate explicit activation first durably records the current exact
+heads and only then clears pre-existing unread state, without exporting historical
+mentions. The first authenticated daily `due=true` gate
 independently derives each 72-hour lower boundary from receiver `server_time`, and
 rows older than that timestamp are discarded before OpenRouter. Thereafter a
 mention-bearing range is marked read only after its bounded event has a durable

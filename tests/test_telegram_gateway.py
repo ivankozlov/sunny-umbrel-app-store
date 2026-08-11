@@ -7,7 +7,11 @@ from types import SimpleNamespace
 
 from sunny_digest.models import DigestChat, PeerSpec
 from sunny_digest.prompting import prompt_size, render_digest_prompt
-from sunny_digest.telegram_gateway import MAX_MENTION_EVENTS, TelethonGateway
+from sunny_digest.telegram_gateway import (
+    MAX_MENTION_EVENTS,
+    TelethonGateway,
+    parse_message_link,
+)
 from sunny_digest.version import MAX_PROMPT_BYTES, MAX_SCAN_MESSAGES
 
 
@@ -115,6 +119,211 @@ class GatewayUnderTest(TelethonGateway):
                 self.peers = peers
 
         return InputDialogPeer, GetPeerDialogsRequest
+
+
+class TestBugTelegramMessageLinks20260811(unittest.IsolatedAsyncioTestCase):
+    def test_parses_official_public_private_and_forum_links(self):
+        self.assertEqual(
+            parse_message_link("https://t.me/c/1234567890/42"),
+            ("channel", 1234567890),
+        )
+        self.assertEqual(
+            parse_message_link(
+                "https://t.me/c/1234567890/7/42?single"),
+            ("channel", 1234567890),
+        )
+        self.assertEqual(
+            parse_message_link("https://telegram.me/Example_Group/42?thread=7"),
+            ("username", "example_group"),
+        )
+        self.assertEqual(
+            parse_message_link("https://t.me/Example_Group/7/42"),
+            ("username", "example_group"),
+        )
+        self.assertEqual(
+            parse_message_link(
+                "https://t.me/x/42?single&t=1h23m10s&task=3&option=0JrQvtGC#ignored"),
+            ("username", "x"),
+        )
+
+    def test_rejects_non_message_spoofed_and_ambiguous_links(self):
+        invalid = (
+            "http://t.me/c/123/42",
+            "https://t.me.evil.example/c/123/42",
+            "https://www.t.me/c/123/42",
+            "https://t.me./c/123/42",
+            "https://ｔ.me/c/123/42",
+            "https://user@t.me/c/123/42",
+            "https://t.me\\@evil.example/c/123/42",
+            "https://t.me:443/c/123/42",
+            "https://t.me/+invite",
+            "https://t.me/joinchat/invite",
+            "https://t.me/c/123",
+            "https://t.me/c/123/0",
+            "https://t.me/c/0123/42",
+            "https://t.me/c/123/042",
+            "https://t.me/C/123/42",
+            "https://t.me/c/123/2147483648",
+            "https://t.me/c/123/1/2/3",
+            "https://t.me/example_group",
+            "https://t.me/example_group/not-a-message",
+            "https://t.me/example_group/42?start=payload",
+            "https://t.me/example_group/42?comment=9",
+            "https://t.me/example_group/42?single&single",
+            "https://t.me/example_group/42?&&",
+            "https://t.me/example_group/7/42?thread=7",
+            "https://t.me/example_group/42?thread=0",
+            "https://t.me/example_group/42?t=1:234",
+            "https://t.me/example_group/42?task=0",
+            "https://t.me/example_group/42?option=__8",
+            "https://t.me/example_group/%34%32",
+            "https://t.me/example_group/%2F42",
+            "https://t.me/example_group/s/42",
+            "https://t.me/share/url?url=https://example.com",
+            "https://t.me/boost/example_group",
+            "https://t.me/contact/12345",
+            "https://t.me/giftcode/12345",
+            "https://t.me/call/12345",
+            "https://t.me/m/12345",
+            "tg://resolve?domain=example_group&post=42",
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_message_link(value)
+
+    async def test_resolves_only_accessible_groups_without_fetching_linked_messages(self):
+        class InputPeerChannel:
+            def __init__(self, channel_id, access_hash):
+                self.channel_id = channel_id
+                self.access_hash = access_hash
+
+        class InputPeerChat:
+            def __init__(self, chat_id):
+                self.chat_id = chat_id
+
+        class InputPeerUser:
+            pass
+
+        class ResolveUtils:
+            @staticmethod
+            def get_input_peer(entity):
+                return entity.input_peer
+
+        class ResolveClient:
+            def __init__(self):
+                self.connect_calls = 0
+                self.disconnect_calls = 0
+                self.iter_calls = []
+                self.dialogs = [
+                    SimpleNamespace(
+                        id=-(1_000_000_000_000 + 1234567890),
+                        name="Приватная группа",
+                        is_group=True,
+                        entity=SimpleNamespace(
+                            username=None,
+                            usernames=[],
+                            input_peer=InputPeerChannel(1234567890, 11),
+                        ),
+                    ),
+                    SimpleNamespace(
+                        id=-(1_000_000_000_000 + 777),
+                        name="Публичная группа",
+                        is_group=True,
+                        entity=SimpleNamespace(
+                            username="Primary_Name",
+                            usernames=[
+                                SimpleNamespace(username="Alias_Name", active=True),
+                                SimpleNamespace(username="Old_Name", active=False),
+                            ],
+                            input_peer=InputPeerChannel(777, 22),
+                        ),
+                    ),
+                    SimpleNamespace(
+                        id=-(1_000_000_000_000 + 888),
+                        name="Broadcast channel",
+                        is_group=False,
+                        entity=SimpleNamespace(
+                            username="broadcast",
+                            usernames=[],
+                            input_peer=InputPeerChannel(888, 33),
+                        ),
+                    ),
+                    SimpleNamespace(
+                        id=-(1_000_000_000_000 + 999),
+                        name="Left group",
+                        is_group=True,
+                        entity=SimpleNamespace(
+                            username="left_group",
+                            usernames=[],
+                            left=True,
+                            input_peer=InputPeerChannel(999, 44),
+                        ),
+                    ),
+                ]
+
+            async def connect(self):
+                self.connect_calls += 1
+
+            async def disconnect(self):
+                self.disconnect_calls += 1
+
+            async def is_user_authorized(self):
+                return True
+
+            def iter_dialogs(self, **kwargs):
+                self.iter_calls.append(kwargs)
+
+                async def rows():
+                    for row in self.dialogs:
+                        yield row
+
+                return rows()
+
+        class ResolveGateway(TelethonGateway):
+            def __init__(self, client):
+                super().__init__(123, "a" * 32)
+                self.client = client
+
+            def _client(self, _session):
+                return self.client
+
+            def _modules(self):
+                return (
+                    None, ResolveUtils, None, None,
+                    InputPeerChannel, InputPeerChat, InputPeerUser,
+                )
+
+        client = ResolveClient()
+        gateway = ResolveGateway(client)
+        selected = await gateway.resolve_message_links("session", [
+            "https://t.me/c/1234567890/42",
+            "https://t.me/Alias_Name/7/43",
+        ])
+        self.assertEqual(
+            [(row.chat_id, row.title) for row in selected],
+            [
+                (-(1_000_000_000_000 + 1234567890), "Приватная группа"),
+                (-(1_000_000_000_000 + 777), "Публичная группа"),
+            ],
+        )
+        self.assertEqual(client.iter_calls, [{"limit": 500}])
+        self.assertEqual(client.connect_calls, 1)
+        self.assertEqual(client.disconnect_calls, 1)
+
+        with self.assertRaisesRegex(ValueError, "same Telegram group"):
+            await gateway.resolve_message_links("session", [
+                "https://t.me/Primary_Name/42",
+                "https://t.me/c/777/43",
+            ])
+        with self.assertRaisesRegex(ValueError, "accessible group"):
+            await gateway.resolve_message_links(
+                "session", ["https://t.me/broadcast/42"])
+        with self.assertRaisesRegex(ValueError, "accessible group"):
+            await gateway.resolve_message_links(
+                "session", ["https://t.me/Old_Name/42"])
+        with self.assertRaisesRegex(ValueError, "accessible group"):
+            await gateway.resolve_message_links(
+                "session", ["https://t.me/left_group/42"])
 
 
 class TelegramFetchTests(unittest.IsolatedAsyncioTestCase):

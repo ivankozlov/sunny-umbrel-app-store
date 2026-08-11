@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import time
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -40,7 +41,7 @@ from .storage import (
     safe_unlink,
     unlink_atomic_material,
 )
-from .telegram_gateway import TelethonGateway
+from .telegram_gateway import TelethonGateway, parse_message_link
 from .version import (
     DEFAULT_LOOKBACK_HOURS,
     MAX_PROMPT_BYTES,
@@ -59,6 +60,7 @@ DIGEST_ACKNOWLEDGED_SCHEMA = "sunny.personal-chats.digest-acknowledged.v2"
 WATCH_STATE_SCHEMA = "sunny.personal-chats.watch-state.v2"
 REVOCATION_WARNING_SCHEMA = "sunny.personal-chats.revocation-warning.v2"
 SESSION_OUTSTANDING_SCHEMA = "sunny.personal-chats.session-outstanding.v2"
+DIALOG_CANDIDATES_SCHEMA = "sunny.personal-chats.dialog-candidates.v2"
 TELEGRAM_SETUP_TIMEOUT_S = 90
 TELEGRAM_DIALOG_TIMEOUT_S = 120
 TELEGRAM_FETCH_TIMEOUT_S = 180
@@ -74,6 +76,28 @@ def _now() -> datetime:
 def _masked_phone(phone: str) -> str:
     digits = "".join(ch for ch in phone if ch.isdigit())
     return f"+***{digits[-4:]}" if len(digits) >= 4 else "+***"
+
+
+def _load_dialog_candidates(paths: Paths) -> tuple[str, List[DialogCandidate]]:
+    value = read_json(paths.dialog_candidates, max_bytes=512 * 1024)
+    if not isinstance(value, dict) or set(value) != {
+            "schema", "selection_id", "dialogs"}:
+        raise ValueError("dialog candidates are invalid")
+    if value.get("schema") != DIALOG_CANDIDATES_SCHEMA:
+        raise ValueError("dialog candidates are invalid")
+    try:
+        selection_id = str(uuid.UUID(value.get("selection_id")))
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("dialog candidates are invalid") from None
+    if selection_id != value.get("selection_id"):
+        raise ValueError("dialog candidates are invalid")
+    rows = value.get("dialogs")
+    if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_SELECTED_CHATS:
+        raise ValueError("dialog candidates are invalid")
+    candidates = [DialogCandidate.from_private_dict(row) for row in rows]
+    if len({row.chat_id for row in candidates}) != len(candidates):
+        raise ValueError("dialog candidates are invalid")
+    return selection_id, candidates
 
 
 class Collector:
@@ -196,6 +220,7 @@ class Collector:
             "consent_expires_at": None,
             "phone_masked": None,
             "dialogs": [],
+            "selection_id": None,
             "last_run_at": None,
             "last_result": None,
             "last_error_type": None,
@@ -246,13 +271,9 @@ class Collector:
                 elif (status["consent_active"]
                       and settings["phase"] == "dialogs_listed"
                       and self.paths.dialog_candidates.exists()):
-                    private = read_json(self.paths.dialog_candidates, max_bytes=512 * 1024)
-                    rows = private.get("dialogs")
-                    if isinstance(rows, list):
-                        status["dialogs"] = [
-                            DialogCandidate.from_private_dict(row).as_ui_dict()
-                            for row in rows
-                        ]
+                    selection_id, candidates = _load_dialog_candidates(self.paths)
+                    status["selection_id"] = selection_id
+                    status["dialogs"] = [row.as_ui_dict() for row in candidates]
                 if self.paths.setup_state.exists():
                     setup = read_json(self.paths.setup_state, max_bytes=16 * 1024)
                     if isinstance(setup.get("phone_masked"), str):
@@ -296,11 +317,12 @@ class Collector:
                 monitoring_active=False,
                 upload_public_key=None, upload_key_fingerprint=None, model=None,
                 upload_target=None, consent_expires_at=None, phone_masked=None,
-                dialogs=[], revocation_required=True,
+                dialogs=[], selection_id=None, revocation_required=True,
             )
         # A locked runtime status must never expose dialog candidates or setup state.
         if status["chat_locked"]:
             status["dialogs"] = []
+            status["selection_id"] = None
             status["phone_masked"] = None
         return status
 
@@ -313,7 +335,7 @@ class Collector:
             "monitoring_phase", "activation_required", "monitoring_active",
             "upload_public_key", "upload_key_fingerprint",
             "model", "upload_target", "consent_expires_at",
-            "phone_masked", "dialogs", "last_run_at", "last_result",
+            "phone_masked", "dialogs", "selection_id", "last_run_at", "last_result",
             "last_error_type", "last_message_count", "last_through_message_id",
             "failed_chat_count", "revocation_required",
         }
@@ -426,18 +448,31 @@ class Collector:
             safe_unlink(self.paths.setup_state)
             return self._write_status(last_result="authenticated", last_error_type=None)
 
-    async def list_dialogs(self) -> Dict[str, Any]:
+    async def resolve_chat_links(self, links: Any) -> Dict[str, Any]:
         async with self.state_lock:
             settings = load_settings(self.paths)
-            # Exactly once, and permanently impossible after selection for this session.
+            # The durable phase is committed before dialog enumeration. A failed or
+            # interrupted attempt therefore cannot silently enumerate again.
             if settings["chat_locked"] or self.paths.chat_locked.exists():
-                raise RuntimeError("dialog listing is permanently disabled for the locked session")
+                raise RuntimeError("chat link resolution is disabled for the locked session")
             if settings["phase"] != "authenticated" or self.paths.dialog_candidates.exists():
-                raise RuntimeError("dialog listing has already been used or is unavailable")
+                raise RuntimeError("chat link resolution has already been used or is unavailable")
+            if not isinstance(links, list) or not 1 <= len(links) <= MAX_SELECTED_CHATS:
+                raise ValueError("1 to 16 message links are required")
+            if any(not isinstance(link, str) or not 1 <= len(link) <= 2048
+                   for link in links):
+                raise ValueError("Telegram message link is invalid")
+            locators = [parse_message_link(link) for link in links]
+            if len(set(locators)) != len(locators):
+                raise ValueError("message links contain a duplicate group locator")
             self._require_setup_consent(settings)
             credentials = load_credentials(self.paths)
+            session_text = self._session_text()
+            settings["phase"] = "resolving_links"
+            atomic_write_json(self.paths.settings, settings)
             dialogs = await self._bounded_external(
-                self._gateway(credentials).list_dialogs(self._session_text()),
+                self._gateway(credentials).resolve_message_links(
+                    session_text, links),
                 TELEGRAM_DIALOG_TIMEOUT_S,
             )
             self._require_setup_consent(settings)
@@ -445,41 +480,61 @@ class Collector:
                 DialogCandidate.from_private_dict(candidate.as_private_dict())
                 for candidate in dialogs
             ]
-            if not dialogs:
-                raise RuntimeError("Telegram returned no selectable dialogs")
+            if len(dialogs) != len(links):
+                raise RuntimeError("Telegram did not resolve every message link")
+            if len({candidate.chat_id for candidate in dialogs}) != len(dialogs):
+                raise RuntimeError("Telegram resolved duplicate group candidates")
+            selection_id = new_source_id()
             atomic_write_json(self.paths.dialog_candidates, {
+                "schema": DIALOG_CANDIDATES_SCHEMA,
+                "selection_id": selection_id,
                 "dialogs": [candidate.as_private_dict() for candidate in dialogs]
             })
             settings["phase"] = "dialogs_listed"
             atomic_write_json(self.paths.settings, settings)
-            return self._write_status(last_result="dialogs_listed", last_error_type=None)
+            return self._write_status(
+                last_result="message_links_resolved", last_error_type=None)
 
-    async def select_chats(self, chat_ids: Any) -> Dict[str, Any]:
+    async def select_chats(self, selection: Any) -> Dict[str, Any]:
         async with self.state_lock:
             settings = load_settings(self.paths)
             if settings["chat_locked"] or self.paths.chat_locked.exists():
                 raise RuntimeError("chats are already permanently locked for this session")
             if settings["phase"] != "dialogs_listed":
                 raise RuntimeError("select_chats is not allowed in this phase")
+            if not isinstance(selection, dict) or set(selection) != {
+                    "selection_id", "chat_ids"}:
+                raise ValueError("chat selection is invalid")
+            selection_id = selection.get("selection_id")
+            chat_ids = selection.get("chat_ids")
+            if not isinstance(selection_id, str):
+                raise ValueError("chat selection is invalid")
             if not isinstance(chat_ids, list) or not 1 <= len(chat_ids) <= MAX_SELECTED_CHATS:
                 raise ValueError("1 to 16 chats must be selected")
             requested: List[int] = []
             for raw in chat_ids:
-                try:
-                    chat_id = int(raw)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError("chat_id is invalid") from exc
+                if isinstance(raw, bool):
+                    raise ValueError("chat_id is invalid")
+                if isinstance(raw, int):
+                    chat_id = raw
+                elif isinstance(raw, str):
+                    try:
+                        chat_id = int(raw)
+                    except ValueError as exc:
+                        raise ValueError("chat_id is invalid") from exc
+                    if raw != str(chat_id):
+                        raise ValueError("chat_id is invalid")
+                else:
+                    raise ValueError("chat_id is invalid")
                 if chat_id >= 0:
                     raise ValueError("only Telegram groups or supergroups can be selected")
                 requested.append(chat_id)
             if len(set(requested)) != len(requested):
                 raise ValueError("selected chat_ids must be unique")
             requested.sort()
-            candidates_value = read_json(self.paths.dialog_candidates, max_bytes=512 * 1024)
-            rows = candidates_value.get("dialogs")
-            if not isinstance(rows, list):
-                raise ValueError("dialog candidates are invalid")
-            candidates = [DialogCandidate.from_private_dict(row) for row in rows]
+            stored_selection_id, candidates = _load_dialog_candidates(self.paths)
+            if selection_id != stored_selection_id:
+                raise ValueError("chat selection is stale")
             by_id = {row.chat_id: row for row in candidates}
             if any(chat_id not in by_id for chat_id in requested):
                 raise ValueError("chat_id was not in the one-time dialog list")
