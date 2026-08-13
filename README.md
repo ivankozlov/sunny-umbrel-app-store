@@ -14,11 +14,10 @@ The app/package/image ID remains `sunny-personal-digest` for release continuity;
 the v0.2 product name is **Sunny Personal Chats**. v0.2 is a breaking credential
 generation and does not migrate the unpublished v0.1 pilot state.
 
-The current enabled app release is `0.2.2`, pinned for both services at
-`sha256:ba4780b36f42e93ca0f0149238c2ee4b7ad670f47d4e9a9cc5c19f2f076b8098`.
-The physical Umbrel has that version installed and is at fresh setup. This
-checkout prepares a disabled `0.2.3` candidate with a release digest placeholder;
-its wire `COLLECTOR_VERSION` remains `0.2.1`.
+The current enabled app release is `0.2.3`, pinned for both services at
+`sha256:e4166a4586e867fa0c858f22f8abc5f57ad6d62a9b4ba9d33948d662338134b2`.
+The physical Umbrel still has `0.2.2` installed and is at fresh setup, ready for
+the app update. Wire `COLLECTOR_VERSION` remains `0.2.1`.
 
 ## Product contract
 
@@ -212,15 +211,12 @@ The target repository is
 `ghcr.io/ivankozlov/sunny-personal-digest` must be public so umbrelOS can clone and
 pull without registry credentials.
 
-1. Push a disabled `0.2.3` source commit with the digest placeholder.
-2. Run the pinned `Publish image` workflow from `main` through the protected
-   `ghcr-release` Environment. `bootstrap_empty_package=true` remains permanently
-   limited to the original `0.1.0`; it must be false for `0.2.3`.
-3. Verify the public OCI index contains `linux/amd64` and `linux/arm64`.
-4. Pin the exact workflow digest in both Compose services and set `disabled: false`.
-   Manifest/image/`APP_VERSION` remain `0.2.3`; wire `COLLECTOR_VERSION` deliberately
-   stays `0.2.1` because it participates in payload hashes and receiver gates.
-5. Run `python3 scripts/check_package.py --release` before the enabling commit.
+The `0.2.3` release followed this exact sequence: disabled source first, the
+protected `Publish image` workflow with `bootstrap_empty_package=false`, independent
+public OCI verification for `linux/amd64` and `linux/arm64`, and only then the exact
+digest pin plus `disabled: false`. Future versions must repeat the same sequence.
+Wire `COLLECTOR_VERSION` deliberately stays `0.2.1` until an explicit chain migration.
+Run `python3 scripts/check_package.py --release` before every enabling commit.
 
 Never overwrite a version tag, use a mutable tag without its digest, or enable the
 app before both the repository and image are public.
