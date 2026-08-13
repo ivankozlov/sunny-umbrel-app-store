@@ -16,7 +16,9 @@ generation and does not migrate the unpublished v0.1 pilot state.
 
 The current enabled app release is `0.2.2`, pinned for both services at
 `sha256:ba4780b36f42e93ca0f0149238c2ee4b7ad670f47d4e9a9cc5c19f2f076b8098`.
-Its wire `COLLECTOR_VERSION` remains `0.2.1`.
+The physical Umbrel has that version installed and is at fresh setup. This
+checkout prepares a disabled `0.2.3` candidate with a release digest placeholder;
+its wire `COLLECTOR_VERSION` remains `0.2.1`.
 
 ## Product contract
 
@@ -57,11 +59,14 @@ specific chats. Containment is enforced locally and fails closed:
   one sanitized VLESS/REALITY TCP/Vision node and no `DIRECT`, provider, proxy group,
   TUN, controller, LAN listener, or ambient proxy setting. OpenRouter and SSH remain
   on the ordinary Umbrel route;
-- setup downloads the bearer subscription in a killable subprocess, pins both the
-  HTTPS origin and chosen node to DNS-vetted public IPv4 addresses, and passes the URL
-  only over stdin. The URL is never persisted. Only the first valid node is retained;
-  changing it requires factory reset. Mihomo config/cache live in a random `tmpfs`
-  directory and are erased only after TERM/KILL/reap;
+- setup accepts an HTTPS bearer subscription whose response is either a raw/base64
+  share-link list or Clash YAML. A killable subprocess pins both the HTTPS origin and
+  chosen node to DNS-vetted public IPv4 addresses and receives the URL only over stdin.
+  Clash YAML is parsed without constructors/aliases/tags and narrowed to an exact
+  allowlist; neither the raw URL nor provider response is persisted;
+  only the first sanitized node is retained. Changing it requires factory reset.
+  Mihomo config/cache live in a random `tmpfs` directory and are erased only after
+  TERM/KILL/reap;
 - link resolution durably enters `resolving_links` before its single setup-only
   paged dialog enumeration. The setup must finish within one continuous one-hour monotonic
   lease; an interrupted lookup or collector restart before chat lock requires
@@ -128,9 +133,10 @@ Telegram, acknowledge that action in the UI, and provision a fresh credential ep
 
 1. Create Telegram application credentials at `my.telegram.org`.
 2. Prepare an HTTPS subscription containing at least one VLESS/REALITY TCP node with
-   `flow=xtls-rprx-vision`. The URL is a bearer secret: paste it only into the Umbrel
-   password field, never into chat, Git, logs, or an issue. A standard bounded `spx`
-   parameter is accepted and discarded after validation.
+   `flow=xtls-rprx-vision`; raw/base64 share-link lists and Clash YAML are supported.
+   The URL is a bearer secret: paste it only into the Umbrel password field, never
+   into chat, Git, logs, or an issue. A standard bounded `spx` parameter in a share
+   link is accepted and discarded after validation.
 3. Create a dedicated OpenRouter key with a small spending limit. Disable account
    input/output logging and opt-in use of prompts, and narrow the key/model/provider
    allowlist as far as practical.
@@ -139,8 +145,8 @@ Telegram, acknowledge that action in the UI, and provision a fresh credential ep
 5. Complete the public repository/image release gate below.
 6. Install **Sunny Personal Chats** from the Community App Store. The additional
    username is `sunny`; Umbrel displays the deterministic app password.
-7. Enter Telegram/VPN/OpenRouter/SSH settings and consent. Subscription download,
-   strict parsing, DNS pinning, Mihomo startup, and SOCKS readiness finish before
+7. Enter Telegram/VPN/OpenRouter/SSH settings and consent. VPN-source validation,
+   any required subscription download/DNS pinning, Mihomo startup, and SOCKS readiness finish before
    settings are committed and before any Telegram authorization call. Consent covers
    daily selected-chat text sent to ZDR OpenRouter, bounded native-mention events
    sent to Sunny, and read acknowledgements visible on every Telegram client.
@@ -206,13 +212,13 @@ The target repository is
 `ghcr.io/ivankozlov/sunny-personal-digest` must be public so umbrelOS can clone and
 pull without registry credentials.
 
-1. Push a disabled `0.2.2` source commit with the digest placeholder.
+1. Push a disabled `0.2.3` source commit with the digest placeholder.
 2. Run the pinned `Publish image` workflow from `main` through the protected
    `ghcr-release` Environment. `bootstrap_empty_package=true` remains permanently
-   limited to the original `0.1.0`; it must be false for `0.2.2`.
+   limited to the original `0.1.0`; it must be false for `0.2.3`.
 3. Verify the public OCI index contains `linux/amd64` and `linux/arm64`.
 4. Pin the exact workflow digest in both Compose services and set `disabled: false`.
-   Manifest/image/`APP_VERSION` remain `0.2.2`; wire `COLLECTOR_VERSION` deliberately
+   Manifest/image/`APP_VERSION` remain `0.2.3`; wire `COLLECTOR_VERSION` deliberately
    stays `0.2.1` because it participates in payload hashes and receiver gates.
 5. Run `python3 scripts/check_package.py --release` before the enabling commit.
 

@@ -315,7 +315,8 @@ class WebTests(unittest.TestCase):
 
     def test_ui_discloses_exact_data_scope_and_first_activation_effect(self):
         fresh = render_status(status("fresh"), "a" * 64)
-        self.assertIn("VLESS/REALITY TCP/Vision subscription URL", fresh)
+        self.assertIn("VLESS/REALITY subscription URL", fresh)
+        self.assertIn("share-ссылок или Clash YAML", fresh)
         self.assertIn("не сохраняется", fresh)
         self.assertIn("ZDR OpenRouter", fresh)
         self.assertIn("фрагментом до 300 UTF-16", fresh)

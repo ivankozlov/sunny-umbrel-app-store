@@ -1,4 +1,4 @@
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.2.3"
 COLLECTOR_VERSION = "0.2.1"
 PROMPT_VERSION = "personal-chats-digest-v2"
 STATUS_REQUEST_SCHEMA = "sunny.personal-chats.status-request.v2"

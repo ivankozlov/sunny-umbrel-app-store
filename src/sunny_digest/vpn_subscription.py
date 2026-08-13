@@ -16,6 +16,23 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+import yaml
+from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
+from yaml.tokens import (
+    AliasToken,
+    AnchorToken,
+    BlockEndToken,
+    BlockMappingStartToken,
+    BlockSequenceStartToken,
+    DirectiveToken,
+    FlowMappingEndToken,
+    FlowMappingStartToken,
+    FlowSequenceEndToken,
+    FlowSequenceStartToken,
+    ScalarToken,
+    TagToken,
+)
+
 MAX_SUBSCRIPTION_URL = 2048
 MAX_SUBSCRIPTION_BYTES = 1024 * 1024
 MAX_SUBSCRIPTION_NODES = 64
@@ -23,6 +40,8 @@ MAX_NODE_LINE = 4096
 MAX_WORKER_RESPONSE_BYTES = 128 * 1024
 WORKER_SCHEMA = "sunny.personal-chats.subscription-worker.v1"
 WORKER_TERMINATE_GRACE_S = 2.0
+MAX_YAML_NODES = 10_000
+MAX_YAML_DEPTH = 32
 
 _DNS_LABEL = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
@@ -188,7 +207,6 @@ class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
 
         return self.do_open(
             connection, request, context=self._context,
-            check_hostname=self._check_hostname,
         )
 
 
@@ -373,14 +391,257 @@ def _parse_node(line: str) -> Dict[str, Any]:
     }
 
 
+def _validate_yaml_tree(node: Node, *, depth: int = 0, count: List[int]) -> None:
+    if depth > MAX_YAML_DEPTH:
+        raise ValueError
+    count[0] += 1
+    if count[0] > MAX_YAML_NODES:
+        raise ValueError
+    if isinstance(node, ScalarNode):
+        return
+    if isinstance(node, SequenceNode):
+        for item in node.value:
+            _validate_yaml_tree(item, depth=depth + 1, count=count)
+        return
+    if isinstance(node, MappingNode):
+        seen = set()
+        for key, value in node.value:
+            if (
+                not isinstance(key, ScalarNode)
+                or key.tag != "tag:yaml.org,2002:str"
+                or not key.value
+                or key.value in seen
+            ):
+                raise ValueError
+            seen.add(key.value)
+            _validate_yaml_tree(value, depth=depth + 1, count=count)
+        return
+    raise ValueError
+
+
+def _yaml_mapping(node: Node) -> Dict[str, Node]:
+    if not isinstance(node, MappingNode):
+        raise ValueError
+    return {key.value: value for key, value in node.value}
+
+
+def _yaml_string(node: Optional[Node]) -> str:
+    if not isinstance(node, ScalarNode) or node.tag != "tag:yaml.org,2002:str":
+        raise ValueError
+    return node.value
+
+
+def _yaml_integer(node: Optional[Node]) -> int:
+    if (
+        not isinstance(node, ScalarNode)
+        or node.tag != "tag:yaml.org,2002:int"
+        or not re.fullmatch(r"[1-9][0-9]*", node.value)
+    ):
+        raise ValueError
+    return int(node.value, 10)
+
+
+def _yaml_boolean(node: Optional[Node]) -> bool:
+    if (
+        not isinstance(node, ScalarNode)
+        or node.tag != "tag:yaml.org,2002:bool"
+        or node.value not in ("true", "false")
+    ):
+        raise ValueError
+    return node.value == "true"
+
+
+def _parse_clash_vless(node: Node) -> Optional[Dict[str, Any]]:
+    fields = _yaml_mapping(node)
+    node_type = _yaml_string(fields.get("type"))
+    if node_type != "vless":
+        return None
+
+    network_node = fields.get("network")
+    if not isinstance(network_node, ScalarNode):
+        raise ValueError
+    if network_node.tag != "tag:yaml.org,2002:str":
+        raise ValueError
+    if network_node.value != "tcp":
+        return None
+
+    flow_node = fields.get("flow")
+    reality_node = fields.get("reality-opts")
+    if flow_node is None and reality_node is None:
+        return None
+    network = _yaml_string(network_node)
+    tls = _yaml_boolean(fields.get("tls"))
+    flow = _yaml_string(flow_node)
+    if (
+        network != "tcp"
+        or tls is not True
+        or flow != "xtls-rprx-vision"
+        or reality_node is None
+    ):
+        return None
+
+    required = {
+        "name", "type", "server", "port", "uuid", "network", "tls",
+        "flow", "servername", "reality-opts", "client-fingerprint",
+    }
+    optional = {"udp", "skip-cert-verify", "encryption"}
+    if not required <= set(fields) or set(fields) - required - optional:
+        raise ValueError
+
+    name = _yaml_string(fields["name"])
+    if not 1 <= len(name) <= 256:
+        raise ValueError
+    server = _canonical_server(_yaml_string(fields["server"]))
+    port = _yaml_integer(fields["port"])
+    if not 1 <= port <= 65535:
+        raise ValueError
+    raw_uuid = _yaml_string(fields["uuid"])
+    canonical_uuid = str(uuid.UUID(raw_uuid))
+    if raw_uuid != canonical_uuid:
+        raise ValueError
+
+    if "udp" in fields:
+        _yaml_boolean(fields["udp"])
+    if (
+        "skip-cert-verify" in fields
+        and _yaml_boolean(fields["skip-cert-verify"]) is not False
+    ):
+        raise ValueError
+    if (
+        "encryption" in fields
+        and _yaml_string(fields["encryption"]) not in ("", "none")
+    ):
+        raise ValueError
+
+    sni = _yaml_string(fields["servername"])
+    if (
+        not 1 <= len(sni) <= 253
+        or _has_control(sni)
+        or any(ord(character) < 0x21 or ord(character) > 0x7E
+               for character in sni)
+    ):
+        raise ValueError
+    fingerprint = _yaml_string(fields["client-fingerprint"])
+    if fingerprint not in _MODERN_FINGERPRINTS:
+        raise ValueError
+
+    reality = _yaml_mapping(fields["reality-opts"])
+    if set(reality) - {"public-key", "short-id", "support-x25519mlkem768"}:
+        raise ValueError
+    if "public-key" not in reality:
+        raise ValueError
+    if (
+        "support-x25519mlkem768" in reality
+        and _yaml_boolean(reality["support-x25519mlkem768"]) is not False
+    ):
+        raise ValueError
+    public_key = _yaml_string(reality["public-key"])
+    if len(public_key) != 43 or not _BASE64URL.fullmatch(public_key):
+        raise ValueError
+    try:
+        decoded_key = base64.b64decode(
+            public_key + "=", altchars=b"-_", validate=True,
+        )
+    except (binascii.Error, ValueError):
+        raise ValueError from None
+    if (
+        len(decoded_key) != 32
+        or base64.urlsafe_b64encode(decoded_key).decode("ascii").rstrip("=")
+        != public_key
+    ):
+        raise ValueError
+    short_id = _yaml_string(reality.get("short-id", ScalarNode(
+        tag="tag:yaml.org,2002:str", value="",
+    )))
+    if (
+        len(short_id) > 16
+        or len(short_id) % 2
+        or (short_id and not _HEX.fullmatch(short_id))
+    ):
+        raise ValueError
+
+    return {
+        "type": "vless",
+        "server": server,
+        "port": port,
+        "uuid": canonical_uuid,
+        "network": "tcp",
+        "tls": True,
+        "servername": sni.lower(),
+        "client-fingerprint": fingerprint,
+        "reality-opts": {
+            "public-key": public_key,
+            "short-id": short_id.lower(),
+        },
+        "flow": "xtls-rprx-vision",
+        "udp": False,
+    }
+
+
+def _preflight_clash_yaml(text: str) -> None:
+    forbidden = (AliasToken, AnchorToken, DirectiveToken, TagToken)
+    collection_starts = (
+        BlockMappingStartToken, BlockSequenceStartToken,
+        FlowMappingStartToken, FlowSequenceStartToken,
+    )
+    collection_ends = (BlockEndToken, FlowMappingEndToken, FlowSequenceEndToken)
+    nodes = 0
+    depth = 0
+    for token in yaml.scan(text, Loader=yaml.SafeLoader):
+        if isinstance(token, forbidden):
+            raise ValueError
+        if isinstance(token, ScalarToken):
+            nodes += 1
+        elif isinstance(token, collection_starts):
+            nodes += 1
+            depth += 1
+            if depth > MAX_YAML_DEPTH:
+                raise ValueError
+        elif isinstance(token, collection_ends):
+            depth -= 1
+            if depth < 0:
+                raise ValueError
+        if nodes > MAX_YAML_NODES:
+            raise ValueError
+    if depth != 0:
+        raise ValueError
+
+
+def _parse_clash_yaml(payload: bytes) -> List[Dict[str, Any]]:
+    text = payload.decode("utf-8-sig")
+    _preflight_clash_yaml(text)
+    root = yaml.compose(text, Loader=yaml.SafeLoader)
+    if root is None:
+        raise ValueError
+    _validate_yaml_tree(root, count=[0])
+    fields = _yaml_mapping(root)
+    proxies = fields.get("proxies")
+    if (
+        not isinstance(proxies, SequenceNode)
+        or not 1 <= len(proxies.value) <= MAX_SUBSCRIPTION_NODES
+    ):
+        raise ValueError
+    nodes = []
+    for item in proxies.value:
+        node = _parse_clash_vless(item)
+        if node is not None:
+            nodes.append(node)
+    if not nodes:
+        raise ValueError
+    return nodes
+
+
 def parse_vless_subscription(payload: bytes) -> List[Dict[str, Any]]:
-    """Parse a raw or base64-wrapped VLESS list into a narrow Mihomo shape."""
+    """Parse a share-link list or Clash YAML into a narrow Mihomo shape."""
     try:
         if not isinstance(payload, bytes) or not 1 <= len(payload) <= MAX_SUBSCRIPTION_BYTES:
             raise ValueError
         candidate = payload.strip(b" \t\r\n")
         if not candidate.startswith(b"vless://"):
-            candidate = _decode_base64_wrapped(candidate)
+            try:
+                candidate = _decode_base64_wrapped(candidate)
+            except ValueError:
+                return _parse_clash_yaml(candidate)
         text = candidate.decode("utf-8")
         if any(
             unicodedata.category(character).startswith("C")
@@ -396,7 +657,7 @@ def parse_vless_subscription(payload: bytes) -> List[Dict[str, Any]]:
         if not 1 <= len(lines) <= MAX_SUBSCRIPTION_NODES:
             raise ValueError
         return [_parse_node(line) for line in lines]
-    except (TypeError, ValueError, UnicodeError):
+    except (TypeError, ValueError, UnicodeError, RecursionError, yaml.YAMLError):
         raise ValueError("subscription payload is invalid") from None
 
 

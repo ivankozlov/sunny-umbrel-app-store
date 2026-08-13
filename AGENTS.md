@@ -13,6 +13,11 @@ runtime configuration.
   after either an interrupted attempt or chat selection. Telegram may include
   the latest messages for up to 500 dialogs across those responses; the app may use
   only peer/title metadata and must not persist links or returned message text.
+- VPN setup accepts one HTTPS bearer subscription. Its raw/base64 share-list or Clash
+  YAML response is parsed in a killable worker; YAML constructors, aliases, anchors,
+  tags, directives, merge keys, duplicate keys, and unknown VLESS capabilities are
+  rejected. Only a freshly built allowlisted VLESS/REALITY TCP/Vision node may be
+  persisted. Every Telegram client remains SOCKS-only with no direct fallback.
 - Changing the Telegram account, selected chats, OpenRouter key/model, or upload
   endpoint requires factory reset. Before its first await, reset persists a
   blocking revocation warning; it then cancels active work, attempts Telegram

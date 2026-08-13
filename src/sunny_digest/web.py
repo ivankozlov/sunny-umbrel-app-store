@@ -206,8 +206,8 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
   <input type="hidden" name="action" value="configure">
   <label>Telegram API ID<input name="telegram_api_id" inputmode="numeric" required></label>
   <label>Telegram API hash<input name="telegram_api_hash" type="password" required autocomplete="new-password"></label>
-  <label>VLESS/REALITY TCP/Vision subscription URL<input name="vpn_subscription_url" type="password" inputmode="url" required autocomplete="new-password"></label>
-  <p class="muted">Ссылка используется один раз для загрузки подписки и не сохраняется. Collector хранит только очищенный VLESS/REALITY-узел; его смена потребует factory reset.</p>
+  <label>VLESS/REALITY subscription URL<input name="vpn_subscription_url" type="password" inputmode="url" required autocomplete="new-password"></label>
+  <p class="muted">Ссылка используется один раз и не сохраняется. Ответ может быть списком share-ссылок или Clash YAML; Collector хранит только очищенный VLESS/REALITY TCP/Vision-узел. Его смена потребует factory reset.</p>
   <label>OpenRouter API key<input name="openrouter_api_key" type="password" required autocomplete="new-password"></label>
   <label>OpenRouter model<input name="openrouter_model" placeholder="provider/model" required></label>
   <label>Sunny receiver host<input name="upload_host" placeholder="sunny.example.net" required></label>

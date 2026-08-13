@@ -56,6 +56,32 @@ def parsed_node(server="1.1.1.1"):
     return parse_vless_subscription(vless_uri(host=server).encode())[0]
 
 
+def clash_yaml(*, node_overrides="", extra_node=""):
+    return f"""port: 7890
+proxies:
+  - name: primary
+    type: vless
+    server: 1.1.1.1
+    port: 443
+    uuid: {UUID}
+    network: tcp
+    tls: true
+    udp: true
+    client-fingerprint: chrome
+    flow: xtls-rprx-vision
+    servername: cdn.example
+    reality-opts:
+      public-key: {PBK}
+      short-id: 1a2b3c4d
+{node_overrides}{extra_node}proxy-groups:
+  - name: provider-choice
+    type: select
+    proxies: [DIRECT]
+rules:
+  - MATCH,DIRECT
+""".encode()
+
+
 class FakeStdin:
     def __init__(self):
         self.data = b""
@@ -273,6 +299,28 @@ class SubscriptionURLTests(unittest.TestCase):
         self.assertEqual(calls, ["preflight", "fetch"])
         self.assertEqual(nodes[0]["server"], "1.1.1.1")
 
+    def test_worker_accepts_clash_yaml_and_returns_only_sanitized_nodes(self):
+        def preflight(_url):
+            return "1.1.1.1"
+
+        def fetch(_url, _timeout_s, _max_bytes, pinned_address):
+            self.assertEqual(pinned_address, "1.1.1.1")
+            return clash_yaml()
+
+        with patch.object(
+            subscription_worker, "resolve_public_subscription_host", preflight,
+        ), patch.object(
+            subscription_worker, "_fetch_https_bytes", fetch,
+        ):
+            nodes = subscription_worker._fetch_nodes(
+                "https://subscription.example/client?token=secret", 5.0,
+            )
+
+        self.assertEqual(nodes, [parsed_node()])
+        encoded = json.dumps(nodes, sort_keys=True)
+        self.assertNotIn("DIRECT", encoded)
+        self.assertNotIn("provider-choice", encoded)
+
     def test_https_fetch_explicitly_ignores_ambient_proxy_environment(self):
         opener = Mock()
         opener.open.return_value = FakeHTTPSResponse()
@@ -311,6 +359,140 @@ class SubscriptionURLTests(unittest.TestCase):
         context.wrap_socket.assert_called_once_with(
             raw_socket, server_hostname="subscription.example",
         )
+
+
+class TestBugPinnedHTTPSPython31220260813(unittest.TestCase):
+    """Pinned subscription HTTPS must not depend on removed urllib internals."""
+
+    def test_handler_runs_real_do_open_with_pinned_ip_and_tls_hostname(self):
+        from sunny_digest.vpn_subscription import _PinnedHTTPSHandler
+
+        class ReachedTLS(Exception):
+            pass
+
+        handler = _PinnedHTTPSHandler("1.1.1.1")
+        if handler._context is None:
+            handler._context = ssl.create_default_context()
+        if hasattr(handler, "_check_hostname"):
+            del handler._check_hostname
+        raw_socket = Mock(spec=socket.socket)
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), handler,
+        )
+
+        with patch(
+            "sunny_digest.vpn_subscription.socket.create_connection",
+            return_value=raw_socket,
+        ) as create, patch.object(
+            ssl.SSLContext, "wrap_socket", autospec=True,
+            side_effect=ReachedTLS,
+        ) as wrap:
+            with self.assertRaises(ReachedTLS):
+                opener.open("https://subscription.example/client", timeout=7)
+
+        create.assert_called_once_with(("1.1.1.1", 443), 7, None)
+        wrap.assert_called_once_with(
+            handler._context, raw_socket,
+            server_hostname="subscription.example",
+        )
+        self.assertIs(handler._context.check_hostname, True)
+        self.assertEqual(handler._context.verify_mode, ssl.CERT_REQUIRED)
+
+
+class TestBugClashYamlSubscription20260813(unittest.TestCase):
+    """A provider's Clash YAML is narrowed to sanitized REALITY nodes only."""
+
+    def test_extracts_only_vless_reality_nodes_and_ignores_global_config(self):
+        nodes = parse_vless_subscription(clash_yaml())
+
+        self.assertEqual(nodes, [parsed_node()])
+        encoded = json.dumps(nodes, sort_keys=True)
+        for ignored in ("primary", "provider-choice", "DIRECT", "rules"):
+            self.assertNotIn(ignored, encoded)
+
+    def test_mixed_subscription_skips_other_types_and_known_incompatible_vless(self):
+        other = """  - name: ignored-trojan
+    type: trojan
+    server: 1.0.0.1
+  - name: ignored-websocket
+    type: vless
+    server: 1.0.0.1
+    port: 443
+    uuid: 11111111-2222-4333-8444-555555555555
+    network: ws
+"""
+        nodes = parse_vless_subscription(clash_yaml(extra_node=other))
+
+        self.assertEqual(nodes, [parsed_node()])
+
+    def test_rejects_yaml_indirection_duplicate_keys_and_multiple_documents(self):
+        invalid = (
+            b"defaults: &node {type: vless}\nproxies: [*node]\n",
+            b"proxies: !!seq []\n",
+            b"%YAML 1.2\n---\nproxies: []\n",
+            b"proxies: []\nproxies: []\n",
+            clash_yaml(node_overrides="    server: 1.0.0.1\n"),
+            clash_yaml(node_overrides="      public-key: " + PBK + "\n"),
+            b"---\nproxies: []\n---\nproxies: []\n",
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload[:40]), self.assertRaisesRegex(
+                ValueError, "subscription payload is invalid",
+            ):
+                parse_vless_subscription(payload)
+
+    def test_rejects_unsafe_or_lossy_selected_node_fields(self):
+        invalid_overrides = (
+            "    dialer-proxy: DIRECT\n",
+            "    skip-cert-verify: true\n",
+            "    port: \"443\"\n",
+            "    tls: yes\n",
+            "      support-x25519mlkem768: true\n",
+            "      short-id: 1234\n",
+        )
+        for override in invalid_overrides:
+            with self.subTest(override=override.strip()), self.assertRaisesRegex(
+                ValueError, "subscription payload is invalid",
+            ):
+                parse_vless_subscription(clash_yaml(node_overrides=override))
+
+    def test_rejects_empty_or_oversized_proxy_lists(self):
+        with self.assertRaisesRegex(ValueError, "subscription payload is invalid"):
+            parse_vless_subscription(b"proxies: []\n")
+        entries = "\n".join(
+            f"  - {{name: n{i}, type: trojan}}" for i in range(65)
+        )
+        with self.assertRaisesRegex(ValueError, "subscription payload is invalid"):
+            parse_vless_subscription(("proxies:\n" + entries + "\n").encode())
+
+    def test_node_limit_rejects_before_yaml_tree_is_built(self):
+        payload = b"proxies: [" + b"a," * 10_001 + b"a]\n"
+        self.assertLess(len(payload), MAX_SUBSCRIPTION_BYTES)
+
+        with patch(
+            "sunny_digest.vpn_subscription.yaml.compose",
+            side_effect=AssertionError("oversized YAML must not be composed"),
+        ) as compose, self.assertRaisesRegex(
+            ValueError, "subscription payload is invalid",
+        ):
+            parse_vless_subscription(payload)
+
+        compose.assert_not_called()
+
+    def test_yaml_errors_never_expose_node_secrets(self):
+        secret_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        secret_key = "S" * 43
+        payload = clash_yaml().replace(UUID.encode(), secret_uuid.encode()).replace(
+            PBK.encode(), secret_key.encode(),
+        ) + b"  unknown-secret-field: do-not-reflect\n"
+
+        with self.assertRaises(ValueError) as raised:
+            parse_vless_subscription(payload)
+
+        message = str(raised.exception)
+        self.assertNotIn(secret_uuid, message)
+        self.assertNotIn(secret_key, message)
+        self.assertNotIn("do-not-reflect", message)
 
 
 class VlessRealityParserTests(unittest.TestCase):

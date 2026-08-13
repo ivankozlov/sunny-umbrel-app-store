@@ -31,3 +31,13 @@ https://raw.githubusercontent.com/MetaCubeX/mihomo/v1.19.29/LICENSE
 SHA-256 of `LICENSES/Mihomo-GPL-3.0.txt`:
 
 `3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986`
+
+## PyYAML 6.0.3
+
+The application installs PyYAML 6.0.3 from its hash-pinned Python package.
+PyYAML is licensed under the MIT License; its package includes the upstream
+license text.
+
+Upstream project and source tag:
+
+https://github.com/yaml/pyyaml/tree/6.0.3

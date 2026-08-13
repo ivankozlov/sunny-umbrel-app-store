@@ -297,6 +297,12 @@ def main() -> int:
     checks.require(re.search(r"(?m)^python-socks==2\.8\.2\s*\\$",
                              requirements) is not None,
                    "requirements lock must contain the Telethon SOCKS transport")
+    checks.require(re.search(r"(?m)^PyYAML==6\.0\.3$",
+                             requirements_input) is not None,
+                   "requirements input must pin the Clash YAML parser")
+    checks.require(re.search(r"(?m)^pyyaml==6\.0\.3\s*\\$",
+                             requirements) is not None,
+                   "requirements lock must contain the Clash YAML parser")
     requirement_starts = list(re.finditer(
         r"(?m)^[A-Za-z0-9_.-]+(?:\[[A-Za-z0-9_,.-]+\])?==[^\s\\]+",
         requirements,
