@@ -19,21 +19,53 @@ from .storage import Paths
 
 
 MAX_SSH_RESPONSE_BYTES = 64 * 1024
+PROCESS_TERMINATE_GRACE_S = 2.0
 
 
-async def _terminate(process: Any) -> None:
+async def _terminate_process_inner(process: Any) -> None:
     try:
         process.terminate()
     except ProcessLookupError:
+        await process.wait()
         return
     try:
-        await asyncio.wait_for(process.wait(), timeout=2)
+        await asyncio.wait_for(
+            process.wait(), timeout=PROCESS_TERMINATE_GRACE_S)
     except (asyncio.TimeoutError, ProcessLookupError):
         try:
             process.kill()
         except ProcessLookupError:
-            return
+            pass
         await process.wait()
+
+
+async def _cleanup_process(
+    process: Any, operation: asyncio.Task[Any],
+) -> None:
+    try:
+        await _terminate_process_inner(process)
+    finally:
+        if not operation.done():
+            operation.cancel()
+        try:
+            await operation
+        except BaseException:
+            pass
+
+
+async def _finish_process_cleanup(
+    process: Any, operation: asyncio.Task[Any],
+) -> bool:
+    """Reap a sensitive child fully; report cancellation received meanwhile."""
+    cleanup = asyncio.create_task(_cleanup_process(process, operation))
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+    cleanup.result()
+    return cancelled
 
 
 async def _run_command(args: list[str], stdin: bytes | None = None,
@@ -44,10 +76,13 @@ async def _run_command(args: list[str], stdin: bytes | None = None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
+    operation = asyncio.create_task(process.communicate(stdin))
     try:
-        stdout, _ = await asyncio.wait_for(process.communicate(stdin), timeout=timeout)
+        stdout, _ = await asyncio.wait_for(operation, timeout=timeout)
     except BaseException:
-        await _terminate(process)
+        cleanup_cancelled = await _finish_process_cleanup(process, operation)
+        if cleanup_cancelled:
+            raise asyncio.CancelledError
         raise
     if len(stdout) > MAX_SSH_RESPONSE_BYTES:
         raise RuntimeError("SSH response exceeds size limit")
@@ -150,21 +185,14 @@ class SSHTransport:
             done, _ = await asyncio.wait(
                 (exchange, cancelled), timeout=30, return_when=asyncio.FIRST_COMPLETED)
             if cancelled in done and revoked.is_set():
-                await _terminate(process)
-                exchange.cancel()
-                await asyncio.gather(exchange, return_exceptions=True)
                 raise asyncio.CancelledError
             if exchange not in done:
-                await _terminate(process)
-                exchange.cancel()
-                await asyncio.gather(exchange, return_exceptions=True)
                 raise RuntimeError("SSH exchange timed out")
             stdout = exchange.result()
         except BaseException:
-            await _terminate(process)
-            if not exchange.done():
-                exchange.cancel()
-                await asyncio.gather(exchange, return_exceptions=True)
+            cleanup_cancelled = await _finish_process_cleanup(process, exchange)
+            if cleanup_cancelled:
+                raise asyncio.CancelledError
             raise
         finally:
             cancelled.cancel()

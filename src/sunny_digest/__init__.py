@@ -1,5 +1,5 @@
 """Security-scoped Telegram digest collector for Umbrel."""
 
-from .version import COLLECTOR_VERSION
+from .version import APP_VERSION, COLLECTOR_VERSION
 
-__all__ = ["COLLECTOR_VERSION"]
+__all__ = ["APP_VERSION", "COLLECTOR_VERSION"]

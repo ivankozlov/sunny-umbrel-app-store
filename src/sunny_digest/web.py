@@ -18,6 +18,9 @@ from .storage import canonical_json_bytes
 
 MAX_HTTP_BODY_BYTES = 64 * 1024
 MAX_IPC_BYTES = 512 * 1024
+IPC_CONNECT_TIMEOUT_S = 5
+IPC_SEND_TIMEOUT_S = 5
+IPC_RESPONSE_TIMEOUT_S = 150
 CSRF_COOKIE = "sunny_csrf"
 
 
@@ -33,8 +36,14 @@ def _one(form: Dict[str, list[str]], key: str) -> str:
 
 
 class IPCClient:
-    def __init__(self, socket_path: str):
+    def __init__(self, socket_path: str, *,
+                 connect_timeout: float = IPC_CONNECT_TIMEOUT_S,
+                 send_timeout: float = IPC_SEND_TIMEOUT_S,
+                 response_timeout: float = IPC_RESPONSE_TIMEOUT_S):
         self.socket_path = socket_path
+        self.connect_timeout = connect_timeout
+        self.send_timeout = send_timeout
+        self.response_timeout = response_timeout
 
     def request(self, command: str, data: Any = None) -> Dict[str, Any]:
         request: Dict[str, Any] = {"command": command}
@@ -42,11 +51,13 @@ class IPCClient:
             request["data"] = data
         raw = canonical_json_bytes(request) + b"\n"
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(30)
+            connection.settimeout(self.connect_timeout)
             connection.connect(self.socket_path)
+            connection.settimeout(self.send_timeout)
             connection.sendall(raw)
-            stream = connection.makefile("rb")
-            response_raw = stream.readline(MAX_IPC_BYTES + 1)
+            connection.settimeout(self.response_timeout)
+            with connection.makefile("rb") as stream:
+                response_raw = stream.readline(MAX_IPC_BYTES + 1)
         if (not response_raw or len(response_raw) > MAX_IPC_BYTES
                 or not response_raw.endswith(b"\n")):
             raise RuntimeError("collector response is unavailable")
@@ -128,7 +139,7 @@ def _layout(content: str, csrf: str, notice: str = "") -> bytes:
     <h1>Sunny Personal Chats</h1><div class="muted">1–16 выбранных чатов · локальная Telegram-сессия</div>
   </div></div>
   {notice_html}<section class="card">{content}{reset_html}</section>
-  <footer>Сырые сообщения дайджеста не сохраняются. Финальный mention-фрагмент до 300 UTF-16, название чата, отправитель и ссылка durably передаются в Sunny. Setup credentials проходят через web только транзитом.</footer>
+  <footer>Сырые сообщения дайджеста не сохраняются. Финальный mention-фрагмент до 300 UTF-16, название чата, отправитель и ссылка durably передаются в Sunny. Setup credentials и VPN subscription URL проходят через web только транзитом.</footer>
 </main></body></html>"""
     return document.encode("utf-8")
 
@@ -151,6 +162,11 @@ def _safe_failure_notice(status: Dict[str, Any], exc: Exception) -> str:
             "Проверьте ссылки: HTTPS t.me, по одной ссылке на сообщение в строке, "
             "без повторов и comment-ссылок."
         )
+    if phase == "fresh" and error_type in ("ValueError", "SubscriptionFetchError"):
+        return (
+            "Проверьте поля настройки и VLESS/REALITY subscription URL. "
+            "Секретные детали ответа провайдера намеренно скрыты."
+        )
     if phase == "dialogs_listed" and error_type == "ValueError":
         return "Подтверждение набора устарело или повреждено. Обновите страницу."
     return f"Операция не выполнена ({error_type})."
@@ -158,6 +174,14 @@ def _safe_failure_notice(status: Dict[str, Any], exc: Exception) -> str:
 
 def render_status(status: Dict[str, Any], csrf: str) -> str:
     phase = status.get("phase")
+    if status.get("vpn_migration_required"):
+        return """
+<h2>Требуется новая настройка VPN</h2>
+<p>Эта конфигурация создана версией без обязательного VLESS/REALITY-туннеля.
+Telegram-действия заблокированы: прямого подключения приложение не выполняет.</p>
+<p class="warn">Выполните factory reset, при необходимости завершите устройство
+Sunny Umbrel в Telegram → Settings → Devices, затем настройте приложение заново
+и введите subscription URL только в скрытом поле Umbrel.</p>"""
     if phase == "fresh":
         revocation = ""
         if status.get("revocation_required"):
@@ -182,6 +206,8 @@ def render_status(status: Dict[str, Any], csrf: str) -> str:
   <input type="hidden" name="action" value="configure">
   <label>Telegram API ID<input name="telegram_api_id" inputmode="numeric" required></label>
   <label>Telegram API hash<input name="telegram_api_hash" type="password" required autocomplete="new-password"></label>
+  <label>VLESS/REALITY TCP/Vision subscription URL<input name="vpn_subscription_url" type="password" inputmode="url" required autocomplete="new-password"></label>
+  <p class="muted">Ссылка используется один раз для загрузки подписки и не сохраняется. Collector хранит только очищенный VLESS/REALITY-узел; его смена потребует factory reset.</p>
   <label>OpenRouter API key<input name="openrouter_api_key" type="password" required autocomplete="new-password"></label>
   <label>OpenRouter model<input name="openrouter_model" placeholder="provider/model" required></label>
   <label>Sunny receiver host<input name="upload_host" placeholder="sunny.example.net" required></label>
@@ -438,7 +464,8 @@ class Handler(BaseHTTPRequestHandler):
                 if _one(form, "confirm_data_scope") != "yes":
                     raise PermissionError("data scope was not confirmed")
                 names = (
-                    "telegram_api_id", "telegram_api_hash", "openrouter_api_key",
+                    "telegram_api_id", "telegram_api_hash", "vpn_subscription_url",
+                    "openrouter_api_key",
                     "openrouter_model", "upload_host", "upload_port",
                     "known_host", "consent_expires_at",
                 )

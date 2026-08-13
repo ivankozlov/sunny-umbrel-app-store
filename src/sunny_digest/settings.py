@@ -12,6 +12,7 @@ from .contracts import parse_utc, utc_iso
 from .models import PeerSpec, validate_chat_title
 from .storage import Paths, atomic_write_bytes, atomic_write_json, read_json
 from .version import MAX_SELECTED_CHATS
+from .vpn_subscription import validate_subscription_url
 
 
 SETTINGS_SCHEMA = "sunny.personal-chats.settings.v2"
@@ -63,11 +64,13 @@ def normalize_known_host(line: Any, host: str, port: int) -> bytes:
     return f"{fields[0]} ssh-ed25519 {fields[2]}\n".encode("ascii")
 
 
-def validate_configure(value: Dict[str, Any], now: datetime) -> tuple[Dict[str, Any], Dict[str, Any], bytes]:
+def validate_configure(
+    value: Dict[str, Any], now: datetime,
+) -> tuple[Dict[str, Any], Dict[str, Any], bytes, str]:
     expected = {
         "telegram_api_id", "telegram_api_hash", "openrouter_api_key",
         "openrouter_model", "upload_host", "upload_port", "upload_user",
-        "known_host", "consent_expires_at",
+        "known_host", "consent_expires_at", "vpn_subscription_url",
     }
     if set(value) != expected:
         raise ValueError("configure request has unexpected fields")
@@ -99,6 +102,7 @@ def validate_configure(value: Dict[str, Any], now: datetime) -> tuple[Dict[str, 
     current = now.astimezone(timezone.utc)
     expires = validate_consent_expiry(value["consent_expires_at"], current)
     known_host = normalize_known_host(value["known_host"], host, port)
+    subscription_url = validate_subscription_url(value["vpn_subscription_url"])
 
     settings = {
         "schema": SETTINGS_SCHEMA,
@@ -118,7 +122,7 @@ def validate_configure(value: Dict[str, Any], now: datetime) -> tuple[Dict[str, 
         "telegram_api_hash": api_hash.lower(),
         "openrouter_api_key": openrouter_key,
     }
-    return settings, credentials, known_host
+    return settings, credentials, known_host, subscription_url
 
 
 def validate_consent_expiry(value: Any, now: datetime) -> datetime:

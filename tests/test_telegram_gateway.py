@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from sunny_digest.models import DigestChat, PeerSpec
 from sunny_digest.prompting import prompt_size, render_digest_prompt
+from sunny_digest.mihomo import MIHOMO_SOCKS_HOST, MIHOMO_SOCKS_PORT
 from sunny_digest.telegram_gateway import (
     MAX_MENTION_EVENTS,
     TelethonGateway,
@@ -93,7 +94,10 @@ class FakeClient:
 
 class GatewayUnderTest(TelethonGateway):
     def __init__(self, client):
-        super().__init__(123, "a" * 32)
+        super().__init__(123, "a" * 32, {
+            "proxy_type": "socks5", "addr": "127.0.0.1",
+            "port": 7891, "rdns": True,
+        })
         self.fake_client = client
 
     def _client(self, _session):
@@ -122,6 +126,35 @@ class GatewayUnderTest(TelethonGateway):
 
 
 class TestBugTelegramMessageLinks20260811(unittest.IsolatedAsyncioTestCase):
+    def test_every_real_telethon_client_has_mandatory_loopback_socks(self):
+        calls = []
+
+        class TelegramClient:
+            def __init__(self, *args, **kwargs):
+                calls.append((args, kwargs))
+
+        class StringSession:
+            def __init__(self, value):
+                self.value = value
+
+        gateway = TelethonGateway(12345, "a" * 32, {
+            "proxy_type": "socks5", "addr": MIHOMO_SOCKS_HOST,
+            "port": MIHOMO_SOCKS_PORT, "rdns": True,
+        })
+        gateway._modules = lambda: (
+            TelegramClient, None, None, StringSession, None, None, None)
+
+        gateway._client("session")
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1]["proxy"], {
+            "proxy_type": "socks5",
+            "addr": MIHOMO_SOCKS_HOST,
+            "port": MIHOMO_SOCKS_PORT,
+            "rdns": True,
+        })
+        self.assertNotIn("local_addr", calls[0][1])
+
     def test_parses_official_public_private_and_forum_links(self):
         self.assertEqual(
             parse_message_link("https://t.me/c/1234567890/42"),
@@ -281,7 +314,10 @@ class TestBugTelegramMessageLinks20260811(unittest.IsolatedAsyncioTestCase):
 
         class ResolveGateway(TelethonGateway):
             def __init__(self, client):
-                super().__init__(123, "a" * 32)
+                super().__init__(123, "a" * 32, {
+                    "proxy_type": "socks5", "addr": "127.0.0.1",
+                    "port": 7891, "rdns": True,
+                })
                 self.client = client
 
             def _client(self, _session):

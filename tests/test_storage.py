@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sunny_digest.storage import atomic_write_bytes, safe_unlink
+from sunny_digest.storage import Paths, atomic_write_bytes, safe_unlink
 
 
 class StorageDurabilityTests(unittest.TestCase):
@@ -42,6 +42,28 @@ class StorageDurabilityTests(unittest.TestCase):
 
             self.assertFalse(path.exists())
             self.assertEqual(modes, [stat.S_IFDIR])
+
+    def test_reset_allowlist_contains_only_exact_vpn_material(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = Paths(
+                root / "config", root / "private", root / "runtime",
+                root / "runtime" / "control.sock",
+            )
+            self.assertEqual(
+                paths.vpn_active_node,
+                root / "private" / "mihomo" / "active-node.json",
+            )
+            self.assertIn(paths.vpn_active_node, paths.reset_files())
+
+            paths.vpn_dir.mkdir(parents=True)
+            unrelated = paths.vpn_dir / "unrelated"
+            unrelated.write_text("keep", encoding="utf-8")
+            paths.remove_empty_vpn_dir()
+            self.assertTrue(unrelated.exists())
+            unrelated.unlink()
+            paths.remove_empty_vpn_dir()
+            self.assertFalse(paths.vpn_dir.exists())
 
 
 if __name__ == "__main__":

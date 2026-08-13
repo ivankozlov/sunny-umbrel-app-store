@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .contracts import (
@@ -20,6 +21,12 @@ from .contracts import (
     validate_monitor_upload,
 )
 from .models import DialogCandidate, DigestChat, PeerSpec
+from .mihomo import (
+    MIHOMO_SOCKS_HOST,
+    MIHOMO_SOCKS_PORT,
+    MihomoRuntime,
+    render_mihomo_config,
+)
 from .openrouter import create_digest
 from .settings import (
     MAX_CONSENT_DAYS,
@@ -48,12 +55,15 @@ from .version import (
     MAX_SELECTED_CHATS,
     MAX_UPLOAD_BYTES,
 )
+from .vpn_subscription import fetch_vless_subscription
 
 
-GatewayFactory = Callable[[int, str], Any]
+GatewayFactory = Callable[[int, str, Dict[str, Any]], Any]
 DigestFunction = Callable[[List[DigestChat], str, str, asyncio.Event], Awaitable[str]]
 TransportFactory = Callable[[Paths, Dict[str, Any]], Any]
 KeygenFunction = Callable[[Paths, str], Awaitable[tuple[str, str]]]
+VPNRuntimeFactory = Callable[[Path], Any]
+SubscriptionFetcher = Callable[[Any], Awaitable[List[Dict[str, Any]]]]
 
 
 DIGEST_ACKNOWLEDGED_SCHEMA = "sunny.personal-chats.digest-acknowledged.v2"
@@ -66,7 +76,12 @@ TELEGRAM_DIALOG_TIMEOUT_S = 120
 TELEGRAM_FETCH_TIMEOUT_S = 180
 KEYGEN_TIMEOUT_S = 30
 OPENROUTER_TIMEOUT_S = 120
+VPN_SUBSCRIPTION_TIMEOUT_S = 30
 SETUP_CONSENT_LEASE_S = 3600
+
+
+class VPNMigrationRequiredError(RuntimeError):
+    """An accepted pre-VPN configuration cannot make Telegram connections."""
 
 
 def _now() -> datetime:
@@ -109,6 +124,8 @@ class Collector:
         digest_function: DigestFunction = create_digest,
         transport_factory: TransportFactory = SSHTransport,
         keygen_function: KeygenFunction = generate_upload_key,
+        vpn_runtime_factory: VPNRuntimeFactory = MihomoRuntime,
+        subscription_fetcher: SubscriptionFetcher = fetch_vless_subscription,
         clock: Callable[[], datetime] = _now,
         monotonic: Callable[[], float] = time.monotonic,
     ):
@@ -118,10 +135,13 @@ class Collector:
         self.digest_function = digest_function
         self.transport_factory = transport_factory
         self.keygen_function = keygen_function
+        self.subscription_fetcher = subscription_fetcher
+        self._vpn_runtime = vpn_runtime_factory(self.paths.private_dir)
         self.clock = clock
         self.monotonic = monotonic
         self.state_lock = asyncio.Lock()
         self.run_lock = asyncio.Lock()
+        self.vpn_lock = asyncio.Lock()
         self.revoked = asyncio.Event()
         self._run_task: Optional[asyncio.Task[Any]] = None
         self._active_run_task: Optional[asyncio.Task[Any]] = None
@@ -182,9 +202,79 @@ class Collector:
         if targets:
             await asyncio.gather(*targets, return_exceptions=True)
 
+    @staticmethod
+    def _validate_vpn_node(node: Any) -> Dict[str, Any]:
+        if not isinstance(node, dict) or set(node) != {
+                "type", "server", "port", "uuid", "network", "tls",
+                "servername", "client-fingerprint", "reality-opts", "flow", "udp"}:
+            raise ValueError("stored Telegram VPN node is invalid")
+        if (node.get("network") != "tcp"
+                or node.get("flow") != "xtls-rprx-vision"
+                or node.get("udp") is not False
+                or not isinstance(node.get("reality-opts"), dict)
+                or set(node["reality-opts"]) != {"public-key", "short-id"}):
+            raise ValueError("stored Telegram VPN node is invalid")
+        # The runtime validator is a second, independent boundary before exec.
+        render_mihomo_config(node)
+        return node
+
+    def _load_vpn_node(self) -> Dict[str, Any]:
+        if not self.paths.vpn_active_node.exists():
+            if self.paths.settings.exists():
+                raise VPNMigrationRequiredError(
+                    "factory reset is required to configure the Telegram VPN")
+            raise RuntimeError("Telegram VPN is not configured")
+        return self._validate_vpn_node(
+            read_json(self.paths.vpn_active_node, max_bytes=16 * 1024))
+
+    async def _start_vpn_node(self, node: Dict[str, Any]) -> None:
+        async with self.vpn_lock:
+            # This also reaps a child which died after an earlier successful start.
+            await self._vpn_runtime.stop()
+            await self._vpn_runtime.start(node)
+            self._vpn_runtime.ensure_alive()
+
+    async def _ensure_vpn(self) -> None:
+        async with self.vpn_lock:
+            if getattr(self._vpn_runtime, "ready", False):
+                self._vpn_runtime.ensure_alive()
+                return
+            node = self._load_vpn_node()
+            await self._vpn_runtime.stop()
+            await self._vpn_runtime.start(node)
+            self._vpn_runtime.ensure_alive()
+
+    async def _stop_vpn(self) -> None:
+        async with self.vpn_lock:
+            await self._vpn_runtime.stop()
+
+    def _require_no_revocation_warning(self) -> None:
+        if self.paths.revocation_warning.exists():
+            raise RuntimeError("manual Telegram device revocation is required")
+
+    def _capture_epoch(self) -> asyncio.Event:
+        self._require_no_revocation_warning()
+        epoch = self.revoked
+        if epoch.is_set():
+            raise RuntimeError("factory reset is in progress")
+        return epoch
+
+    def _require_current_epoch(self, epoch: asyncio.Event) -> None:
+        self._require_no_revocation_warning()
+        if epoch is not self.revoked or epoch.is_set():
+            raise RuntimeError("factory reset is in progress")
+
     def _gateway(self, credentials: Dict[str, Any]):
+        # Even a missed caller-side readiness check cannot construct a direct
+        # Telegram client: gateway creation itself requires the SOCKS child.
+        self._vpn_runtime.ensure_alive()
         return self.gateway_factory(
-            credentials["telegram_api_id"], credentials["telegram_api_hash"])
+            credentials["telegram_api_id"], credentials["telegram_api_hash"], {
+                "proxy_type": "socks5",
+                "addr": MIHOMO_SOCKS_HOST,
+                "port": MIHOMO_SOCKS_PORT,
+                "rdns": True,
+            })
 
     def _session_text(self) -> str:
         if not self.paths.telegram_session.exists():
@@ -228,6 +318,12 @@ class Collector:
             "last_through_message_id": None,
             "failed_chat_count": 0,
             "revocation_required": self.paths.revocation_warning.exists(),
+            "vpn_configured": self.paths.vpn_active_node.exists(),
+            "vpn_ready": bool(getattr(self._vpn_runtime, "ready", False)),
+            "vpn_migration_required": (
+                self.paths.settings.exists()
+                and not self.paths.vpn_active_node.exists()
+            ),
         }
         if self.paths.settings.exists():
             try:
@@ -338,6 +434,7 @@ class Collector:
             "phone_masked", "dialogs", "selection_id", "last_run_at", "last_result",
             "last_error_type", "last_message_count", "last_through_message_id",
             "failed_chat_count", "revocation_required",
+            "vpn_configured", "vpn_ready", "vpn_migration_required",
         }
         status = {key: status.get(key) for key in allowed}
         atomic_write_json(self.paths.status, status, 0o600)
@@ -364,21 +461,57 @@ class Collector:
                     or self.paths.telegram_session_outstanding.exists()):
                 raise RuntimeError(
                     "manual Telegram device revocation must be acknowledged first")
-            if self.paths.chat_locked.exists() or self.paths.settings.exists():
+            if (self.paths.chat_locked.exists() or self.paths.settings.exists()
+                    or self.paths.credentials.exists()
+                    or self.paths.vpn_active_node.exists()):
                 raise RuntimeError("factory reset is required before configuration")
-            settings, credentials, known_host = validate_configure(data, self.clock())
-            save_initial_config(self.paths, settings, credentials, known_host)
+            epoch = self._capture_epoch()
+            settings, credentials, known_host, subscription_url = validate_configure(
+                data, self.clock())
+            try:
+                nodes = await self._bounded_external(
+                    self.subscription_fetcher(subscription_url),
+                    VPN_SUBSCRIPTION_TIMEOUT_S,
+                )
+                self._require_current_epoch(epoch)
+                if not isinstance(nodes, list) or not nodes:
+                    raise RuntimeError("Telegram VPN subscription is empty")
+                node = self._validate_vpn_node(nodes[0])
+                await self._start_vpn_node(node)
+                self._require_current_epoch(epoch)
+                atomic_write_json(self.paths.vpn_active_node, node, 0o600)
+                save_initial_config(self.paths, settings, credentials, known_host)
+            except BaseException:
+                try:
+                    try:
+                        await self._stop_vpn()
+                    except BaseException:
+                        # Preserve the configure failure after the supervised
+                        # child has completed its own non-cancellable cleanup.
+                        pass
+                finally:
+                    unlink_atomic_material((
+                        self.paths.vpn_active_node,
+                        self.paths.credentials,
+                        self.paths.known_hosts,
+                        self.paths.settings,
+                    ))
+                    self.paths.remove_empty_vpn_dir()
+                raise
             self._setup_deadline_mono = self.monotonic() + SETUP_CONSENT_LEASE_S
             return self._write_status(last_result="configured", last_error_type=None)
 
     async def send_code(self, phone: Any) -> Dict[str, Any]:
         async with self.state_lock:
+            epoch = self._capture_epoch()
             settings = load_settings(self.paths)
             if settings["chat_locked"] or settings["phase"] != "configured":
                 raise RuntimeError("send_code is not allowed in this phase")
             self._require_setup_consent(settings)
             if not isinstance(phone, str) or not re.fullmatch(r"\+[0-9]{7,15}", phone):
                 raise ValueError("phone must use international +digits format")
+            await self._ensure_vpn()
+            self._require_current_epoch(epoch)
             # Arm before the first authorization network call. There is no
             # transaction with Telegram: a false-positive manual device check
             # after a crash is safer than an untracked live session.
@@ -388,6 +521,7 @@ class Collector:
                 self._gateway(credentials).send_code(self._session_text(), phone),
                 TELEGRAM_SETUP_TIMEOUT_S,
             )
+            self._require_current_epoch(epoch)
             self._save_session(session)
             self._require_setup_consent(settings)
             atomic_write_json(self.paths.setup_state, {
@@ -401,6 +535,7 @@ class Collector:
 
     async def submit_code(self, code: Any) -> Dict[str, Any]:
         async with self.state_lock:
+            epoch = self._capture_epoch()
             settings = load_settings(self.paths)
             if settings["chat_locked"] or settings["phase"] != "code_sent":
                 raise RuntimeError("submit_code is not allowed in this phase")
@@ -409,6 +544,8 @@ class Collector:
                 raise ValueError("Telegram code is invalid")
             setup = read_json(self.paths.setup_state, max_bytes=16 * 1024)
             credentials = load_credentials(self.paths)
+            await self._ensure_vpn()
+            self._require_current_epoch(epoch)
             session, needs_password = await self._bounded_external(
                 self._gateway(credentials).submit_code(
                     self._session_text(), setup["phone"], code,
@@ -416,6 +553,7 @@ class Collector:
                 ),
                 TELEGRAM_SETUP_TIMEOUT_S,
             )
+            self._require_current_epoch(epoch)
             self._save_session(session)
             self._require_setup_consent(settings)
             settings["phase"] = "password_required" if needs_password else "authenticated"
@@ -429,6 +567,7 @@ class Collector:
 
     async def submit_password(self, password: Any) -> Dict[str, Any]:
         async with self.state_lock:
+            epoch = self._capture_epoch()
             settings = load_settings(self.paths)
             if settings["chat_locked"] or settings["phase"] != "password_required":
                 raise RuntimeError("submit_password is not allowed in this phase")
@@ -436,11 +575,14 @@ class Collector:
             if not isinstance(password, str) or not 1 <= len(password) <= 512:
                 raise ValueError("Telegram 2FA password is invalid")
             credentials = load_credentials(self.paths)
+            await self._ensure_vpn()
+            self._require_current_epoch(epoch)
             session = await self._bounded_external(
                 self._gateway(credentials).submit_password(
                     self._session_text(), password),
                 TELEGRAM_SETUP_TIMEOUT_S,
             )
+            self._require_current_epoch(epoch)
             self._save_session(session)
             self._require_setup_consent(settings)
             settings["phase"] = "authenticated"
@@ -450,6 +592,7 @@ class Collector:
 
     async def resolve_chat_links(self, links: Any) -> Dict[str, Any]:
         async with self.state_lock:
+            epoch = self._capture_epoch()
             settings = load_settings(self.paths)
             # The durable phase is committed before dialog enumeration. A failed or
             # interrupted attempt therefore cannot silently enumerate again.
@@ -470,11 +613,14 @@ class Collector:
             session_text = self._session_text()
             settings["phase"] = "resolving_links"
             atomic_write_json(self.paths.settings, settings)
+            await self._ensure_vpn()
+            self._require_current_epoch(epoch)
             dialogs = await self._bounded_external(
                 self._gateway(credentials).resolve_message_links(
                     session_text, links),
                 TELEGRAM_DIALOG_TIMEOUT_S,
             )
+            self._require_current_epoch(epoch)
             self._require_setup_consent(settings)
             dialogs = [
                 DialogCandidate.from_private_dict(candidate.as_private_dict())
@@ -497,6 +643,7 @@ class Collector:
 
     async def select_chats(self, selection: Any) -> Dict[str, Any]:
         async with self.state_lock:
+            epoch = self._capture_epoch()
             settings = load_settings(self.paths)
             if settings["chat_locked"] or self.paths.chat_locked.exists():
                 raise RuntimeError("chats are already permanently locked for this session")
@@ -544,6 +691,7 @@ class Collector:
             public_key, fingerprint = await self._bounded_external(
                 self.keygen_function(self.paths, source_id), KEYGEN_TIMEOUT_S)
             try:
+                self._require_current_epoch(epoch)
                 self._require_setup_consent(settings)
             except RuntimeError:
                 # The real key generator has already created this exact pair.
@@ -579,6 +727,7 @@ class Collector:
 
     async def activate_monitoring(self) -> Dict[str, Any]:
         async with self.state_lock:
+            self._capture_epoch()
             settings = load_settings(self.paths)
             if not settings["chat_locked"] or settings["phase"] != "chat_locked":
                 raise RuntimeError("monitoring can only be activated for locked chats")
@@ -620,8 +769,23 @@ class Collector:
         # Persist the operator action before the first await. Cancellation or
         # power loss while hung Telethon work is being cancelled must not let a
         # restart reuse the still-live session as if reset had never begun.
-        if possible_session:
-            self._write_revocation_warning()
+        self._write_revocation_warning()
+        cleanup = asyncio.create_task(
+            self._revoke_and_reset_inner(possible_session))
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        result = cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    async def _revoke_and_reset_inner(
+        self, possible_session: bool,
+    ) -> Dict[str, Any]:
         # Cancel first: setup methods intentionally hold state_lock across their
         # network operation, so waiting for the lock before cancellation would
         # make reset unavailable when Telegram hangs.
@@ -631,6 +795,9 @@ class Collector:
         async with self.state_lock:
             try:
                 if self.paths.credentials.exists() and self.paths.telegram_session.exists():
+                    # A failed or missing VPN makes remote logout unknowable. It
+                    # must never fall back to Telegram over the host route.
+                    await self._ensure_vpn()
                     credentials = load_credentials(self.paths)
                     logout_confirmed = bool(await asyncio.wait_for(
                         self._gateway(credentials).logout(self._session_text()), timeout=20))
@@ -640,18 +807,29 @@ class Collector:
             except Exception:
                 logout_confirmed = False
             finally:
-                unlink_atomic_material(self.paths.reset_files())
-                if logout_confirmed:
-                    unlink_atomic_material((
-                        self.paths.telegram_session_outstanding,
-                        self.paths.revocation_warning,
-                    ))
-                else:
-                    self._write_revocation_warning()
-                # Old runs retain the set Event object; new setup receives a new one.
-                self.revoked = asyncio.Event()
-                self._last_attempt = None
-                self._setup_deadline_mono = None
+                try:
+                    await self._stop_vpn()
+                except asyncio.CancelledError:
+                    logout_confirmed = False
+                    logout_cancelled = True
+                except Exception:
+                    # Local credential deletion and the persistent remote-
+                    # revocation warning must not depend on a clean child exit.
+                    logout_confirmed = False
+                finally:
+                    unlink_atomic_material(self.paths.reset_files())
+                    self.paths.remove_empty_vpn_dir()
+                    if logout_confirmed:
+                        unlink_atomic_material((
+                            self.paths.telegram_session_outstanding,
+                            self.paths.revocation_warning,
+                        ))
+                    else:
+                        self._write_revocation_warning()
+                    # Old runs retain the set Event object; new setup receives a new one.
+                    self.revoked = asyncio.Event()
+                    self._last_attempt = None
+                    self._setup_deadline_mono = None
         result = self._write_status(
             phase="fresh", configured=False, chat_locked=False,
             consent_active=False, pending_digest_upload=False,
@@ -665,8 +843,6 @@ class Collector:
             revocation_required=not logout_confirmed,
             last_message_count=None, last_through_message_id=None,
         )
-        if logout_cancelled:
-            raise asyncio.CancelledError
         return result
 
     async def acknowledge_manual_revocation(self) -> Dict[str, Any]:
@@ -676,7 +852,11 @@ class Collector:
                 raise RuntimeError("there is no manual revocation warning")
             # The operator asserted remote termination. Finish any config-only
             # restore or failed-reset cleanup as one fresh credential epoch.
-            unlink_atomic_material(self.paths.reset_files())
+            try:
+                await self._stop_vpn()
+            finally:
+                unlink_atomic_material(self.paths.reset_files())
+                self.paths.remove_empty_vpn_dir()
             unlink_atomic_material((
                 self.paths.telegram_session_outstanding,
                 self.paths.revocation_warning,
@@ -698,6 +878,7 @@ class Collector:
 
     async def renew_consent(self, expires_at: Any) -> Dict[str, Any]:
         async with self.state_lock:
+            self._capture_epoch()
             settings = load_settings(self.paths)
             if not settings["chat_locked"] or settings["phase"] != "chat_locked":
                 raise RuntimeError("consent can only be renewed for locked chats")
@@ -715,6 +896,7 @@ class Collector:
         self, revoked: asyncio.Event, source_id: str, chat_ids: List[int],
         trusted_now: Optional[datetime] = None,
     ) -> None:
+        self._require_no_revocation_warning()
         if revoked.is_set():
             raise asyncio.CancelledError
         settings = load_settings(self.paths)
@@ -1455,6 +1637,7 @@ class Collector:
             revoked = self.revoked
             try:
                 async with self.state_lock:
+                    self._require_no_revocation_warning()
                     settings = load_settings(self.paths)
                     credentials = load_credentials(self.paths)
                     if not settings["chat_locked"] or not self.paths.chat_locked.exists():
@@ -1471,9 +1654,11 @@ class Collector:
                     chat_ids = [row["chat_id"] for row in settings["chats"]]
                     upload_config = dict(settings["upload"])
                 transport = self.transport_factory(self.paths, upload_config)
-                gateway = self._gateway(credentials)
                 gate, gate_received_mono = await self._fresh_gate(
                     transport, source_id, chat_ids, revoked)
+                await self._ensure_vpn()
+                self._require_current_epoch(revoked)
+                gateway = self._gateway(credentials)
                 gate, gate_received_mono, mentions, failed_chat_count = await self._run_monitor(
                     gate, gate_received_mono, transport, gateway, settings,
                     session, revoked,
@@ -1515,6 +1700,12 @@ class Collector:
             finally:
                 if self._active_run_task is current_task:
                     self._active_run_task = None
+
+    async def close(self) -> None:
+        """Cancel collector work and reap the app-scoped VPN child."""
+        await self._cancel_active_operations()
+        async with self.state_lock:
+            await self._stop_vpn()
 
     def trigger_run(self) -> bool:
         if self._run_task is not None and not self._run_task.done():

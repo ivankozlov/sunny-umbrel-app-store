@@ -32,6 +32,7 @@ def configure(*, user="root", expires="2026-08-05T00:00:00Z"):
     return {
         "telegram_api_id": "12345",
         "telegram_api_hash": "a" * 32,
+        "vpn_subscription_url": "https://subscription.example/client?token=test",
         "openrouter_api_key": "sk-or-test-secret",
         "openrouter_model": "anthropic/example",
         "upload_host": "receiver.example",
@@ -39,6 +40,7 @@ def configure(*, user="root", expires="2026-08-05T00:00:00Z"):
         "upload_user": user,
         "known_host": f"receiver.example ssh-ed25519 {public_blob()}",
         "consent_expires_at": expires,
+        "vpn_subscription_url": "https://subscription.example/client?token=secret",
     }
 
 
@@ -69,9 +71,31 @@ class SettingsTests(unittest.TestCase):
             normalize_known_host(invalid, "receiver.example", 22)
 
     def test_receiver_login_is_fixed_to_root(self):
-        validate_configure(configure(), NOW)
+        settings, credentials, _known_host, subscription_url = validate_configure(
+            configure(), NOW)
+        self.assertNotIn("vpn", settings)
+        self.assertNotIn("vpn", credentials)
+        self.assertEqual(
+            subscription_url,
+            "https://subscription.example/client?token=secret",
+        )
         with self.assertRaisesRegex(ValueError, "root forced-command"):
             validate_configure(configure(user="sunny-digest"), NOW)
+
+    def test_subscription_url_is_required_but_never_enters_persisted_values(self):
+        missing = configure()
+        del missing["vpn_subscription_url"]
+        with self.assertRaisesRegex(ValueError, "unexpected fields"):
+            validate_configure(missing, NOW)
+
+        secret = "never-persist-this-bearer"
+        value = configure()
+        value["vpn_subscription_url"] = (
+            f"https://subscription.example/client?token={secret}")
+        settings, credentials, known_host, returned = validate_configure(value, NOW)
+        persisted = repr((settings, credentials, known_host))
+        self.assertNotIn(secret, persisted)
+        self.assertIn(secret, returned)
 
     def test_consent_bounds_are_inclusive(self):
         exact_hour = (NOW + timedelta(hours=1)).isoformat().replace("+00:00", "Z")

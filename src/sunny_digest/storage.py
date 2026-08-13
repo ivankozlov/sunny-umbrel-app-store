@@ -185,6 +185,14 @@ class Paths:
         return self.private_dir / "upload-ed25519.pub"
 
     @property
+    def vpn_dir(self) -> Path:
+        return self.private_dir / "mihomo"
+
+    @property
+    def vpn_active_node(self) -> Path:
+        return self.vpn_dir / "active-node.json"
+
+    @property
     def status(self) -> Path:
         return self.runtime_dir / "status.json"
 
@@ -207,4 +215,12 @@ class Paths:
             self.chat_locked,
             self.upload_key,
             self.upload_public_key,
+            self.vpn_active_node,
         )
+
+    def remove_empty_vpn_dir(self) -> None:
+        """Remove only the known VPN directory, and only when it is empty."""
+        try:
+            self.vpn_dir.rmdir()
+        except (FileNotFoundError, OSError):
+            return

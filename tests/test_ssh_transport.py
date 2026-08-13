@@ -15,7 +15,11 @@ from sunny_digest.contracts import (
     canonical_monitor_bytes,
     status_request,
 )
-from sunny_digest.ssh_transport import MAX_SSH_RESPONSE_BYTES, SSHTransport
+from sunny_digest.ssh_transport import (
+    MAX_SSH_RESPONSE_BYTES,
+    SSHTransport,
+    _run_command,
+)
 from sunny_digest.storage import Paths
 
 
@@ -89,6 +93,44 @@ class FakeProcess:
 
     def kill(self):
         self.returncode = -9
+
+
+class FakeSlowKillProcess(FakeProcess):
+    def __init__(self, response: dict):
+        super().__init__(response)
+        self.returncode = None
+        self.read_started = asyncio.Event()
+        self.communicate_started = asyncio.Event()
+        self.terminated = False
+        self.killed = False
+        self.kill_started = asyncio.Event()
+        self.allow_kill_exit = asyncio.Event()
+        self.stopped = asyncio.Event()
+
+    async def read(self, _limit):
+        self.read_started.set()
+        await self.stopped.wait()
+        return b""
+
+    async def communicate(self, _stdin):
+        self.communicate_started.set()
+        await self.stopped.wait()
+        return b"", b""
+
+    async def wait(self):
+        if self.killed:
+            await self.allow_kill_exit.wait()
+            self.returncode = -9
+            self.stopped.set()
+        await self.stopped.wait()
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+        self.kill_started.set()
 
 
 def receipt(upload, stream):
@@ -172,6 +214,59 @@ class SSHTransportTests(unittest.IsolatedAsyncioTestCase):
             })
             with self.assertRaises(ValueError):
                 transport._args("arbitrary")
+
+
+class TestBugSSHSecondCancellation20260812(unittest.IsolatedAsyncioTestCase):
+    """Reset cancellation must not strand ssh or ssh-keygen after TERM."""
+
+    async def _finish_repeated_cancellation(self, task, process):
+        while not process.terminated:
+            await asyncio.sleep(0)
+        await asyncio.wait_for(process.kill_started.wait(), timeout=0.5)
+        task.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        process.allow_kill_exit.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(process.killed)
+        self.assertIsNotNone(process.returncode)
+
+    async def test_run_command_kills_and_reaps_despite_repeated_cancellation(self):
+        process = FakeSlowKillProcess({"ok": True})
+        with patch(
+            "sunny_digest.ssh_transport.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=process),
+        ), patch(
+            "sunny_digest.ssh_transport.PROCESS_TERMINATE_GRACE_S", 0.01,
+        ):
+            task = asyncio.create_task(_run_command(["ssh-keygen"], timeout=30))
+            await process.communicate_started.wait()
+            task.cancel()
+            await self._finish_repeated_cancellation(task, process)
+
+    async def test_exchange_kills_and_reaps_despite_repeated_cancellation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = Paths(root / "config", root / "private", root / "runtime",
+                          root / "runtime" / "control.sock")
+            transport = SSHTransport(paths, {
+                "host": "receiver.example", "port": 22, "user": "root",
+            })
+            process = FakeSlowKillProcess({"ok": True})
+            process.stdout = process
+            revoked = asyncio.Event()
+            with patch(
+                "sunny_digest.ssh_transport.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=process),
+            ), patch(
+                "sunny_digest.ssh_transport.PROCESS_TERMINATE_GRACE_S", 0.01,
+            ):
+                task = asyncio.create_task(transport.gate(
+                    SOURCE_ID, CHAT_IDS, revoked))
+                await process.read_started.wait()
+                revoked.set()
+                await self._finish_repeated_cancellation(task, process)
 
 
 if __name__ == "__main__":

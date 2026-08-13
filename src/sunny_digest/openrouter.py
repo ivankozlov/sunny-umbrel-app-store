@@ -17,6 +17,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_WORKER_REQUEST_BYTES = 128 * 1024
 WORKER_SCHEMA = "sunny.personal-chats.openrouter-worker.v2"
+WORKER_TERMINATE_GRACE_S = 2.0
 
 
 class OpenRouterError(RuntimeError):
@@ -93,19 +94,35 @@ def _blocking_digest(chats: List[DigestChat], model: str, api_key: str) -> str:
     return _blocking_digest_prompt(_prompt(chats), model, api_key)
 
 
-async def _terminate(process: Any) -> None:
+async def _terminate_worker_inner(process: Any) -> None:
     try:
         process.terminate()
     except ProcessLookupError:
+        await process.wait()
         return
     try:
-        await asyncio.wait_for(process.wait(), timeout=2)
+        await asyncio.wait_for(
+            process.wait(), timeout=WORKER_TERMINATE_GRACE_S)
     except (asyncio.TimeoutError, ProcessLookupError):
         try:
             process.kill()
         except ProcessLookupError:
-            return
+            pass
         await process.wait()
+
+
+async def _cleanup_failed_worker(
+    process: Any, exchange: asyncio.Task[Any],
+) -> None:
+    try:
+        await _terminate_worker_inner(process)
+    finally:
+        if not exchange.done():
+            exchange.cancel()
+        try:
+            await exchange
+        except BaseException:
+            pass
 
 
 async def _bounded_worker_exchange(process: Any, request: bytes) -> bytes:
@@ -167,10 +184,19 @@ async def create_digest(chats: List[DigestChat], model: str, api_key: str,
         if process.returncode != 0:
             raise OpenRouterError("OpenRouter worker failed")
     except BaseException:
-        await _terminate(process)
-        if not exchange.done():
-            exchange.cancel()
-            await asyncio.gather(exchange, return_exceptions=True)
+        # Reset can signal revocation and cancel this task almost together.
+        # Repeated cancellation must not strand a worker containing the API key
+        # and raw chat prompt, so TERM/KILL/reap lives in a shielded task.
+        cleanup = asyncio.create_task(_cleanup_failed_worker(process, exchange))
+        cleanup_cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cleanup_cancelled = True
+        cleanup.result()
+        if cleanup_cancelled:
+            raise asyncio.CancelledError
         raise
     finally:
         cancelled.cancel()

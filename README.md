@@ -48,6 +48,16 @@ generation and does not migrate the unpublished v0.1 pilot state.
 Telegram API credentials and a user StringSession cannot restrict themselves to
 specific chats. Containment is enforced locally and fails closed:
 
+- every Telegram connection uses a mandatory loopback SOCKS endpoint backed by an
+  embedded, immutable Mihomo `v1.19.29` binary. The static config contains exactly
+  one sanitized VLESS/REALITY TCP/Vision node and no `DIRECT`, provider, proxy group,
+  TUN, controller, LAN listener, or ambient proxy setting. OpenRouter and SSH remain
+  on the ordinary Umbrel route;
+- setup downloads the bearer subscription in a killable subprocess, pins both the
+  HTTPS origin and chosen node to DNS-vetted public IPv4 addresses, and passes the URL
+  only over stdin. The URL is never persisted. Only the first valid node is retained;
+  changing it requires factory reset. Mihomo config/cache live in a random `tmpfs`
+  directory and are erased only after TERM/KILL/reap;
 - link resolution durably enters `resolving_links` before its single setup-only
   paged dialog enumeration. The setup must finish within one continuous one-hour monotonic
   lease; an interrupted lookup or collector restart before chat lock requires
@@ -92,8 +102,9 @@ web :8080 (second Basic Auth with APP_PASSWORD)
         │ narrow JSON IPC over Unix socket
         ▼
 collector ── exact Telegram peers
-    │      ├── OpenRouter ZDR (daily raw text only)
-    │      └── SSH forced-command receiver
+    │      ├── loopback SOCKS → VLESS/REALITY → Telegram only
+    │      ├── OpenRouter ZDR (daily raw text only, direct)
+    │      └── SSH forced-command receiver (direct)
     │
     ├── /data/config   locked settings, checkpoints, pending final payloads
     ├── /data/private  Telegram session and provider/uploader credentials
@@ -112,18 +123,24 @@ Telegram, acknowledge that action in the UI, and provision a fresh credential ep
 ## Provisioning
 
 1. Create Telegram application credentials at `my.telegram.org`.
-2. Create a dedicated OpenRouter key with a small spending limit. Disable account
+2. Prepare an HTTPS subscription containing at least one VLESS/REALITY TCP node with
+   `flow=xtls-rprx-vision`. The URL is a bearer secret: paste it only into the Umbrel
+   password field, never into chat, Git, logs, or an issue. A standard bounded `spx`
+   parameter is accepted and discarded after validation.
+3. Create a dedicated OpenRouter key with a small spending limit. Disable account
    input/output logging and opt-in use of prompts, and narrow the key/model/provider
    allowlist as far as practical.
-3. Obtain the DO Ed25519 SSH host-key line through an independent trusted channel.
+4. Obtain the DO Ed25519 SSH host-key line through an independent trusted channel.
    Never bootstrap trust with `ssh-keyscan` on the Umbrel.
-4. Complete the public repository/image release gate below.
-5. Install **Sunny Personal Chats** from the Community App Store. The additional
+5. Complete the public repository/image release gate below.
+6. Install **Sunny Personal Chats** from the Community App Store. The additional
    username is `sunny`; Umbrel displays the deterministic app password.
-6. Enter Telegram/OpenRouter/SSH settings and consent. Consent explicitly covers
+7. Enter Telegram/VPN/OpenRouter/SSH settings and consent. Subscription download,
+   strict parsing, DNS pinning, Mihomo startup, and SOCKS readiness finish before
+   settings are committed and before any Telegram authorization call. Consent covers
    daily selected-chat text sent to ZDR OpenRouter, bounded native-mention events
    sent to Sunny, and read acknowledgements visible on every Telegram client.
-7. Finish Telegram login, paste one message link from each of 1–16 groups, then
+8. Finish Telegram login, paste one message link from each of 1–16 groups, then
    verify the resolved titles and lock the exact checkbox set within the same
    one-hour collector process. Do not submit two links from the same group.
 
@@ -185,13 +202,14 @@ The target repository is
 `ghcr.io/ivankozlov/sunny-personal-digest` must be public so umbrelOS can clone and
 pull without registry credentials.
 
-1. Push a disabled `0.2.1` source commit with the digest placeholder.
+1. Push a disabled `0.2.2` source commit with the digest placeholder.
 2. Run the pinned `Publish image` workflow from `main` through the protected
    `ghcr-release` Environment. `bootstrap_empty_package=true` remains permanently
-   limited to the original `0.1.0`; it must be false for `0.2.1`.
+   limited to the original `0.1.0`; it must be false for `0.2.2`.
 3. Verify the public OCI index contains `linux/amd64` and `linux/arm64`.
-4. Pin the exact workflow digest in both Compose services, set `disabled: false`,
-   and keep manifest/image/runtime versions in lockstep.
+4. Pin the exact workflow digest in both Compose services and set `disabled: false`.
+   Manifest/image/`APP_VERSION` remain `0.2.2`; wire `COLLECTOR_VERSION` deliberately
+   stays `0.2.1` because it participates in payload hashes and receiver gates.
 5. Run `python3 scripts/check_package.py --release` before the enabling commit.
 
 Never overwrite a version tag, use a mutable tag without its digest, or enable the

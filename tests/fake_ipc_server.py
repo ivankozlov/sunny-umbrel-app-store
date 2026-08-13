@@ -39,6 +39,9 @@ def fixture(phase: str):
         "last_through_message_id": None,
         "failed_chat_count": 0,
         "revocation_required": False,
+        "vpn_configured": phase != "fresh",
+        "vpn_ready": phase != "fresh",
+        "vpn_migration_required": False,
     }
     if phase == "dialogs_listed":
         base["selection_id"] = "22345678-1234-4678-9234-567812345678"

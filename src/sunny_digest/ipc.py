@@ -68,12 +68,19 @@ async def _handle(collector: Collector, reader: asyncio.StreamReader,
     except Exception as exc:
         # Never return exception text: providers may include credentials or content.
         response = {"ok": False, "error_type": type(exc).__name__}
-    writer.write(canonical_json_bytes(response) + b"\n")
     try:
+        writer.write(canonical_json_bytes(response) + b"\n")
         await writer.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        # The web request can time out while a valid long-running collector
+        # action is still completing. Its closed socket is not a server error.
+        pass
     finally:
-        writer.close()
-        await writer.wait_closed()
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 async def _scheduler(collector: Collector, interval: int) -> None:
@@ -100,4 +107,6 @@ async def serve(paths: Paths) -> None:
     finally:
         if "scheduler" in locals():
             scheduler.cancel()
+            await asyncio.gather(scheduler, return_exceptions=True)
+        await collector.close()
         safe_unlink(paths.ipc_socket)

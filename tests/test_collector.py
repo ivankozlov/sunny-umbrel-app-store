@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 import uuid
+import base64
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +15,7 @@ import sunny_digest.collector as collector_module
 from sunny_digest.collector import (
     Collector,
     DIALOG_CANDIDATES_SCHEMA,
+    VPNMigrationRequiredError,
     WATCH_STATE_SCHEMA,
 )
 from sunny_digest.contracts import (
@@ -29,7 +31,12 @@ from sunny_digest.models import (
     PeerSpec,
     SelectedMessage,
 )
-from sunny_digest.settings import CONSENT_SCOPE, CREDENTIALS_SCHEMA, SETTINGS_SCHEMA
+from sunny_digest.settings import (
+    CONSENT_SCOPE,
+    CREDENTIALS_SCHEMA,
+    SETTINGS_SCHEMA,
+    load_credentials,
+)
 from sunny_digest.storage import Paths, atomic_write_bytes, atomic_write_json, read_json
 
 
@@ -41,6 +48,41 @@ CHAT_IDS = [peer.telegram_chat_id() for peer in PEERS]
 TITLES = ["Первый чат", "Второй чат"]
 BASELINE_TOPS = {CHAT_IDS[0]: 10, CHAT_IDS[1]: 20}
 BASELINE_HASH = "b" * 64
+VPN_NODE = {
+    "type": "vless",
+    "server": "1.1.1.1",
+    "port": 443,
+    "uuid": "11111111-2222-4333-8444-555555555555",
+    "network": "tcp",
+    "tls": True,
+    "servername": "cdn.example",
+    "client-fingerprint": "chrome",
+    "reality-opts": {"public-key": "E" * 43, "short-id": "1a2b3c4d"},
+    "flow": "xtls-rprx-vision",
+    "udp": False,
+}
+
+
+def known_host_blob():
+    key_type = b"ssh-ed25519"
+    blob = len(key_type).to_bytes(4, "big") + key_type + (32).to_bytes(
+        4, "big") + b"x" * 32
+    return base64.b64encode(blob).decode("ascii")
+
+
+def configure_payload(subscription_url):
+    return {
+        "telegram_api_id": "12345",
+        "telegram_api_hash": "a" * 32,
+        "vpn_subscription_url": subscription_url,
+        "openrouter_api_key": "sk-or-test-secret",
+        "openrouter_model": "anthropic/example",
+        "upload_host": "receiver.example",
+        "upload_port": "22",
+        "upload_user": "root",
+        "known_host": f"receiver.example ssh-ed25519 {known_host_blob()}",
+        "consent_expires_at": "2026-08-05T00:00:00Z",
+    }
 
 
 def make_paths(root: Path) -> Paths:
@@ -109,6 +151,7 @@ def seed_locked(paths: Paths, *, watch_phase: str | None = None):
         "telegram_api_hash": "a" * 32,
         "openrouter_api_key": "sk-or-test-secret",
     })
+    atomic_write_json(paths.vpn_active_node, VPN_NODE)
     atomic_write_bytes(paths.telegram_session, b"string-session", 0o600)
     atomic_write_json(paths.telegram_session_outstanding, {
         "schema": "sunny.personal-chats.session-outstanding.v2",
@@ -256,7 +299,12 @@ class FakeGateway:
             for chat_id, title, peer in zip(CHAT_IDS, TITLES, PEERS)
         ]
         self.resolve_calls = []
+        self.send_code_calls = 0
         self.logout_calls = 0
+
+    async def send_code(self, _session, _phone):
+        self.send_code_calls += 1
+        return "new-session", "phone-code-hash"
 
     async def resolve_message_links(self, _session, links):
         self.resolve_calls.append(list(links))
@@ -320,6 +368,48 @@ class FakeGateway:
         return True
 
 
+class FakeVPNRuntime:
+    def __init__(self, _private_dir, trace=None):
+        self.ready = False
+        self.trace = trace if trace is not None else []
+        self.starts = []
+        self.stop_calls = 0
+        self.start_error = None
+        self.stop_error = None
+
+    async def start(self, node):
+        self.trace.append("vpn_start")
+        self.starts.append(copy.deepcopy(node))
+        if self.start_error is not None:
+            raise self.start_error
+        self.ready = True
+
+    def ensure_alive(self):
+        if not self.ready:
+            raise RuntimeError("VPN is not ready")
+
+    async def stop(self):
+        self.trace.append("vpn_stop")
+        self.stop_calls += 1
+        self.ready = False
+        if self.stop_error is not None:
+            raise self.stop_error
+
+
+class BlockingVPNRuntime(FakeVPNRuntime):
+    def __init__(self, private_dir):
+        super().__init__(private_dir)
+        self.start_entered = asyncio.Event()
+        self.allow_start = asyncio.Event()
+
+    async def start(self, node):
+        self.trace.append("vpn_start")
+        self.starts.append(copy.deepcopy(node))
+        self.start_entered.set()
+        await self.allow_start.wait()
+        self.ready = True
+
+
 def mention(chat_index: int, message_id: int) -> MentionEvent:
     chat_id = CHAT_IDS[chat_index]
     return MentionEvent(
@@ -334,23 +424,336 @@ def mention(chat_index: int, message_id: int) -> MentionEvent:
     )
 
 
-def collector_for(paths, gateway, transport, digest_calls=None):
+def collector_for(paths, gateway, transport, digest_calls=None, runtime=None):
     digest_calls = digest_calls if digest_calls is not None else []
 
     async def digest(chats, model, key, revoked):
         digest_calls.append((chats, model, key, revoked.is_set()))
         return "Общий дайджест"
 
+    runtime = runtime or FakeVPNRuntime(paths.private_dir)
     return Collector(
         paths,
         gateway_factory=lambda *_: gateway,
         digest_function=digest,
         transport_factory=lambda *_: transport,
+        vpn_runtime_factory=lambda _private: runtime,
         clock=lambda: NOW,
     )
 
 
 class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
+    async def test_configure_snapshots_node_starts_vpn_before_settings_and_never_persists_url(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            secret_url = (
+                "https://subscription.example/client?token=never-persist-this")
+            trace = []
+            runtime = FakeVPNRuntime(paths.private_dir, trace)
+            fetched = []
+
+            async def fetch(url):
+                fetched.append(url)
+                return [copy.deepcopy(VPN_NODE)]
+
+            original_save = collector_module.save_initial_config
+
+            def assert_vpn_precedes_settings(*args):
+                self.assertTrue(runtime.ready)
+                self.assertTrue(paths.vpn_active_node.exists())
+                trace.append("settings_commit")
+                return original_save(*args)
+
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                clock=lambda: NOW,
+            )
+            with patch.object(
+                    collector_module, "save_initial_config",
+                    side_effect=assert_vpn_precedes_settings):
+                status = await collector.configure(configure_payload(secret_url))
+
+            self.assertEqual(fetched, [secret_url])
+            self.assertEqual(trace, ["vpn_stop", "vpn_start", "settings_commit"])
+            self.assertTrue(status["vpn_configured"])
+            self.assertTrue(status["vpn_ready"])
+            self.assertFalse(status["vpn_migration_required"])
+            self.assertEqual(read_json(paths.vpn_active_node), VPN_NODE)
+            persisted = b"".join(
+                path.read_bytes() for path in (
+                    paths.settings, paths.credentials, paths.known_hosts,
+                    paths.vpn_active_node,
+                ) if path.exists()
+            )
+            self.assertNotIn(secret_url.encode(), persisted)
+
+    async def test_legacy_configuration_requires_reset_and_never_touches_telegram(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            paths.ensure()
+            atomic_write_json(paths.settings, {
+                "schema": SETTINGS_SCHEMA, "phase": "configured",
+                "chat_locked": False, "openrouter_model": "anthropic/example",
+                "upload": {"host": "receiver.example", "port": 22, "user": "root"},
+                "consent": {"scope": CONSENT_SCOPE,
+                            "granted_at": "2026-08-04T00:00:00Z",
+                            "expires_at": "2026-08-05T00:00:00Z"},
+            })
+            atomic_write_json(paths.credentials, {
+                "schema": CREDENTIALS_SCHEMA, "telegram_api_id": 1,
+                "telegram_api_hash": "a" * 32,
+                "openrouter_api_key": "secret-key-123456",
+            })
+            runtime = FakeVPNRuntime(paths.private_dir)
+            gateway_calls = []
+            collector = Collector(
+                paths,
+                gateway_factory=lambda *_args: gateway_calls.append(_args),
+                vpn_runtime_factory=lambda _private: runtime,
+                clock=lambda: NOW,
+            )
+            collector._setup_deadline_mono = collector.monotonic() + 3600
+
+            status = await collector.public_status()
+            self.assertFalse(status["vpn_configured"])
+            self.assertFalse(status["vpn_ready"])
+            self.assertTrue(status["vpn_migration_required"])
+            with self.assertRaises(VPNMigrationRequiredError):
+                await collector.send_code("+15555550123")
+            self.assertEqual(gateway_calls, [])
+            self.assertFalse(paths.telegram_session_outstanding.exists())
+
+    async def test_configure_failure_cleans_partial_files_even_if_vpn_stop_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            runtime = FakeVPNRuntime(paths.private_dir)
+
+            async def fetch(_url):
+                return [copy.deepcopy(VPN_NODE)]
+
+            def partial_save(target_paths, *_args):
+                atomic_write_json(target_paths.settings, {"partial": True})
+                atomic_write_json(target_paths.credentials, {"partial": True})
+                atomic_write_bytes(target_paths.known_hosts, b"partial\n")
+                runtime.stop_error = RuntimeError("child reap failed")
+                raise OSError("config fsync failed")
+
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                clock=lambda: NOW,
+            )
+            with patch.object(
+                collector_module, "save_initial_config", side_effect=partial_save,
+            ):
+                with self.assertRaises(OSError):
+                    await collector.configure(
+                        configure_payload("https://subscription.example/secret"))
+
+            for path in (
+                paths.vpn_active_node, paths.settings, paths.credentials,
+                paths.known_hosts,
+            ):
+                self.assertFalse(path.exists(), path)
+
+    async def test_reset_overtakes_send_code_blocked_in_vpn_start(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            paths.ensure()
+            atomic_write_json(paths.settings, {
+                "schema": SETTINGS_SCHEMA, "phase": "configured",
+                "chat_locked": False, "openrouter_model": "anthropic/example",
+                "upload": {"host": "receiver.example", "port": 22, "user": "root"},
+                "consent": {"scope": CONSENT_SCOPE,
+                            "granted_at": "2026-08-04T00:00:00Z",
+                            "expires_at": "2026-08-05T00:00:00Z"},
+            })
+            atomic_write_json(paths.credentials, {
+                "schema": CREDENTIALS_SCHEMA, "telegram_api_id": 12345,
+                "telegram_api_hash": "a" * 32,
+                "openrouter_api_key": "sk-or-test-secret",
+            })
+            atomic_write_json(paths.vpn_active_node, VPN_NODE)
+            gateway = FakeGateway(paths)
+            runtime = BlockingVPNRuntime(paths.private_dir)
+            collector = Collector(
+                paths, gateway_factory=lambda *_: gateway,
+                vpn_runtime_factory=lambda _private: runtime,
+                clock=lambda: NOW,
+            )
+            collector._setup_deadline_mono = collector.monotonic() + 3600
+
+            send = asyncio.create_task(collector.send_code("+15555550123"))
+            await runtime.start_entered.wait()
+            reset = asyncio.create_task(collector.revoke_and_reset())
+            while not collector.revoked.is_set():
+                await asyncio.sleep(0)
+            self.assertTrue(paths.revocation_warning.exists())
+            reset.cancel()
+            reset.cancel()
+            runtime.allow_start.set()
+
+            with self.assertRaisesRegex(RuntimeError, "revocation|required|reset"):
+                await send
+            with self.assertRaises(asyncio.CancelledError):
+                await reset
+
+            self.assertEqual(gateway.send_code_calls, 0)
+            self.assertFalse(paths.telegram_session.exists())
+            self.assertFalse(paths.telegram_session_outstanding.exists())
+            for path in paths.reset_files():
+                self.assertFalse(path.exists(), path)
+            self.assertFalse(paths.revocation_warning.exists())
+
+    async def test_reset_overtakes_configure_blocked_in_vpn_start(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            runtime = BlockingVPNRuntime(paths.private_dir)
+
+            async def fetch(_url):
+                return [copy.deepcopy(VPN_NODE)]
+
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                clock=lambda: NOW,
+            )
+            configure = asyncio.create_task(collector.configure(
+                configure_payload("https://subscription.example/secret")))
+            await runtime.start_entered.wait()
+            reset = asyncio.create_task(collector.revoke_and_reset())
+            while not collector.revoked.is_set():
+                await asyncio.sleep(0)
+            runtime.allow_start.set()
+
+            with self.assertRaisesRegex(RuntimeError, "revocation|required|reset"):
+                await configure
+            result = await reset
+
+            self.assertEqual(result["last_result"], "reset")
+            for path in (
+                paths.vpn_active_node, paths.settings, paths.credentials,
+                paths.known_hosts, paths.revocation_warning,
+            ):
+                self.assertFalse(path.exists(), path)
+
+    async def test_dead_vpn_reset_never_attempts_direct_logout_and_requires_manual_revocation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.start_error = RuntimeError("dead VPN")
+            collector = Collector(
+                paths, gateway_factory=lambda *_: gateway,
+                vpn_runtime_factory=lambda _private: runtime,
+                clock=lambda: NOW,
+            )
+
+            result = await collector.revoke_and_reset()
+
+            self.assertEqual(gateway.logout_calls, 0)
+            self.assertTrue(result["revocation_required"])
+            self.assertEqual(
+                result["last_error_type"], "TelegramLogoutUnconfirmed")
+            self.assertTrue(paths.revocation_warning.exists())
+            self.assertFalse(paths.vpn_active_node.exists())
+
+    async def test_vpn_stop_failure_cannot_block_exact_reset_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.stop_error = RuntimeError("child reap failed")
+            collector = Collector(
+                paths, vpn_runtime_factory=lambda _private: runtime,
+                clock=lambda: NOW,
+            )
+
+            result = await collector.revoke_and_reset()
+
+            self.assertTrue(result["revocation_required"])
+            self.assertTrue(paths.revocation_warning.exists())
+            for path in paths.reset_files():
+                self.assertFalse(path.exists(), path)
+
+    async def test_restart_with_revocation_warning_blocks_runtime_before_receiver(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            atomic_write_json(paths.revocation_warning, {
+                "schema": "sunny.personal-chats.revocation-warning.v1",
+                "warning": "TelegramLogoutUnconfirmed",
+                "created_at": "2026-08-04T00:30:00Z",
+            })
+            gateway = FakeGateway(paths)
+            transport = FakeTransport(paths, gate())
+            runtime = FakeVPNRuntime(paths.private_dir)
+            collector = Collector(
+                paths,
+                gateway_factory=lambda *_: gateway,
+                transport_factory=lambda *_: transport,
+                vpn_runtime_factory=lambda _private: runtime,
+                clock=lambda: NOW,
+            )
+
+            result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "error")
+            self.assertEqual(result["last_error_type"], "RuntimeError")
+            self.assertEqual(transport.gate_calls, 0)
+            self.assertEqual(gateway.aggregate_scan_calls, 0)
+            self.assertEqual(gateway.fetch_calls, [])
+            self.assertEqual(runtime.starts, [])
+
+    async def test_gateway_receives_only_exact_proxy_after_vpn_readiness(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            runtime = FakeVPNRuntime(paths.private_dir)
+            gateway_args = []
+
+            def gateway_factory(*args):
+                gateway_args.append(args)
+                return FakeGateway(paths)
+
+            collector = Collector(
+                paths, gateway_factory=gateway_factory,
+                vpn_runtime_factory=lambda _private: runtime,
+                clock=lambda: NOW,
+            )
+            await collector._ensure_vpn()
+            collector._gateway(load_credentials(paths))
+
+            self.assertEqual(gateway_args, [(
+                12345, "a" * 32,
+                {"proxy_type": "socks5", "addr": "127.0.0.1",
+                 "port": 7891, "rdns": True},
+            )])
+            self.assertTrue(runtime.ready)
+
+    async def test_close_reaps_vpn_child(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            atomic_write_json(paths.vpn_active_node, VPN_NODE)
+            runtime = FakeVPNRuntime(paths.private_dir)
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                clock=lambda: NOW,
+            )
+            await collector._ensure_vpn()
+            self.assertTrue(runtime.ready)
+
+            await collector.close()
+
+            self.assertFalse(runtime.ready)
+            self.assertGreaterEqual(runtime.stop_calls, 2)
+
     async def test_run_before_explicit_activation_never_contacts_receiver_or_telegram(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = make_paths(Path(temporary))
@@ -458,9 +861,13 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
                 "openrouter_api_key": "secret-key-123456",
             })
             atomic_write_bytes(paths.telegram_session, b"session")
+            atomic_write_json(paths.vpn_active_node, VPN_NODE)
             gateway = FakeGateway(paths)
+            runtime = FakeVPNRuntime(paths.private_dir)
             collector = Collector(
-                paths, gateway_factory=lambda *_: gateway, clock=lambda: NOW)
+                paths, gateway_factory=lambda *_: gateway,
+                vpn_runtime_factory=lambda _private: runtime,
+                clock=lambda: NOW)
             collector._setup_deadline_mono = collector.monotonic() + 3600
             with self.assertRaisesRegex(ValueError, "1 to 16 message links"):
                 await collector.resolve_chat_links([])
@@ -518,6 +925,7 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
                 "openrouter_api_key": "secret-key-123456",
             })
             atomic_write_bytes(paths.telegram_session, b"session")
+            atomic_write_json(paths.vpn_active_node, VPN_NODE)
             gateway = FakeGateway(paths)
 
             async def fail_once(_session, links):
@@ -527,8 +935,11 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
                 raise TimeoutError("simulated")
 
             gateway.resolve_message_links = fail_once
+            runtime = FakeVPNRuntime(paths.private_dir)
             collector = Collector(
-                paths, gateway_factory=lambda *_: gateway, clock=lambda: NOW)
+                paths, gateway_factory=lambda *_: gateway,
+                vpn_runtime_factory=lambda _private: runtime,
+                clock=lambda: NOW)
             collector._setup_deadline_mono = collector.monotonic() + 3600
             links = ["https://t.me/c/124/10"]
             with self.assertRaises(TimeoutError):
@@ -557,9 +968,13 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
                 "openrouter_api_key": "secret-key-123456",
             })
             atomic_write_bytes(paths.telegram_session, b"session")
+            atomic_write_json(paths.vpn_active_node, VPN_NODE)
             gateway = FakeGateway(paths)
+            runtime = FakeVPNRuntime(paths.private_dir)
             collector = Collector(
-                paths, gateway_factory=lambda *_: gateway, clock=lambda: NOW)
+                paths, gateway_factory=lambda *_: gateway,
+                vpn_runtime_factory=lambda _private: runtime,
+                clock=lambda: NOW)
             collector._setup_deadline_mono = collector.monotonic() + 3600
             original_write = collector_module.atomic_write_json
 
@@ -976,8 +1391,11 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             atomic_write_bytes(paths.pending, b"digest")
             atomic_write_bytes(paths.monitor_pending, b"monitor")
             gateway = FakeGateway(paths)
+            runtime = FakeVPNRuntime(paths.private_dir)
             collector = Collector(
-                paths, gateway_factory=lambda *_: gateway, clock=lambda: NOW)
+                paths, gateway_factory=lambda *_: gateway,
+                vpn_runtime_factory=lambda _private: runtime,
+                clock=lambda: NOW)
             result = await collector.revoke_and_reset()
             self.assertEqual(result["last_result"], "reset")
             self.assertEqual(gateway.logout_calls, 1)

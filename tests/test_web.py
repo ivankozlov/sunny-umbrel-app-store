@@ -34,6 +34,9 @@ def status(phase="fresh"):
         "last_result": None,
         "last_error_type": None,
         "revocation_required": False,
+        "vpn_configured": phase != "fresh",
+        "vpn_ready": phase != "fresh",
+        "vpn_migration_required": False,
         "failed_chat_count": 0,
     }
     if phase == "chat_locked":
@@ -112,6 +115,9 @@ class WebTests(unittest.TestCase):
             "action": "configure",
             "telegram_api_id": "12345",
             "telegram_api_hash": "a-secret-api-hash",
+            "vpn_subscription_url": (
+                "https://subscription.example/client?token=a-secret-vpn-token"
+            ),
             "openrouter_api_key": "a-secret-openrouter-key",
             "openrouter_model": "anthropic/example",
             "upload_host": "receiver.example",
@@ -129,11 +135,32 @@ class WebTests(unittest.TestCase):
             "POST", headers=headers, body=urlencode(form).encode("utf-8"))
         self.assertEqual(result.status, 200)
         self.assertNotIn(b"a-secret-api-hash", rendered)
+        self.assertNotIn(b"a-secret-vpn-token", rendered)
         self.assertNotIn(b"a-secret-openrouter-key", rendered)
         self.assertNotIn(b"AAAAsecret-host-key", rendered)
         command, data = self.ipc.calls[-1]
         self.assertEqual(command, "configure")
         self.assertEqual(data["upload_user"], "root")
+        self.assertEqual(
+            data["vpn_subscription_url"],
+            "https://subscription.example/client?token=a-secret-vpn-token",
+        )
+
+    def test_vpn_migration_blocks_every_telegram_action(self):
+        value = status("configured")
+        value.update(
+            vpn_configured=False,
+            vpn_ready=False,
+            vpn_migration_required=True,
+        )
+        body = render_status(value, "a" * 64)
+        self.assertIn("Требуется новая настройка VPN", body)
+        self.assertIn("factory reset", body)
+        for action in (
+            "send_code", "submit_code", "submit_password",
+            "resolve_chat_links", "activate_monitoring", "run_now",
+        ):
+            self.assertNotIn(f'name="action" value="{action}"', body)
 
     def test_csrf_is_required(self):
         headers = dict(self.auth)
@@ -288,6 +315,8 @@ class WebTests(unittest.TestCase):
 
     def test_ui_discloses_exact_data_scope_and_first_activation_effect(self):
         fresh = render_status(status("fresh"), "a" * 64)
+        self.assertIn("VLESS/REALITY TCP/Vision subscription URL", fresh)
+        self.assertIn("не сохраняется", fresh)
         self.assertIn("ZDR OpenRouter", fresh)
         self.assertIn("фрагментом до 300 UTF-16", fresh)
         self.assertIn("помечать просмотренные сообщения", fresh)

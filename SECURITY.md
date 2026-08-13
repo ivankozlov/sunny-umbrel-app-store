@@ -21,6 +21,17 @@ socket access is nevertheless part of the trusted computing base: protect it wit
 strong authentication, expose it only to trusted LAN/Tailscale clients, and stop
 it when it is not needed.
 
+Every Telegram client is constructed with a mandatory loopback SOCKS proxy. An
+embedded immutable Mihomo binary receives one locally rendered static
+VLESS/REALITY TCP/Vision node with a public-IP destination; it has no DIRECT rule,
+remote provider, TUN, controller, LAN listener, or ambient proxy. A missing or dead
+proxy blocks Telegram before `connect()`. OpenRouter and SSH do not use it. The
+subscription bearer URL is sent only over stdin to a bounded killable downloader,
+never persisted or logged, and both its origin and the retained node are pinned to
+DNS-vetted public IPv4 addresses. Mihomo config/cache live on collector `tmpfs` and
+are erased after the child is physically reaped. Factory reset cannot promise SSD
+forensic erasure or revoke the provider token; rotate that token after compromise.
+
 Daily selected-chat text is memory-only. OpenRouter receives chat-local
 `participant-N` labels instead of stable Telegram sender/message IDs. Native
 mentions are the narrow exception: a durable event may contain a sanitized snippet

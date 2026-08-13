@@ -19,7 +19,7 @@ from .models import (
 )
 from .prompting import prompt_size
 from .version import (
-    COLLECTOR_VERSION,
+    APP_VERSION,
     DEFAULT_LOOKBACK_HOURS,
     MAX_MENTION_EVENTS,
     MAX_MENTION_SNIPPET_UTF16,
@@ -213,9 +213,18 @@ def _sender_display(message: Any) -> str:
 class TelethonGateway:
     """Telethon boundary. Imports stay local so unit tests need no network library."""
 
-    def __init__(self, api_id: int, api_hash: str):
+    def __init__(self, api_id: int, api_hash: str, proxy: Dict[str, Any]):
+        expected_proxy = {
+            "proxy_type": "socks5",
+            "addr": "127.0.0.1",
+            "port": 7891,
+            "rdns": True,
+        }
+        if proxy != expected_proxy:
+            raise ValueError("Telegram requires the app-scoped SOCKS proxy")
         self.api_id = api_id
         self.api_hash = api_hash
+        self.proxy = dict(expected_proxy)
 
     def _modules(self):
         from telethon import TelegramClient, utils
@@ -230,9 +239,10 @@ class TelethonGateway:
         return TelegramClient(
             StringSession(session_text), self.api_id, self.api_hash,
             receive_updates=False,
+            proxy=self.proxy,
             device_model="Sunny Umbrel",
             system_version="umbrelOS",
-            app_version=COLLECTOR_VERSION,
+            app_version=APP_VERSION,
         )
 
     def _peer_dialog_modules(self):

@@ -2,15 +2,24 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import hashlib
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent.parent
 APP = ROOT / "sunny-personal-digest"
 PLACEHOLDER = "RELEASE_GATE_MULTIARCH_DIGEST"
+EXPECTED_WIRE_VERSION = "0.2.1"
+MIHOMO_IMAGE = (
+    "docker.io/metacubex/mihomo:v1.19.29@sha256:"
+    "e1d7dadaa9368a52d420d65007e0e0d87cb148d292faa67326eda3fef5757f59"
+)
+MIHOMO_LICENSE_SHA256 = (
+    "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+)
 
 
 class Checks:
@@ -26,11 +35,83 @@ def text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def service_block(compose: str, name: str) -> str:
     match = re.search(rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)", compose)
     if not match:
         return ""
     return match.group(1)
+
+
+def telegram_client_guard(gateway: str) -> tuple[bool, bool, bool]:
+    """Return mandatory-proxy and application-version facts from the gateway AST."""
+    tree = ast.parse(gateway)
+    gateway_class = next(
+        (node for node in tree.body
+         if isinstance(node, ast.ClassDef) and node.name == "TelethonGateway"),
+        None,
+    )
+    if gateway_class is None:
+        return False, False, False
+    init = next(
+        (node for node in gateway_class.body
+         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+         and node.name == "__init__"),
+        None,
+    )
+    client = next(
+        (node for node in gateway_class.body
+         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+         and node.name == "_client"),
+        None,
+    )
+    if init is None or client is None:
+        return False, False, False
+
+    positional = list(init.args.posonlyargs) + list(init.args.args)
+    defaulted = {
+        arg.arg for arg in positional[-len(init.args.defaults):]
+    } if init.args.defaults else set()
+    mandatory_positional_proxy = (
+        any(arg.arg == "proxy" for arg in positional)
+        and "proxy" not in defaulted
+    )
+    mandatory_keyword_proxy = any(
+        arg.arg == "proxy" and default is None
+        for arg, default in zip(init.args.kwonlyargs, init.args.kw_defaults)
+    )
+    mandatory_proxy = mandatory_positional_proxy or mandatory_keyword_proxy
+
+    client_calls: list[ast.Call] = []
+    for node in ast.walk(client):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "TelegramClient"):
+            client_calls.append(node)
+
+    def has_exact_keyword(call: ast.Call, name: str, value: ast.expr) -> bool:
+        return any(
+            keyword.arg == name and ast.dump(keyword.value) == ast.dump(value)
+            for keyword in call.keywords
+        )
+
+    proxy_value = ast.Attribute(
+        value=ast.Name(id="self", ctx=ast.Load()),
+        attr="proxy",
+        ctx=ast.Load(),
+    )
+    app_version_value = ast.Name(id="APP_VERSION", ctx=ast.Load())
+    proxy_forwarded = bool(client_calls) and all(
+        has_exact_keyword(call, "proxy", proxy_value) for call in client_calls
+    )
+    app_version_forwarded = bool(client_calls) and all(
+        has_exact_keyword(call, "app_version", app_version_value)
+        for call in client_calls
+    )
+    return mandatory_proxy, proxy_forwarded, app_version_forwarded
 
 
 def main() -> int:
@@ -42,6 +123,8 @@ def main() -> int:
 
     required = (
         ROOT / "Dockerfile", ROOT / "README.md", ROOT / "SECURITY.md",
+        ROOT / "LICENSE", ROOT / "THIRD_PARTY_NOTICES.md",
+        ROOT / "LICENSES/Mihomo-GPL-3.0.txt",
         ROOT / "umbrel-app-store.yml", APP / "umbrel-app.yml",
         APP / "docker-compose.yml", APP / "icon.svg",
         ROOT / ".github/workflows/ci.yml", ROOT / ".github/workflows/publish.yml",
@@ -56,6 +139,8 @@ def main() -> int:
     manifest = text(APP / "umbrel-app.yml")
     compose = text(APP / "docker-compose.yml")
     dockerfile = text(ROOT / "Dockerfile")
+    third_party_notices = text(ROOT / "THIRD_PARTY_NOTICES.md")
+    requirements_input = text(ROOT / "requirements.in")
     requirements = text(ROOT / "requirements.txt")
     version_source = text(ROOT / "src/sunny_digest/version.py")
 
@@ -68,20 +153,29 @@ def main() -> int:
     disabled = re.search(r"(?m)^disabled: true$", manifest) is not None
     version_match = re.search(r'(?m)^version: "([0-9]+\.[0-9]+\.[0-9]+)"$', manifest)
     checks.require(version_match is not None, "manifest version must be quoted semver")
-    runtime_version = re.search(
+    app_runtime_version = re.search(
+        r'(?m)^APP_VERSION = "([0-9]+\.[0-9]+\.[0-9]+)"$',
+        version_source,
+    )
+    wire_version = re.search(
         r'(?m)^COLLECTOR_VERSION = "([0-9]+\.[0-9]+\.[0-9]+)"$',
         version_source,
     )
     docker_version = re.search(
         r"(?m)^ARG APP_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$", dockerfile)
-    checks.require(runtime_version is not None,
+    checks.require(app_runtime_version is not None,
+                   "APP_VERSION must be strict semver")
+    checks.require(wire_version is not None,
                    "COLLECTOR_VERSION must be strict semver")
     checks.require(docker_version is not None,
                    "Docker APP_VERSION default must be strict semver")
-    if version_match and runtime_version and docker_version:
+    if wire_version:
+        checks.require(wire_version.group(1) == EXPECTED_WIRE_VERSION,
+                       "collector wire version changed without a protocol migration")
+    if version_match and app_runtime_version and docker_version:
         expected_version = version_match.group(1)
-        checks.require(runtime_version.group(1) == expected_version,
-                       "manifest and COLLECTOR_VERSION differ")
+        checks.require(app_runtime_version.group(1) == expected_version,
+                       "manifest and APP_VERSION differ")
         checks.require(docker_version.group(1) == expected_version,
                        "manifest and Docker APP_VERSION differ")
 
@@ -155,11 +249,58 @@ def main() -> int:
     checks.require("deterministicPassword: true" in manifest,
                    "Umbrel must expose the deterministic app password")
 
-    checks.require(re.search(r"(?m)^FROM .+@sha256:[0-9a-f]{64}$", dockerfile) is not None,
-                   "Docker base image must be pinned by digest")
+    docker_images = re.findall(
+        r"(?m)^FROM ([^\s]+)(?: AS [A-Za-z0-9_.-]+)?$", dockerfile)
+    checks.require(bool(docker_images), "Dockerfile has no base image")
+    checks.require(all(re.search(r"@sha256:[0-9a-f]{64}$", image)
+                       for image in docker_images),
+                   "every Docker base image must be pinned by digest")
+    checks.require(
+        f"FROM {MIHOMO_IMAGE} AS mihomo" in dockerfile,
+        "Mihomo build stage must use the reviewed immutable multi-arch image",
+    )
+    checks.require("COPY --from=mihomo /mihomo /usr/local/bin/mihomo" in dockerfile,
+                   "Mihomo binary must be embedded in the application image")
+    checks.require("RUN test -x /usr/local/bin/mihomo" in dockerfile,
+                   "Mihomo binary executable bit must be checked during build")
+    checks.require('org.opencontainers.image.licenses="MIT AND GPL-3.0-only"' in dockerfile,
+                   "image license label must cover the bundled Mihomo binary")
+    checks.require("COPY LICENSE /usr/share/licenses/sunny/LICENSE" in dockerfile,
+                   "application license must be included in the image")
+    checks.require(
+        "COPY LICENSES/Mihomo-GPL-3.0.txt /usr/share/licenses/mihomo/LICENSE"
+        in dockerfile,
+        "complete Mihomo GPL license must be included in the image",
+    )
+    checks.require(
+        "COPY THIRD_PARTY_NOTICES.md /usr/share/doc/sunny/THIRD_PARTY_NOTICES.md"
+        in dockerfile,
+        "third-party source notice must be included in the image",
+    )
+    checks.require(
+        sha256(ROOT / "LICENSES/Mihomo-GPL-3.0.txt") == MIHOMO_LICENSE_SHA256,
+        "Mihomo GPL license text differs from the reviewed upstream tag",
+    )
+    for marker in (
+        MIHOMO_IMAGE,
+        "https://github.com/MetaCubeX/mihomo/tree/v1.19.29",
+        "LICENSES/Mihomo-GPL-3.0.txt",
+        MIHOMO_LICENSE_SHA256,
+    ):
+        checks.require(marker in third_party_notices,
+                       f"third-party notice is missing: {marker}")
     checks.require("--require-hashes" in dockerfile, "pip install must require hashes")
     checks.require("USER 1000:1000" in dockerfile, "image must end as uid 1000")
-    requirement_starts = list(re.finditer(r"(?m)^[A-Za-z0-9_.-]+==[^\s\\]+", requirements))
+    checks.require(re.search(r"(?m)^python-socks\[asyncio\]==2\.8\.2$",
+                             requirements_input) is not None,
+                   "requirements input must pin the Telethon SOCKS transport")
+    checks.require(re.search(r"(?m)^python-socks==2\.8\.2\s*\\$",
+                             requirements) is not None,
+                   "requirements lock must contain the Telethon SOCKS transport")
+    requirement_starts = list(re.finditer(
+        r"(?m)^[A-Za-z0-9_.-]+(?:\[[A-Za-z0-9_,.-]+\])?==[^\s\\]+",
+        requirements,
+    ))
     checks.require(bool(requirement_starts), "requirements lock is empty")
     for index, match in enumerate(requirement_starts):
         end = requirement_starts[index + 1].start() if index + 1 < len(
@@ -168,9 +309,16 @@ def main() -> int:
                        f"requirement lacks hashes: {match.group(0)}")
 
     gateway = text(ROOT / "src/sunny_digest/telegram_gateway.py")
+    mandatory_proxy, proxy_forwarded, app_version_forwarded = telegram_client_guard(gateway)
     checks.require("receive_updates=False" in gateway,
                    "Telegram client must disable update reception")
     checks.require("StringSession" in gateway, "Telegram runtime must use StringSession")
+    checks.require(mandatory_proxy,
+                   "TelethonGateway must require an explicit proxy")
+    checks.require(proxy_forwarded,
+                   "TelegramClient must receive the explicit app-scoped proxy")
+    checks.require(app_version_forwarded,
+                   "TelegramClient app_version must use APP_VERSION, not the wire version")
     checks.require("get_entity(" not in gateway and "download_media(" not in gateway,
                    "generic entity resolution/media downloads are forbidden")
     openrouter = text(ROOT / "src/sunny_digest/openrouter.py")
@@ -178,6 +326,11 @@ def main() -> int:
                    "blocking OpenRouter work must stay in a killable subprocess")
     checks.require("sunny_digest.openrouter_worker" in openrouter,
                    "OpenRouter subprocess boundary is missing")
+    vpn_subscription = text(ROOT / "src/sunny_digest/vpn_subscription.py")
+    checks.require("asyncio.to_thread" not in vpn_subscription,
+                   "subscription HTTPS work must stay in a killable subprocess")
+    checks.require("sunny_digest.vpn_subscription_worker" in vpn_subscription,
+                   "subscription subprocess boundary is missing")
 
     private_markers = ("-----BEGIN OPENSSH PRIVATE KEY-----", "sk-or-v1-")
     for path in ROOT.rglob("*"):

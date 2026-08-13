@@ -144,6 +144,29 @@ class FakeHungWorker:
         return self.returncode
 
 
+class FakeSlowKillWorker(FakeHungWorker):
+    def __init__(self):
+        super().__init__()
+        self.kill_started = asyncio.Event()
+        self.allow_kill_exit = asyncio.Event()
+        self.killed = False
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+        self.kill_started.set()
+
+    async def wait(self):
+        if self.killed:
+            await self.allow_kill_exit.wait()
+            self.returncode = -9
+            self.stopped.set()
+        await self.stopped.wait()
+        return self.returncode
+
+
 class ContractTests(unittest.TestCase):
     def test_status_v2_binds_exact_sorted_chat_set_and_independent_chains(self):
         value = validate_gate(gate(), CHAT_IDS)
@@ -414,6 +437,38 @@ class OpenRouterProcessTests(unittest.IsolatedAsyncioTestCase):
         command = " ".join(str(part) for part in spawn.call_args.args)
         self.assertNotIn("sk-or-test-secret", command)
         self.assertNotIn("Текст", command)
+
+
+class TestBugOpenRouterSecondCancellation20260812(
+        unittest.IsolatedAsyncioTestCase):
+    """Reset cancellation must not strand a bearer-bearing worker after TERM."""
+
+    async def test_second_cancellation_cannot_interrupt_worker_kill_and_reap(self):
+        worker = FakeSlowKillWorker()
+        revoked = asyncio.Event()
+        messages = [DigestChat("Чат", [SelectedMessage(1, 7, NOW, "Текст")])]
+        with patch(
+            "sunny_digest.openrouter.asyncio.create_subprocess_exec",
+            return_value=worker,
+        ), patch(
+            "sunny_digest.openrouter.WORKER_TERMINATE_GRACE_S", 0.01,
+        ):
+            task = asyncio.create_task(create_digest(
+                messages, "anthropic/example", "sk-or-test-secret", revoked))
+            await worker.started.wait()
+            revoked.set()
+            while not worker.terminated:
+                await asyncio.sleep(0)
+            await asyncio.wait_for(worker.kill_started.wait(), timeout=0.5)
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            worker.allow_kill_exit.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertTrue(worker.killed)
+        self.assertIsNotNone(worker.returncode)
 
 
 if __name__ == "__main__":
