@@ -14,6 +14,10 @@ The app/package/image ID remains `sunny-personal-digest` for release continuity;
 the v0.2 product name is **Sunny Personal Chats**. v0.2 is a breaking credential
 generation and does not migrate the unpublished v0.1 pilot state.
 
+The current enabled app release is `0.2.2`, pinned for both services at
+`sha256:ba4780b36f42e93ca0f0149238c2ee4b7ad670f47d4e9a9cc5c19f2f076b8098`.
+Its wire `COLLECTOR_VERSION` remains `0.2.1`.
+
 ## Product contract
 
 - Setup accepts one Telegram message link from each of 1–16 groups, resolves the
