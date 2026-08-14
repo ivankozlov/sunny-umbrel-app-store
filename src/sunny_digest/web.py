@@ -167,6 +167,12 @@ def _safe_failure_notice(status: Dict[str, Any], exc: Exception) -> str:
             "Проверьте поля настройки и VLESS/REALITY subscription URL. "
             "Секретные детали ответа провайдера намеренно скрыты."
         )
+    if phase == "chat_locked" and error_type in (
+            "ValueError", "SubscriptionFetchError"):
+        return (
+            "Проверьте новый VLESS/REALITY subscription URL и подтверждение. "
+            "Секретные детали ответа провайдера намеренно скрыты."
+        )
     if phase == "dialogs_listed" and error_type == "ValueError":
         return "Подтверждение набора устарело или повреждено. Обновите страницу."
     return f"Операция не выполнена ({error_type})."
@@ -207,7 +213,7 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
   <label>Telegram API ID<input name="telegram_api_id" inputmode="numeric" required></label>
   <label>Telegram API hash<input name="telegram_api_hash" type="password" required autocomplete="new-password"></label>
   <label>VLESS/REALITY subscription URL<input name="vpn_subscription_url" type="password" inputmode="url" required autocomplete="new-password"></label>
-  <p class="muted">Ссылка используется один раз и не сохраняется. Ответ может быть списком share-ссылок или Clash YAML; Collector хранит только очищенный VLESS/REALITY TCP/Vision-узел. Его смена потребует factory reset.</p>
+  <p class="muted">Ссылка используется один раз и не сохраняется. Ответ может быть списком share-ссылок или Clash YAML; Collector хранит только очищенный VLESS/REALITY TCP/Vision-узел. После фиксации групп маршрут можно заменить без сброса Telegram-сессии и выбранных чатов.</p>
   <label>OpenRouter API key<input name="openrouter_api_key" type="password" required autocomplete="new-password"></label>
   <label>OpenRouter model<input name="openrouter_model" placeholder="provider/model" required></label>
   <label>Sunny receiver host<input name="upload_host" placeholder="sunny.example.net" required></label>
@@ -284,8 +290,40 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
 </form>"""
     if phase == "chat_locked":
         result = _escape(status.get("last_result") or "ещё не запускался")
-        error = status.get("last_error_type")
+        error_value = status.get("last_error_type")
+        error = (
+            error_value
+            if isinstance(error_value, str)
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", error_value)
+            else "CollectorError" if error_value else None
+        )
         error_row = f'<dt>Последняя ошибка</dt><dd>{_escape(error)}</dd>' if error else ""
+        repair_state_value = status.get("vpn_repair_state")
+        repair_state = (
+            repair_state_value
+            if isinstance(repair_state_value, str)
+            and repair_state_value in {
+                "idle", "fetching", "waiting_for_run", "testing",
+                "succeeded", "failed",
+            }
+            else "unavailable"
+        )
+        repair_attempted_value = status.get("vpn_repair_attempted")
+        repair_attempted = (
+            repair_attempted_value
+            if isinstance(repair_attempted_value, int)
+            and not isinstance(repair_attempted_value, bool)
+            and 0 <= repair_attempted_value <= 999
+            else 0
+        )
+        repair_error_value = status.get("vpn_repair_error_type")
+        repair_error = (
+            repair_error_value
+            if isinstance(repair_error_value, str)
+            and re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_]{0,79}", repair_error_value)
+            else "CollectorError" if repair_error_value else "—"
+        )
         consent = "активно" if status.get("consent_active") else "истекло"
         chats = "<br>".join(
             f'{_escape(row.get("title"))} <span class="muted">({_escape(row.get("chat_id"))})</span>'
@@ -313,11 +351,22 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
   <dt>Pending digest</dt><dd>{"да" if status.get("pending_digest_upload") else "нет"}</dd>
   <dt>Ошибки peer</dt><dd>{_escape(status.get("failed_chat_count") or 0)}</dd>
   <dt>Последний результат</dt><dd>{result}</dd>{error_row}
+  <dt>Проверка нового VPN</dt><dd>{_escape(repair_state)}</dd>
+  <dt>Проверено маршрутов</dt><dd>{repair_attempted}</dd>
+  <dt>Ошибка замены VPN</dt><dd>{_escape(repair_error)}</dd>
 </dl>
 <p class="muted">Добавьте этот публичный ключ в конфигурацию forced-command receiver’а Sunny:</p>
 <code>{_escape(status.get("upload_public_key") or "")}</code>
 <p class="muted">Fingerprint: {_escape(status.get("upload_key_fingerprint") or "—")}</p>
 {activation}
+<details><summary>Проверить и заменить VPN-маршрут</summary>
+  <form method="post" autocomplete="off">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="replace_vpn">
+    <label>Новый VLESS/REALITY subscription URL<input name="vpn_subscription_url" type="password" inputmode="url" required autocomplete="new-password"></label>
+    <p class="muted">Ссылка используется один раз и не сохраняется. Telegram-сессия, выбранные группы, Source ID, upload key и состояние мониторинга сохранятся. Collector проверит connect и авторизацию Telegram через новый SOCKS-маршрут, не читая dialogs или сообщения. При неудаче старый конфиг останется выбранным; если он тоже недоступен, Telegram останется заблокирован.</p>
+    <label class="check"><input type="checkbox" name="confirm_vpn_replace" value="yes" required>Проверить новые маршруты подписки и заменить текущий только после успешной Telegram-проверки.</label>
+    <button class="secondary" type="submit">Проверить и заменить VPN</button>
+  </form>
+</details>
 <details><summary>Продлить согласие для выбранных групп</summary>
   <form method="post">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="renew_consent">
     <label>Новое окончание (ISO 8601, от 1 часа до 90 дней)<input name="consent_expires_at" placeholder="2026-10-01T00:00:00Z" required></label>
@@ -503,6 +552,11 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.app.ipc.request("activate_monitoring")
             elif action == "run_now":
                 result = self.app.ipc.request("run_now")
+            elif action == "replace_vpn":
+                if _one(form, "confirm_vpn_replace") != "yes":
+                    raise PermissionError("VPN replacement was not confirmed")
+                result = self.app.ipc.request(
+                    "replace_vpn", _one(form, "vpn_subscription_url"))
             elif action == "renew_consent":
                 if _one(form, "confirm_renew") != "yes":
                     raise PermissionError("consent renewal was not confirmed")

@@ -442,7 +442,675 @@ def collector_for(paths, gateway, transport, digest_calls=None, runtime=None):
     )
 
 
+def seed_vpn_repair_protected_files(paths: Paths):
+    atomic_write_bytes(paths.known_hosts, b"receiver.example ssh-ed25519 test\n")
+    atomic_write_bytes(paths.upload_key, b"private-upload-key")
+    atomic_write_bytes(paths.upload_public_key, b"public-upload-key\n")
+    atomic_write_bytes(paths.pending, b'{"pending":"digest"}\n')
+    atomic_write_bytes(paths.monitor_pending, b'{"pending":"monitor"}\n')
+    atomic_write_bytes(paths.acknowledged, b'{"acknowledged":true}\n')
+
+
+def vpn_repair_protected_snapshot(paths: Paths):
+    return {
+        path: path.read_bytes()
+        for path in (
+            paths.settings,
+            paths.credentials,
+            paths.telegram_session,
+            paths.telegram_session_outstanding,
+            paths.chat_locked,
+            paths.watch_state,
+            paths.known_hosts,
+            paths.upload_key,
+            paths.upload_public_key,
+            paths.pending,
+            paths.monitor_pending,
+            paths.acknowledged,
+        )
+    }
+
+
+class TestBugLiveVPNRepair20260814(unittest.IsolatedAsyncioTestCase):
+    """A locally-ready VLESS node reset Telegram before any locked peer access."""
+
+    async def test_live_vpn_repair_commits_only_authorized_candidate_without_state_loss(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = make_paths(root)
+            seed_locked(paths, watch_phase="active")
+            seed_vpn_repair_protected_files(paths)
+            before = vpn_repair_protected_snapshot(paths)
+            bad = copy.deepcopy(VPN_NODE)
+            bad["server"] = "2.2.2.2"
+            good = copy.deepcopy(VPN_NODE)
+            good["server"] = "3.3.3.3"
+            secret_url = "https://subscription.example/client?token=repair-secret"
+            fetched = []
+
+            async def fetch(source):
+                fetched.append(source)
+                return [copy.deepcopy(VPN_NODE), bad, good]
+
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            probe_calls = []
+            probe_results = [TimeoutError(), True]
+
+            async def probe(api_id, api_hash, session, revoked):
+                probe_calls.append((api_id, api_hash, session, revoked.is_set()))
+                result = probe_results.pop(0)
+                if isinstance(result, BaseException):
+                    raise result
+                return result
+
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                telegram_probe_function=probe,
+                clock=lambda: NOW,
+            )
+
+            queued = await collector.replace_vpn(secret_url)
+            self.assertEqual(queued["last_result"], "vpn_repairing")
+            task = collector._vpn_repair_task
+            self.assertIsNotNone(task)
+            await task
+
+            self.assertEqual(fetched, [secret_url])
+            self.assertEqual(runtime.starts, [bad, good])
+            self.assertEqual(probe_calls, [
+                (12345, "a" * 32, "string-session", False),
+                (12345, "a" * 32, "string-session", False),
+            ])
+            self.assertEqual(read_json(paths.vpn_active_node), good)
+            for path, raw in before.items():
+                self.assertEqual(path.read_bytes(), raw, path)
+            persisted = b"".join(
+                path.read_bytes() for path in root.rglob("*") if path.is_file()
+            )
+            self.assertNotIn(secret_url.encode(), persisted)
+            status = await collector.public_status()
+            self.assertEqual(status["last_result"], "vpn_repaired")
+            self.assertIsNone(status["last_error_type"])
+            self.assertFalse(status["vpn_repairing"])
+
+    async def test_failed_live_vpn_repair_restores_old_runtime_and_exact_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            seed_vpn_repair_protected_files(paths)
+            old_node_bytes = paths.vpn_active_node.read_bytes()
+            protected = vpn_repair_protected_snapshot(paths)
+            secret_url = (
+                "https://subscription.example/client?token=failed-repair-secret")
+            first = copy.deepcopy(VPN_NODE)
+            first["server"] = "2.2.2.2"
+            second = copy.deepcopy(VPN_NODE)
+            second["server"] = "3.3.3.3"
+
+            async def fetch(_source):
+                return [first, second]
+
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            probe_results = [TimeoutError(), ConnectionError()]
+
+            async def probe(_api_id, _api_hash, _session, _revoked):
+                result = probe_results.pop(0)
+                if isinstance(result, BaseException):
+                    raise result
+                return result
+
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                telegram_probe_function=probe,
+                clock=lambda: NOW,
+            )
+
+            await collector.replace_vpn(secret_url)
+            task = collector._vpn_repair_task
+            self.assertIsNotNone(task)
+            await task
+
+            self.assertEqual(runtime.starts, [first, second, VPN_NODE])
+            self.assertEqual(paths.vpn_active_node.read_bytes(), old_node_bytes)
+            for path, raw in protected.items():
+                self.assertEqual(path.read_bytes(), raw, path)
+            status = await collector.public_status()
+            self.assertEqual(status["last_result"], "vpn_repair_failed")
+            self.assertEqual(status["last_error_type"], "VPNRepairFailed")
+            self.assertFalse(status["vpn_repairing"])
+            persisted = b"".join(
+                path.read_bytes()
+                for path in Path(temporary).rglob("*") if path.is_file()
+            )
+            self.assertNotIn(secret_url.encode(), persisted)
+
+    async def test_repair_waits_for_active_run_before_stopping_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            candidate = copy.deepcopy(VPN_NODE)
+            candidate["server"] = "2.2.2.2"
+
+            async def fetch(_source):
+                return [candidate]
+
+            async def probe(*_args):
+                return True
+
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                telegram_probe_function=probe,
+                clock=lambda: NOW,
+            )
+            await collector.run_lock.acquire()
+            try:
+                await collector.replace_vpn(
+                    "https://subscription.example/locked-run")
+                task = collector._vpn_repair_task
+                self.assertIsNotNone(task)
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                    if collector._vpn_repair_state == "waiting_for_run":
+                        break
+                self.assertEqual(collector._vpn_repair_state, "waiting_for_run")
+                self.assertEqual(runtime.stop_calls, 0)
+                self.assertEqual(runtime.starts, [])
+            finally:
+                collector.run_lock.release()
+            await task
+            self.assertEqual(runtime.starts, [candidate])
+
+    async def test_duplicate_repair_is_rejected_without_replacing_first_url(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            fetch_entered = asyncio.Event()
+            allow_fetch = asyncio.Event()
+            fetched = []
+
+            async def fetch(source):
+                fetched.append(source)
+                fetch_entered.set()
+                await allow_fetch.wait()
+                return [VPN_NODE]
+
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda private: FakeVPNRuntime(private),
+                subscription_fetcher=fetch,
+                clock=lambda: NOW,
+            )
+            first = "https://subscription.example/first?token=first-secret"
+            second = "https://subscription.example/second?token=second-secret"
+            await collector.replace_vpn(first)
+            task = collector._vpn_repair_task
+            await fetch_entered.wait()
+            with self.assertRaises(RuntimeError):
+                await collector.replace_vpn(second)
+            self.assertEqual(fetched, [first])
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            persisted = b"".join(
+                path.read_bytes()
+                for path in Path(temporary).rglob("*") if path.is_file()
+            )
+            self.assertNotIn(first.encode(), persisted)
+            self.assertNotIn(second.encode(), persisted)
+
+    async def test_reset_during_probe_stops_candidate_without_restarting_old(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            candidate = copy.deepcopy(VPN_NODE)
+            candidate["server"] = "2.2.2.2"
+            probe_entered = asyncio.Event()
+
+            async def fetch(_source):
+                return [candidate]
+
+            async def probe(*_args):
+                probe_entered.set()
+                await asyncio.Event().wait()
+
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                telegram_probe_function=probe,
+                clock=lambda: NOW,
+            )
+            await collector.replace_vpn(
+                "https://subscription.example/reset?token=reset-secret")
+            repair = collector._vpn_repair_task
+            await probe_entered.wait()
+            # Remove the session only to isolate the repair cleanup from the
+            # reset logout path, which legitimately restarts the persisted old node.
+            paths.telegram_session.unlink()
+            paths.telegram_session_outstanding.unlink()
+            await collector.revoke_and_reset()
+            await asyncio.gather(repair, return_exceptions=True)
+            self.assertEqual(runtime.starts, [candidate])
+            self.assertFalse(runtime.ready)
+            for path in paths.reset_files():
+                self.assertFalse(path.exists(), path)
+
+    async def test_reset_during_probe_lets_only_logout_path_restart_old_node(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            candidate = copy.deepcopy(VPN_NODE)
+            candidate["server"] = "2.2.2.2"
+            probe_entered = asyncio.Event()
+
+            async def fetch(_source):
+                return [candidate]
+
+            async def probe(*_args):
+                probe_entered.set()
+                await asyncio.Event().wait()
+
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            gateway = FakeGateway(paths)
+            collector = Collector(
+                paths,
+                gateway_factory=lambda *_args: gateway,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                telegram_probe_function=probe,
+                clock=lambda: NOW,
+            )
+            await collector.replace_vpn(
+                "https://subscription.example/reset-with-logout")
+            repair = collector._vpn_repair_task
+            await probe_entered.wait()
+            result = await collector.revoke_and_reset()
+            await asyncio.gather(repair, return_exceptions=True)
+            self.assertEqual(runtime.starts, [candidate, VPN_NODE])
+            self.assertEqual(gateway.logout_calls, 1)
+            self.assertFalse(runtime.ready)
+            self.assertFalse(result["revocation_required"])
+            for path in paths.reset_files():
+                self.assertFalse(path.exists(), path)
+
+    async def test_close_during_probe_does_not_restart_old_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            candidate = copy.deepcopy(VPN_NODE)
+            candidate["server"] = "2.2.2.2"
+            probe_entered = asyncio.Event()
+
+            async def fetch(_source):
+                return [candidate]
+
+            async def probe(*_args):
+                probe_entered.set()
+                await asyncio.Event().wait()
+
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                telegram_probe_function=probe,
+                clock=lambda: NOW,
+            )
+            await collector.replace_vpn(
+                "https://subscription.example/close-during-probe")
+            repair = collector._vpn_repair_task
+            await probe_entered.wait()
+            await collector.close()
+            await asyncio.gather(repair, return_exceptions=True)
+            self.assertEqual(runtime.starts, [candidate])
+            self.assertFalse(runtime.ready)
+
+    async def test_partial_candidate_commit_failure_restores_exact_old_node(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            old_bytes = paths.vpn_active_node.read_bytes()
+            candidate = copy.deepcopy(VPN_NODE)
+            candidate["server"] = "2.2.2.2"
+
+            async def fetch(_source):
+                return [candidate]
+
+            async def probe(*_args):
+                return True
+
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                telegram_probe_function=probe,
+                clock=lambda: NOW,
+            )
+            real_write = collector_module.atomic_write_json
+            failed = False
+
+            def fail_after_replace(path, value, mode=0o600):
+                nonlocal failed
+                real_write(path, value, mode)
+                if path == paths.vpn_active_node and value == candidate and not failed:
+                    failed = True
+                    raise OSError("simulated directory fsync failure")
+
+            with patch.object(
+                collector_module, "atomic_write_json", side_effect=fail_after_replace,
+            ):
+                await collector.replace_vpn(
+                    "https://subscription.example/write-failure")
+                task = collector._vpn_repair_task
+                await task
+            self.assertEqual(paths.vpn_active_node.read_bytes(), old_bytes)
+            self.assertEqual(runtime.starts, [candidate, VPN_NODE])
+            status = await collector.public_status()
+            self.assertEqual(status["last_error_type"], "VPNRepairFailed")
+
+    async def test_rollback_start_failure_keeps_old_canonical_and_reports_unready(self):
+        class RollbackFailRuntime(FakeVPNRuntime):
+            async def start(self, node):
+                self.trace.append("vpn_start")
+                self.starts.append(copy.deepcopy(node))
+                if node == VPN_NODE:
+                    self.ready = False
+                    raise RuntimeError("old route cannot start")
+                self.ready = True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            old_bytes = paths.vpn_active_node.read_bytes()
+            candidate = copy.deepcopy(VPN_NODE)
+            candidate["server"] = "2.2.2.2"
+
+            async def fetch(_source):
+                return [candidate]
+
+            async def probe(*_args):
+                raise TimeoutError
+
+            runtime = RollbackFailRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                telegram_probe_function=probe,
+                clock=lambda: NOW,
+            )
+            await collector.replace_vpn(
+                "https://subscription.example/rollback-failure")
+            task = collector._vpn_repair_task
+            await task
+            self.assertEqual(paths.vpn_active_node.read_bytes(), old_bytes)
+            self.assertFalse(runtime.ready)
+            status = await collector.public_status()
+            self.assertEqual(status["last_error_type"], "VPNRollbackError")
+            self.assertFalse(status["vpn_ready"])
+
+    async def test_unauthorized_session_stops_candidate_search(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            candidates = []
+            for server in ("2.2.2.2", "3.3.3.3"):
+                node = copy.deepcopy(VPN_NODE)
+                node["server"] = server
+                candidates.append(node)
+
+            async def fetch(_source):
+                return candidates
+
+            async def probe(*_args):
+                return False
+
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                telegram_probe_function=probe,
+                clock=lambda: NOW,
+            )
+            await collector.replace_vpn(
+                "https://subscription.example/unauthorized")
+            task = collector._vpn_repair_task
+            await task
+            self.assertEqual(runtime.starts, [candidates[0], VPN_NODE])
+            status = await collector.public_status()
+            self.assertEqual(
+                status["last_error_type"], "TelegramSessionUnauthorized")
+
+    async def test_candidate_that_dies_after_authorization_is_not_committed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            candidates = []
+            for server in ("2.2.2.2", "3.3.3.3"):
+                node = copy.deepcopy(VPN_NODE)
+                node["server"] = server
+                candidates.append(node)
+
+            async def fetch(_source):
+                return candidates
+
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            probe_calls = 0
+
+            async def probe(*_args):
+                nonlocal probe_calls
+                probe_calls += 1
+                if probe_calls == 1:
+                    runtime.ready = False
+                return True
+
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                telegram_probe_function=probe,
+                clock=lambda: NOW,
+            )
+            await collector.replace_vpn(
+                "https://subscription.example/died-after-auth")
+            task = collector._vpn_repair_task
+            await task
+            self.assertEqual(runtime.starts, candidates)
+            self.assertEqual(read_json(paths.vpn_active_node), candidates[1])
+
+    async def test_total_timeout_before_run_lock_never_touches_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            candidate = copy.deepcopy(VPN_NODE)
+            candidate["server"] = "2.2.2.2"
+
+            async def fetch(_source):
+                return [candidate]
+
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                clock=lambda: NOW,
+            )
+            await collector.run_lock.acquire()
+            try:
+                with patch.object(
+                    collector_module, "VPN_REPAIR_RUN_LOCK_TIMEOUT_S", 0.01,
+                ):
+                    await collector.replace_vpn(
+                        "https://subscription.example/run-timeout")
+                    task = collector._vpn_repair_task
+                    await task
+            finally:
+                collector.run_lock.release()
+            self.assertEqual(runtime.stop_calls, 0)
+            self.assertEqual(runtime.starts, [])
+            status = await collector.public_status()
+            self.assertEqual(status["last_error_type"], "VPNRepairTimeout")
+
+    async def test_stop_side_effect_failure_still_restarts_old_runtime(self):
+        class StopOnceRuntime(FakeVPNRuntime):
+            async def stop(self):
+                self.trace.append("vpn_stop")
+                self.stop_calls += 1
+                self.ready = False
+                if self.stop_calls == 1:
+                    raise RuntimeError("late runtime cleanup failure")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            old_bytes = paths.vpn_active_node.read_bytes()
+            candidate = copy.deepcopy(VPN_NODE)
+            candidate["server"] = "2.2.2.2"
+
+            async def fetch(_source):
+                return [candidate]
+
+            runtime = StopOnceRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                clock=lambda: NOW,
+            )
+            await collector.replace_vpn(
+                "https://subscription.example/late-stop-failure")
+            task = collector._vpn_repair_task
+            await task
+            self.assertEqual(runtime.starts, [VPN_NODE])
+            self.assertTrue(runtime.ready)
+            self.assertEqual(paths.vpn_active_node.read_bytes(), old_bytes)
+            status = await collector.public_status()
+            self.assertEqual(status["last_error_type"], "VPNRepairFailed")
+
+    async def test_run_lock_wait_does_not_consume_candidate_testing_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            candidate = copy.deepcopy(VPN_NODE)
+            candidate["server"] = "2.2.2.2"
+
+            async def fetch(_source):
+                return [candidate]
+
+            async def probe(*_args):
+                await asyncio.sleep(0.12)
+                return True
+
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                telegram_probe_function=probe,
+                clock=lambda: NOW,
+            )
+            await collector.run_lock.acquire()
+            with (
+                patch.object(
+                    collector_module, "VPN_REPAIR_RUN_LOCK_TIMEOUT_S", 0.2),
+                patch.object(
+                    collector_module, "VPN_REPAIR_TEST_TIMEOUT_S", 0.2),
+            ):
+                await collector.replace_vpn(
+                    "https://subscription.example/separate-budgets")
+                task = collector._vpn_repair_task
+                await asyncio.sleep(0.12)
+                collector.run_lock.release()
+                await task
+            self.assertEqual(read_json(paths.vpn_active_node), candidate)
+            status = await collector.public_status()
+            self.assertEqual(status["last_result"], "vpn_repaired")
+
+    async def test_repair_requires_locked_nonrevoked_session(self):
+        for case in ("missing_lock", "missing_session", "revocation_warning"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                paths = make_paths(Path(temporary))
+                seed_locked(paths, watch_phase="active")
+                if case == "missing_lock":
+                    paths.chat_locked.unlink()
+                elif case == "missing_session":
+                    paths.telegram_session.unlink()
+                else:
+                    atomic_write_json(paths.revocation_warning, {
+                        "schema": "sunny.personal-chats.revocation-warning.v2",
+                        "warning": "TelegramLogoutUnconfirmed",
+                        "created_at": "2026-08-04T00:00:00Z",
+                    })
+                collector = Collector(
+                    paths,
+                    vpn_runtime_factory=lambda private: FakeVPNRuntime(private),
+                    subscription_fetcher=lambda _source: None,
+                    clock=lambda: NOW,
+                )
+                with self.assertRaises((RuntimeError, ValueError)):
+                    await collector.replace_vpn(
+                        "https://subscription.example/precondition-secret")
+                self.assertIsNone(collector._vpn_repair_task)
+
+    async def test_repair_tests_at_most_eight_deduplicated_candidates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            candidates = []
+            for index in range(2, 12):
+                node = copy.deepcopy(VPN_NODE)
+                node["server"] = f"20.{index}.1.1"
+                candidates.append(node)
+
+            async def fetch(_source):
+                return [candidates[0], candidates[0], *candidates]
+
+            async def probe(*_args):
+                raise TimeoutError
+
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                telegram_probe_function=probe,
+                clock=lambda: NOW,
+            )
+            await collector.replace_vpn(
+                "https://subscription.example/bounded-candidates")
+            task = collector._vpn_repair_task
+            await task
+            self.assertEqual(runtime.starts[:-1], candidates[:8])
+            self.assertEqual(runtime.starts[-1], VPN_NODE)
+            status = await collector.public_status()
+            self.assertEqual(status["vpn_repair_attempted"], 8)
+
+
 class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
+
     async def test_configure_snapshots_node_starts_vpn_before_settings_and_never_persists_url(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = make_paths(Path(temporary))

@@ -44,18 +44,20 @@ from .storage import (
     Paths,
     atomic_write_bytes,
     atomic_write_json,
+    canonical_json_bytes,
     read_json,
     safe_unlink,
     unlink_atomic_material,
 )
 from .telegram_gateway import TelethonGateway, parse_message_link
+from .telegram_probe import probe_telegram_session
 from .version import (
     DEFAULT_LOOKBACK_HOURS,
     MAX_PROMPT_BYTES,
     MAX_SELECTED_CHATS,
     MAX_UPLOAD_BYTES,
 )
-from .vpn_subscription import fetch_vless_subscription
+from .vpn_subscription import fetch_vless_subscription, validate_subscription_url
 
 
 GatewayFactory = Callable[[int, str, Dict[str, Any]], Any]
@@ -64,6 +66,9 @@ TransportFactory = Callable[[Paths, Dict[str, Any]], Any]
 KeygenFunction = Callable[[Paths, str], Awaitable[tuple[str, str]]]
 VPNRuntimeFactory = Callable[[Path], Any]
 SubscriptionFetcher = Callable[[Any], Awaitable[List[Dict[str, Any]]]]
+TelegramProbeFunction = Callable[
+    [int, str, str, asyncio.Event], Awaitable[bool]
+]
 
 
 DIGEST_ACKNOWLEDGED_SCHEMA = "sunny.personal-chats.digest-acknowledged.v2"
@@ -77,11 +82,26 @@ TELEGRAM_FETCH_TIMEOUT_S = 180
 KEYGEN_TIMEOUT_S = 30
 OPENROUTER_TIMEOUT_S = 120
 VPN_SUBSCRIPTION_TIMEOUT_S = 30
+VPN_REPAIR_RUN_LOCK_TIMEOUT_S = 240
+VPN_REPAIR_TEST_TIMEOUT_S = 300
+VPN_REPAIR_MAX_CANDIDATES = 8
 SETUP_CONSENT_LEASE_S = 3600
 
 
 class VPNMigrationRequiredError(RuntimeError):
     """An accepted pre-VPN configuration cannot make Telegram connections."""
+
+
+class VPNRepairFailed(RuntimeError):
+    """No candidate established an authorized Telegram session."""
+
+
+class VPNRollbackError(RuntimeError):
+    """The previous VPN node could not be restarted after a failed repair."""
+
+
+class TelegramSessionUnauthorized(VPNRepairFailed):
+    """The stored Telegram session is no longer authorized."""
 
 
 def _now() -> datetime:
@@ -126,6 +146,7 @@ class Collector:
         keygen_function: KeygenFunction = generate_upload_key,
         vpn_runtime_factory: VPNRuntimeFactory = MihomoRuntime,
         subscription_fetcher: SubscriptionFetcher = fetch_vless_subscription,
+        telegram_probe_function: TelegramProbeFunction = probe_telegram_session,
         clock: Callable[[], datetime] = _now,
         monotonic: Callable[[], float] = time.monotonic,
     ):
@@ -136,6 +157,7 @@ class Collector:
         self.transport_factory = transport_factory
         self.keygen_function = keygen_function
         self.subscription_fetcher = subscription_fetcher
+        self.telegram_probe_function = telegram_probe_function
         self._vpn_runtime = vpn_runtime_factory(self.paths.private_dir)
         self.clock = clock
         self.monotonic = monotonic
@@ -145,7 +167,11 @@ class Collector:
         self.revoked = asyncio.Event()
         self._run_task: Optional[asyncio.Task[Any]] = None
         self._active_run_task: Optional[asyncio.Task[Any]] = None
+        self._vpn_repair_task: Optional[asyncio.Task[Any]] = None
         self._external_tasks: set[asyncio.Task[Any]] = set()
+        self._vpn_repair_state = "idle"
+        self._vpn_repair_attempted = 0
+        self._vpn_repair_error_type: Optional[str] = None
         self._last_attempt: Optional[tuple[int, float]] = None
         # Pre-lock Telegram metadata access has no authenticated server clock.
         # A single in-process monotonic lease prevents wall-clock rollback from
@@ -193,6 +219,7 @@ class Collector:
             task for task in (
                 self._active_run_task,
                 self._run_task,
+                self._vpn_repair_task,
                 *tuple(self._external_tasks),
             )
             if task is not None and task is not current and not task.done()
@@ -324,6 +351,12 @@ class Collector:
                 self.paths.settings.exists()
                 and not self.paths.vpn_active_node.exists()
             ),
+            "vpn_repairing": self._vpn_repair_state in {
+                "fetching", "waiting_for_run", "testing",
+            },
+            "vpn_repair_state": self._vpn_repair_state,
+            "vpn_repair_attempted": self._vpn_repair_attempted,
+            "vpn_repair_error_type": self._vpn_repair_error_type,
         }
         if self.paths.settings.exists():
             try:
@@ -435,6 +468,8 @@ class Collector:
             "last_error_type", "last_message_count", "last_through_message_id",
             "failed_chat_count", "revocation_required",
             "vpn_configured", "vpn_ready", "vpn_migration_required",
+            "vpn_repairing", "vpn_repair_state", "vpn_repair_attempted",
+            "vpn_repair_error_type",
         }
         status = {key: status.get(key) for key in allowed}
         atomic_write_json(self.paths.status, status, 0o600)
@@ -500,6 +535,253 @@ class Collector:
                 raise
             self._setup_deadline_mono = self.monotonic() + SETUP_CONSENT_LEASE_S
             return self._write_status(last_result="configured", last_error_type=None)
+
+    async def replace_vpn(self, source: Any) -> Dict[str, Any]:
+        """Queue a locked-session VPN replacement without persisting its URL."""
+        subscription_url = validate_subscription_url(source)
+        async with self.state_lock:
+            epoch = self._capture_epoch()
+            settings = load_settings(self.paths)
+            if (
+                not settings["chat_locked"]
+                or settings["phase"] != "chat_locked"
+                or not self.paths.chat_locked.exists()
+            ):
+                raise RuntimeError("VPN replacement requires locked chats")
+            self._load_vpn_node()
+            load_credentials(self.paths)
+            if not self._session_text():
+                raise RuntimeError("Telegram session is unavailable")
+            if (
+                self._vpn_repair_task is not None
+                and not self._vpn_repair_task.done()
+            ):
+                raise RuntimeError("VPN replacement is already running")
+            self._vpn_repair_state = "fetching"
+            self._vpn_repair_attempted = 0
+            self._vpn_repair_error_type = None
+            task = asyncio.create_task(
+                self._run_vpn_repair(subscription_url, epoch))
+            self._vpn_repair_task = task
+            return self._write_status(
+                last_result="vpn_repairing", last_error_type=None)
+
+    async def _run_vpn_repair(
+        self, subscription_url: str, epoch: asyncio.Event,
+    ) -> None:
+        current = asyncio.current_task()
+        try:
+            nodes = await self._bounded_external(
+                self.subscription_fetcher(subscription_url),
+                VPN_SUBSCRIPTION_TIMEOUT_S,
+            )
+            # The bearer URL is no longer needed after the killable fetcher
+            # returns.  Only sanitized candidate dictionaries continue.
+            subscription_url = ""
+            self._require_current_epoch(epoch)
+            self._vpn_repair_state = "waiting_for_run"
+            self._write_status(
+                last_result="vpn_repairing", last_error_type=None)
+            await self._replace_vpn_nodes(nodes, epoch)
+        except asyncio.CancelledError:
+            self._vpn_repair_state = "idle"
+            self._vpn_repair_error_type = None
+            raise
+        except Exception as exc:
+            self._vpn_repair_state = "failed"
+            if isinstance(exc, VPNRollbackError):
+                error_type = "VPNRollbackError"
+            elif isinstance(exc, TelegramSessionUnauthorized):
+                error_type = "TelegramSessionUnauthorized"
+            elif isinstance(exc, asyncio.TimeoutError):
+                error_type = "VPNRepairTimeout"
+            else:
+                error_type = "VPNRepairFailed"
+            self._vpn_repair_error_type = error_type
+            try:
+                self._write_status(
+                    last_result="vpn_repair_failed",
+                    last_error_type=error_type,
+                )
+            except Exception:
+                # A background task must never emit a traceback containing
+                # transport internals merely because status persistence failed.
+                pass
+        else:
+            self._vpn_repair_state = "succeeded"
+            self._vpn_repair_error_type = None
+            try:
+                self._write_status(
+                    last_result="vpn_repaired", last_error_type=None)
+            except Exception:
+                # The new node is already durably committed and E2E-proven.
+                # A status write failure must not roll it back.
+                pass
+        finally:
+            subscription_url = ""
+            if self._vpn_repair_task is current:
+                self._vpn_repair_task = None
+
+    async def _replace_vpn_nodes(
+        self, nodes: Any, epoch: asyncio.Event,
+    ) -> None:
+        acquired = False
+        try:
+            await asyncio.wait_for(
+                self.run_lock.acquire(),
+                timeout=VPN_REPAIR_RUN_LOCK_TIMEOUT_S,
+            )
+            acquired = True
+            async with self.state_lock:
+                self._require_current_epoch(epoch)
+                settings = load_settings(self.paths)
+                if (
+                    not settings["chat_locked"]
+                    or settings["phase"] != "chat_locked"
+                    or not self.paths.chat_locked.exists()
+                ):
+                    raise RuntimeError("VPN replacement requires locked chats")
+                old_node = self._load_vpn_node()
+                old_bytes = self.paths.vpn_active_node.read_bytes()
+                credentials = load_credentials(self.paths)
+                session = self._session_text()
+                if not session:
+                    raise RuntimeError("Telegram session is unavailable")
+
+            if not isinstance(nodes, list) or not nodes:
+                raise VPNRepairFailed("VPN subscription is empty")
+            old_key = canonical_json_bytes(old_node)
+            candidates: List[Dict[str, Any]] = []
+            seen = {old_key}
+            for value in nodes:
+                candidate = self._validate_vpn_node(value)
+                key = canonical_json_bytes(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if len(candidates) < VPN_REPAIR_MAX_CANDIDATES:
+                    candidates.append(candidate)
+            if not candidates:
+                raise VPNRepairFailed("VPN subscription has no new candidates")
+            await asyncio.wait_for(
+                self._test_vpn_candidates(
+                    candidates, old_bytes, old_node,
+                    credentials, session, epoch,
+                ),
+                timeout=VPN_REPAIR_TEST_TIMEOUT_S,
+            )
+        finally:
+            if acquired:
+                self.run_lock.release()
+
+    async def _test_vpn_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+        old_bytes: bytes,
+        old_node: Dict[str, Any],
+        credentials: Dict[str, Any],
+        session: str,
+        epoch: asyncio.Event,
+    ) -> None:
+        runtime_touched = False
+        committed = False
+        try:
+            self._require_current_epoch(epoch)
+            # stop() may physically reap the child before a late cleanup error;
+            # rollback must run even when that await itself raises.
+            runtime_touched = True
+            await self._stop_vpn()
+            self._vpn_repair_state = "testing"
+            for candidate in candidates:
+                self._require_current_epoch(epoch)
+                self._vpn_repair_attempted += 1
+                self._write_status(
+                    last_result="vpn_repairing", last_error_type=None)
+                try:
+                    await self._start_vpn_node(candidate)
+                    authorized = await self.telegram_probe_function(
+                        credentials["telegram_api_id"],
+                        credentials["telegram_api_hash"],
+                        session,
+                        epoch,
+                    )
+                except Exception:
+                    continue
+                self._require_current_epoch(epoch)
+                if not authorized:
+                    # A different route cannot repair a revoked auth key.
+                    raise TelegramSessionUnauthorized(
+                        "Telegram session is unauthorized")
+                try:
+                    self._vpn_runtime.ensure_alive()
+                except Exception:
+                    continue
+                async with self.state_lock:
+                    self._require_current_epoch(epoch)
+                    if self.paths.vpn_active_node.read_bytes() != old_bytes:
+                        raise RuntimeError("Telegram VPN node changed concurrently")
+                    atomic_write_json(
+                        self.paths.vpn_active_node, candidate, 0o600)
+                committed = True
+                return
+            raise VPNRepairFailed("no working Telegram VPN node was found")
+        except BaseException as primary:
+            if runtime_touched and not committed:
+                cleanup = asyncio.create_task(
+                    self._restore_previous_vpn(old_bytes, old_node, epoch))
+                cleanup_cancelled = False
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        cleanup_cancelled = True
+                try:
+                    cleanup.result()
+                except Exception:
+                    if isinstance(primary, asyncio.CancelledError) or epoch.is_set():
+                        raise asyncio.CancelledError
+                    raise VPNRollbackError(
+                        "previous Telegram VPN could not be restored") from None
+                if cleanup_cancelled:
+                    raise asyncio.CancelledError
+            raise
+
+    async def _restore_previous_vpn(
+        self,
+        old_bytes: bytes,
+        old_node: Dict[str, Any],
+        epoch: asyncio.Event,
+    ) -> None:
+        try:
+            await self._stop_vpn()
+        except Exception:
+            # _start_vpn_node performs another supervised stop before start.
+            pass
+        if epoch is not self.revoked or epoch.is_set():
+            return
+        restore_error = False
+        try:
+            try:
+                current = self.paths.vpn_active_node.read_bytes()
+            except FileNotFoundError:
+                current = None
+            if current != old_bytes:
+                atomic_write_bytes(self.paths.vpn_active_node, old_bytes, 0o600)
+        except Exception:
+            restore_error = True
+        try:
+            self._require_current_epoch(epoch)
+            await self._start_vpn_node(old_node)
+            if epoch is not self.revoked or epoch.is_set():
+                await self._stop_vpn()
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            restore_error = True
+        if restore_error:
+            raise VPNRollbackError(
+                "previous Telegram VPN could not be restored")
 
     async def send_code(self, phone: Any) -> Dict[str, Any]:
         async with self.state_lock:
@@ -830,6 +1112,9 @@ class Collector:
                     self.revoked = asyncio.Event()
                     self._last_attempt = None
                     self._setup_deadline_mono = None
+                    self._vpn_repair_state = "idle"
+                    self._vpn_repair_attempted = 0
+                    self._vpn_repair_error_type = None
         result = self._write_status(
             phase="fresh", configured=False, chat_locked=False,
             consent_active=False, pending_digest_upload=False,
@@ -862,6 +1147,9 @@ class Collector:
                 self.paths.revocation_warning,
             ))
             self._setup_deadline_mono = None
+            self._vpn_repair_state = "idle"
+            self._vpn_repair_attempted = 0
+            self._vpn_repair_error_type = None
             return self._write_status(
                 phase="fresh", configured=False, chat_locked=False,
                 consent_active=False, pending_digest_upload=False,
@@ -1720,6 +2008,9 @@ class Collector:
 
     async def close(self) -> None:
         """Cancel collector work and reap the app-scoped VPN child."""
+        # Process shutdown is also a terminal credential epoch. A cancelled
+        # repair must not restart the old child merely for close() to stop it.
+        self.revoked.set()
         await self._cancel_active_operations()
         async with self.state_lock:
             await self._stop_vpn()

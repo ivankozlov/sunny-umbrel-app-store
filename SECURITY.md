@@ -31,9 +31,19 @@ bounded killable downloader; raw/base64 share lists and Clash YAML are supported
 Clash YAML is scanned and composed without constructors, and aliases, anchors, tags,
 directives, merge/duplicate keys, and unknown VLESS capabilities are rejected. Neither
 the raw URL nor provider response is persisted or logged. Subscription origin/node
-hostnames are pinned to DNS-vetted public IPv4 addresses. Mihomo config/cache live on collector `tmpfs` and
-are erased after the child is physically reaped. Factory reset cannot promise SSD
-forensic erasure or revoke the provider token; rotate that token after compromise.
+hostnames are pinned to DNS-vetted public IPv4 addresses. Initial setup starts the first
+sanitized node before an authorized Telegram session exists. Once chats are locked, the
+operator may submit a replacement subscription without resetting private or durable
+state. The old node remains byte-exact on disk while bounded candidates are tested in
+provider order. Each candidate runs behind Mihomo and must pass only `connect()` plus
+`is_user_authorized()` in a killable subprocess before atomic commit; dialogs, messages,
+history, peers, and read state are forbidden. API hash and StringSession reach the fixed
+worker over stdin, never argv, environment, or a file, and its proxy is the exact
+`127.0.0.1:7891` SOCKS endpoint with no direct fallback. Ordinary failure restores the
+previous node/runtime; revocation cancels and reaps the candidate without reopening the
+old route. Mihomo config/cache live on collector `tmpfs` and are erased after the child
+is physically reaped. Factory reset cannot promise SSD forensic erasure or revoke the
+provider token; rotate that token after compromise.
 
 Daily selected-chat text is memory-only. OpenRouter receives chat-local
 `participant-N` labels instead of stable Telegram sender/message IDs. Native

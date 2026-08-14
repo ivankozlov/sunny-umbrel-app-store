@@ -288,6 +288,15 @@ class TelethonGateway:
         from telethon.tl.types import InputDialogPeer
         return InputDialogPeer, GetPeerDialogsRequest
 
+    async def probe_authorization(self, session_text: str) -> bool:
+        """Verify the existing session without reading dialogs or messages."""
+        client = self._client(session_text)
+        try:
+            await client.connect()
+            return bool(await client.is_user_authorized())
+        finally:
+            await _disconnect_client(client)
+
     async def send_code(self, session_text: str, phone: str) -> Tuple[str, str]:
         client = self._client(session_text)
         await client.connect()

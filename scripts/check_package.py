@@ -114,6 +114,229 @@ def telegram_client_guard(gateway: str) -> tuple[bool, bool, bool]:
     return mandatory_proxy, proxy_forwarded, app_version_forwarded
 
 
+def _attribute_path(node: ast.AST) -> tuple[str, ...]:
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    else:
+        return ()
+    return tuple(reversed(parts))
+
+
+def _module_function(tree: ast.Module, name: str):
+    return next(
+        (node for node in tree.body
+         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+         and node.name == name),
+        None,
+    )
+
+
+def _class_method(tree: ast.Module, class_name: str, method_name: str):
+    class_node = next(
+        (node for node in tree.body
+         if isinstance(node, ast.ClassDef) and node.name == class_name),
+        None,
+    )
+    if class_node is None:
+        return None
+    return next(
+        (node for node in class_node.body
+         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+         and node.name == method_name),
+        None,
+    )
+
+
+def _module_literal(tree: ast.Module, name: str):
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if isinstance(target, ast.Name) and target.id == name:
+            try:
+                return ast.literal_eval(node.value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def telegram_probe_guard(
+    parent_source: str,
+    worker_source: str,
+    gateway_source: str,
+    mihomo_source: str,
+) -> dict[str, bool]:
+    """Return fail-closed facts for the killable Telegram authorization probe."""
+    parent_tree = ast.parse(parent_source)
+    worker_tree = ast.parse(worker_source)
+    gateway_tree = ast.parse(gateway_source)
+    mihomo_tree = ast.parse(mihomo_source)
+
+    spawn_calls = [
+        node for node in ast.walk(parent_tree)
+        if isinstance(node, ast.Call)
+        and _attribute_path(node.func) == ("asyncio", "create_subprocess_exec")
+    ]
+    expected_args = (
+        ast.Attribute(value=ast.Name(id="sys", ctx=ast.Load()),
+                      attr="executable", ctx=ast.Load()),
+        ast.Constant(value="-m"),
+        ast.Constant(value="sunny_digest.telegram_probe_worker"),
+    )
+    exact_worker_argv = len(spawn_calls) == 1 and (
+        len(spawn_calls[0].args) == len(expected_args)
+        and all(ast.dump(actual) == ast.dump(expected)
+                for actual, expected in zip(spawn_calls[0].args, expected_args))
+    )
+    spawn_keywords = {
+        keyword.arg: _attribute_path(keyword.value)
+        for keyword in spawn_calls[0].keywords
+        if keyword.arg is not None
+    } if spawn_calls else {}
+    exact_pipes = spawn_keywords == {
+        "stdin": ("asyncio", "subprocess", "PIPE"),
+        "stdout": ("asyncio", "subprocess", "PIPE"),
+        "stderr": ("asyncio", "subprocess", "DEVNULL"),
+    }
+    parent_writes_stdin = any(
+        isinstance(node, ast.Call)
+        and len(node.args) == 1
+        and _attribute_path(node.func)[-2:] == ("stdin", "write")
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == "request"
+        for node in ast.walk(parent_tree)
+    )
+    worker_reads_stdin = any(
+        isinstance(node, ast.Call)
+        and _attribute_path(node.func) == ("sys", "stdin", "buffer", "read")
+        for node in ast.walk(worker_tree)
+    )
+
+    forbidden_file_calls = {
+        "open", "mkstemp", "NamedTemporaryFile", "TemporaryDirectory",
+        "read_bytes", "read_text", "write_bytes", "write_text",
+    }
+    side_channel_free = True
+    for tree in (parent_tree, worker_tree):
+        for node in ast.walk(tree):
+            path = _attribute_path(node)
+            if path in (("os", "environ"), ("sys", "argv")):
+                side_channel_free = False
+            if not isinstance(node, ast.Call):
+                continue
+            call_path = _attribute_path(node.func)
+            if (call_path and call_path[-1] in forbidden_file_calls) or call_path in (
+                ("os", "getenv"), ("os", "putenv"),
+                ("asyncio", "create_subprocess_shell"),
+            ):
+                side_channel_free = False
+            if any(keyword.arg == "env" for keyword in node.keywords):
+                side_channel_free = False
+    stdin_only_secrets = (
+        exact_worker_argv and exact_pipes and parent_writes_stdin
+        and worker_reads_stdin and side_channel_free
+    )
+
+    worker_probe = _module_function(worker_tree, "_probe")
+    gateway_calls = [
+        node for node in ast.walk(worker_probe)
+        if isinstance(node, ast.Call)
+        and _attribute_path(node.func) == ("TelethonGateway",)
+    ] if worker_probe is not None else []
+    all_worker_gateway_calls = [
+        node for node in ast.walk(worker_tree)
+        if isinstance(node, ast.Call)
+        and _attribute_path(node.func) == ("TelethonGateway",)
+    ]
+    direct_client_calls = [
+        node for tree in (parent_tree, worker_tree)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and _attribute_path(node.func)[-1:] == ("TelegramClient",)
+    ]
+    expected_proxy = ast.Dict(
+        keys=[ast.Constant(value=value) for value in (
+            "proxy_type", "addr", "port", "rdns",
+        )],
+        values=[
+            ast.Constant(value="socks5"),
+            ast.Name(id="MIHOMO_SOCKS_HOST", ctx=ast.Load()),
+            ast.Name(id="MIHOMO_SOCKS_PORT", ctx=ast.Load()),
+            ast.Constant(value=True),
+        ],
+    )
+    fixed_loopback_socks = (
+        _module_literal(mihomo_tree, "MIHOMO_SOCKS_HOST") == "127.0.0.1"
+        and _module_literal(mihomo_tree, "MIHOMO_SOCKS_PORT") == 7891
+        and len(gateway_calls) == 1
+        and all_worker_gateway_calls == gateway_calls
+        and not direct_client_calls
+        and len(gateway_calls[0].args) == 3
+        and ast.dump(gateway_calls[0].args[2]) == ast.dump(expected_proxy)
+        and not gateway_calls[0].keywords
+    )
+
+    authorization_method = _class_method(
+        gateway_tree, "TelethonGateway", "probe_authorization")
+    authorization_calls = {
+        _attribute_path(node.func)[-1]
+        for node in ast.walk(authorization_method)
+        if isinstance(node, ast.Call) and _attribute_path(node.func)
+    } if authorization_method is not None else set()
+    worker_probe_calls = {
+        _attribute_path(node.func)[-1]
+        for node in ast.walk(worker_probe)
+        if isinstance(node, ast.Call) and _attribute_path(node.func)
+    } if worker_probe is not None else set()
+    forbidden_probe_calls = {
+        "get_messages", "iter_messages", "get_dialogs", "iter_dialogs",
+        "get_history", "iter_history", "read_history", "mark_read",
+        "send_read_acknowledge", "get_entity", "get_participants",
+        "iter_participants", "download_media",
+    }
+    probe_api_calls = {
+        _attribute_path(node.func)[-1]
+        for tree in (parent_tree, worker_tree)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _attribute_path(node.func)
+    }
+    authorization_only = (
+        authorization_calls == {
+            "_client", "connect", "bool", "is_user_authorized",
+            "_disconnect_client",
+        }
+        and worker_probe_calls == {"TelethonGateway", "probe_authorization"}
+        and not probe_api_calls.intersection(forbidden_probe_calls)
+    )
+
+    direct_literal = any(
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.upper() == "DIRECT"
+        for tree in (parent_tree, worker_tree)
+        for node in ast.walk(tree)
+    )
+    to_thread_call = any(
+        isinstance(node, ast.Call)
+        and _attribute_path(node.func)[-1:] == ("to_thread",)
+        for tree in (parent_tree, worker_tree)
+        for node in ast.walk(tree)
+    )
+    no_thread_or_direct = (
+        not to_thread_call and not direct_literal and not direct_client_calls
+    )
+    return {
+        "stdin_only_secrets": stdin_only_secrets,
+        "fixed_loopback_socks": fixed_loopback_socks,
+        "authorization_only": authorization_only,
+        "no_thread_or_direct": no_thread_or_direct,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fail-closed Umbrel package checks")
     parser.add_argument("--release", action="store_true",
@@ -128,6 +351,8 @@ def main() -> int:
         ROOT / "umbrel-app-store.yml", APP / "umbrel-app.yml",
         APP / "docker-compose.yml", APP / "icon.svg",
         ROOT / ".github/workflows/ci.yml", ROOT / ".github/workflows/publish.yml",
+        ROOT / "src/sunny_digest/telegram_probe.py",
+        ROOT / "src/sunny_digest/telegram_probe_worker.py",
     )
     for path in required:
         checks.require(path.is_file(), f"missing required file: {path.relative_to(ROOT)}")
@@ -248,6 +473,8 @@ def main() -> int:
                        f"backupIgnore is missing {ignored}")
     checks.require("deterministicPassword: true" in manifest,
                    "Umbrel must expose the deterministic app password")
+    checks.require(re.search(r"(?m)^defaultShell: collector$", manifest) is not None,
+                   "Umbrel terminal must default to the collector service")
 
     docker_images = re.findall(
         r"(?m)^FROM ([^\s]+)(?: AS [A-Za-z0-9_.-]+)?$", dockerfile)
@@ -327,6 +554,23 @@ def main() -> int:
                    "TelegramClient app_version must use APP_VERSION, not the wire version")
     checks.require("get_entity(" not in gateway and "download_media(" not in gateway,
                    "generic entity resolution/media downloads are forbidden")
+    telegram_probe = text(ROOT / "src/sunny_digest/telegram_probe.py")
+    telegram_probe_worker = text(
+        ROOT / "src/sunny_digest/telegram_probe_worker.py")
+    mihomo = text(ROOT / "src/sunny_digest/mihomo.py")
+    probe_facts = telegram_probe_guard(
+        telegram_probe, telegram_probe_worker, gateway, mihomo)
+    for fact, message in {
+        "stdin_only_secrets": (
+            "Telegram probe secrets must reach the fixed worker only over stdin"),
+        "fixed_loopback_socks": (
+            "Telegram probe worker must use the exact fixed loopback Mihomo SOCKS"),
+        "authorization_only": (
+            "Telegram probe may only connect, check authorization, and disconnect"),
+        "no_thread_or_direct": (
+            "Telegram probe must remain killable and have no DIRECT fallback"),
+    }.items():
+        checks.require(probe_facts[fact], message)
     openrouter = text(ROOT / "src/sunny_digest/openrouter.py")
     checks.require("asyncio.to_thread" not in openrouter,
                    "blocking OpenRouter work must stay in a killable subprocess")

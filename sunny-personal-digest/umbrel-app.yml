@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Chats
-version: "0.2.4"
+version: "0.2.5"
 tagline: Mentions, read receipts, and one digest for selected chats
 description: >-
   Resolves message links for only the explicitly selected Telegram groups,
@@ -18,9 +18,10 @@ description: >-
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  Prevents a hung chat-monitor request from starving other selected chats or
-  the independent daily digest. It also raises the Opus output budget and
-  removes duplicate missing-digest watchdog alerts. The collector wire
+  Adds in-place replacement of a failing VLESS/REALITY route without resetting
+  the Telegram session, locked chats, receiver generation, or durable monitor
+  and digest state. Candidate routes pass a killable, SOCKS-only Telegram
+  authorization probe before the active node is committed. The collector wire
   protocol remains 0.2.1.
 
 developer: Ivan Kozlov
@@ -36,6 +37,7 @@ path: ""
 
 defaultUsername: sunny
 deterministicPassword: true
+defaultShell: collector
 submitter: Ivan Kozlov
 
 backupIgnore:

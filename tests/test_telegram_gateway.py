@@ -493,6 +493,28 @@ class TelegramFetchTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TelegramMonitorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_authorization_probe_reads_no_dialogs_messages_or_peers(self):
+        client = FakeClient([], upper_id=None)
+        await GatewayUnderTest(client).probe_authorization("session")
+        self.assertEqual(client.connect_calls, 1)
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertEqual(client.get_calls, [])
+        self.assertEqual(client.iter_calls, [])
+        self.assertEqual(client.raw_calls, [])
+        self.assertEqual(client.read_ack_calls, [])
+
+    async def test_unauthorized_probe_disconnects_and_returns_false(self):
+        class UnauthorizedClient(FakeClient):
+            async def is_user_authorized(self):
+                return False
+
+        client = UnauthorizedClient([], upper_id=None)
+        self.assertFalse(
+            await GatewayUnderTest(client).probe_authorization("session"))
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertEqual(client.get_calls, [])
+        self.assertEqual(client.iter_calls, [])
+
     async def test_snapshot_tops_uses_only_exact_peer_dialog_request(self):
         client = FakeClient([], upper_id=None)
         client.peer_dialogs = [

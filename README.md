@@ -14,13 +14,15 @@ The app/package/image ID remains `sunny-personal-digest` for release continuity;
 the v0.2 product name is **Sunny Personal Chats**. v0.2 is a breaking credential
 generation and does not migrate the unpublished v0.1 pilot state.
 
-The current enabled app release is `0.2.3`, pinned for both services at
-`sha256:e4166a4586e867fa0c858f22f8abc5f57ad6d62a9b4ba9d33948d662338134b2`.
-The physical Umbrel runs `0.2.3`: seven exact peers are locked, the new receiver
-generation and durable baseline are accepted, and monitoring is active. The first
-production daily on 2026-08-14 was starved by an active-monitor timeout. `0.2.4` is
-the disabled, placeholder-pinned source candidate for that fix; it is not published
-or installable yet. Wire `COLLECTOR_VERSION` remains `0.2.1`.
+The current enabled app release is `0.2.4`, pinned for both services at
+`sha256:3a5b9f9b6e3eab67f0e18df53443fed0907f2cadc6a3bf4d1cccec69f0ea1685`.
+The physical Umbrel runs `0.2.4`: seven exact peers, the receiver generation,
+durable baseline, session, and monitoring state remain intact. That release prevents
+an aggregate monitor timeout from starving the independent digest path, but live
+diagnosis then found the persisted VLESS route resetting Telegram's initial MTProto
+exchange. `0.2.5` is the disabled, placeholder-pinned source candidate for replacing
+that route in place; it is not published or installable yet. Wire
+`COLLECTOR_VERSION` remains `0.2.1`.
 
 ## Product contract
 
@@ -67,10 +69,15 @@ specific chats. Containment is enforced locally and fails closed:
   share-link list or Clash YAML. A killable subprocess pins both the HTTPS origin and
   chosen node to DNS-vetted public IPv4 addresses and receives the URL only over stdin.
   Clash YAML is parsed without constructors/aliases/tags and narrowed to an exact
-  allowlist; neither the raw URL nor provider response is persisted;
-  only the first sanitized node is retained. Changing it requires factory reset.
-  Mihomo config/cache live in a random `tmpfs` directory and are erased only after
-  TERM/KILL/reap;
+  allowlist; neither the raw URL nor provider response is persisted. Initial setup
+  starts the first sanitized node because no authorized Telegram session exists yet.
+  After chat lock, a replacement subscription can be tested in place: candidates are
+  tried in provider order through Mihomo and must complete only Telegram `connect()`
+  plus `is_user_authorized()` in a killable child process before the active node is
+  atomically replaced. The worker receives API/session secrets only over stdin and
+  cannot inspect dialogs, messages, history, peers, or read state. An ordinary failed
+  replacement restores the previous byte-exact node and runtime. Mihomo config/cache
+  live in a random `tmpfs` directory and are erased only after TERM/KILL/reap;
 - link resolution durably enters `resolving_links` before its single setup-only
   paged dialog enumeration. The setup must finish within one continuous one-hour monotonic
   lease; an interrupted lookup or collector restart before chat lock requires
@@ -170,8 +177,23 @@ raw links and referenced message IDs are not retained after resolution.
 After lock, the UI displays only public bootstrap data: source UUID, locked chat
 IDs/titles, uploader public key/fingerprint, and endpoint metadata. It never displays
 the private key or session. Do not activate monitoring until the receiver and Sunny
-`chats` topic are ready. Changing the selection, model, endpoint, or credentials
-requires factory reset and a new receiver generation.
+`chats` topic are ready. Changing the selection, model, endpoint, Telegram account,
+OpenRouter key, or upload credentials requires factory reset and a new receiver
+generation. Replacing only a failing VLESS/REALITY route uses the locked-page VPN
+repair form and preserves all of that state.
+
+### Replacing a failing VPN route after chat lock
+
+Paste a fresh HTTPS VLESS/REALITY subscription into the password field on the locked
+status page and explicitly confirm the replacement. The URL is consumed once and is
+not written to config, status, or logs. Download happens before the collector pauses
+normal runs; candidate testing is bounded and reports only a redacted phase, attempted
+count, and fixed error class. A candidate becomes active only after the existing
+Telegram session proves authorized through its SOCKS route. Failure keeps the previous
+node and does not alter the StringSession, selected chats, source ID, uploader keys,
+consent, pending payloads, or accepted monitor/digest checkpoints. Factory reset during
+repair cancels and reaps the probe, stops the candidate, and continues revocation
+without restarting a route behind the reset boundary.
 
 On explicit activation, baseline upload precedes every read acknowledgement. If the
 daily gate is already due, the same runtime cycle may immediately scan up to the
@@ -198,6 +220,10 @@ docker build --platform linux/amd64 -t sunny-personal-digest:local .
 The real web path can be rendered without credentials with the test-only fake IPC
 fixture. Production code still requires the configured Unix socket.
 
+The Umbrel app terminal defaults to the `collector` service. That is intentional:
+VPN/session diagnostics need `data/config` and `data/private`, which are absent from
+the deliberately narrower `web` container.
+
 ```bash
 tmpdir="$(mktemp -d)"
 PYTHONPATH=src python3 tests/fake_ipc_server.py \
@@ -220,10 +246,10 @@ The target repository is
 `ghcr.io/ivankozlov/sunny-personal-digest` must be public so umbrelOS can clone and
 pull without registry credentials.
 
-The `0.2.3` release followed this exact sequence: disabled source first, the
+The `0.2.4` release followed this exact sequence: disabled source first, the
 protected `Publish image` workflow with `bootstrap_empty_package=false`, independent
 public OCI verification for `linux/amd64` and `linux/arm64`, and only then the exact
-digest pin plus `disabled: false`. `0.2.4` is currently at the first phase only:
+digest pin plus `disabled: false`. `0.2.5` is currently at the first phase only:
 its manifest is disabled and both image references intentionally contain the release
 placeholder. It is not a release until publish, independent OCI verification, digest
 pinning, and the separate enabling commit all succeed. Future versions must repeat
@@ -247,12 +273,14 @@ duplicate after retry, independent monitor/digest health, and then the first com
 daily digest.
 
 Production has completed setup, receiver rotation, activation, and the mention path
-with seven peers on `0.2.3`. The first daily on 2026-08-14 exposed monitor-timeout
-starvation before any digest upload. After releasing and installing `0.2.4`, verify
-the persisted lock/session/baseline, VPN readiness, and the next real 03:00–04:45 daily.
-There is deliberately no manual same-day backfill. The DO host watchdog update is a
-separate deployment: it suppresses only duplicate `missing_daily_digest` reminders;
-all other monitor and digest errors remain alerting.
+with seven peers on `0.2.4`. The first daily, while `0.2.3` was installed on
+2026-08-14, exposed monitor-timeout starvation before any digest upload; `0.2.4`
+shipped that isolation fix and the matching watchdog suppression. The next live run
+exposed a separate failure before peer access:
+the persisted route reset Telegram initialization. After releasing and installing
+`0.2.5`, submit the replacement subscription in the locked UI, verify a successful
+authorization probe, unchanged lock/session/baseline/checkpoints, active monitoring,
+and the next real 03:00–04:45 daily. There is deliberately no manual same-day backfill.
 
 ## Incident response
 

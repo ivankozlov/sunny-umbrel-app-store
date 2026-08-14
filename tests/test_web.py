@@ -37,6 +37,10 @@ def status(phase="fresh"):
         "vpn_configured": phase != "fresh",
         "vpn_ready": phase != "fresh",
         "vpn_migration_required": False,
+        "vpn_repairing": False,
+        "vpn_repair_state": "idle",
+        "vpn_repair_attempted": 0,
+        "vpn_repair_error_type": None,
         "failed_chat_count": 0,
     }
     if phase == "chat_locked":
@@ -145,6 +149,84 @@ class WebTests(unittest.TestCase):
             data["vpn_subscription_url"],
             "https://subscription.example/client?token=a-secret-vpn-token",
         )
+
+    def test_locked_vpn_replacement_is_confirmed_and_never_reflects_url(self):
+        self.ipc.value = status("chat_locked")
+        response, page = self.request("GET", headers=self.auth)
+        self.assertIn(b'name="action" value="replace_vpn"', page)
+        self.assertIn(b'name="vpn_subscription_url" type="password"', page)
+        self.assertIn(b'name="confirm_vpn_replace"', page)
+        cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+        token = re.search(
+            rb'name="csrf" value="([0-9a-f]{64})"', page).group(1).decode()
+        secret_url = "https://subscription.example/sub/?token=live-secret"
+        headers = dict(self.auth)
+        headers.update({
+            "Cookie": cookie,
+            "Content-Type": "application/x-www-form-urlencoded",
+        })
+        form = {
+            "csrf": token,
+            "action": "replace_vpn",
+            "vpn_subscription_url": secret_url,
+            "confirm_vpn_replace": "yes",
+        }
+
+        result, rendered = self.request(
+            "POST", headers=headers, body=urlencode(form).encode("utf-8"))
+
+        self.assertEqual(result.status, 200)
+        self.assertEqual(self.ipc.calls[-1], ("replace_vpn", secret_url))
+        self.assertNotIn(b"live-secret", rendered)
+        self.assertNotIn(secret_url.encode("utf-8"), rendered)
+
+    def test_locked_vpn_replacement_requires_confirmation_before_ipc(self):
+        self.ipc.value = status("chat_locked")
+        response, page = self.request("GET", headers=self.auth)
+        cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+        token = re.search(
+            rb'name="csrf" value="([0-9a-f]{64})"', page).group(1).decode()
+        headers = dict(self.auth)
+        headers.update({
+            "Cookie": cookie,
+            "Content-Type": "application/x-www-form-urlencoded",
+        })
+        before = list(self.ipc.calls)
+        secret_url = "https://subscription.example/sub/?token=unconfirmed"
+
+        result, rendered = self.request(
+            "POST", headers=headers, body=urlencode({
+                "csrf": token,
+                "action": "replace_vpn",
+                "vpn_subscription_url": secret_url,
+            }).encode("utf-8"))
+
+        self.assertEqual(result.status, 200)
+        self.assertEqual(self.ipc.calls, before + [("status", None)])
+        self.assertNotIn(b"unconfirmed", rendered)
+
+    def test_vpn_repair_status_is_bounded_and_redacted(self):
+        value = status("chat_locked")
+        value.update({
+            "vpn_repair_state": "testing",
+            "vpn_repair_attempted": 3,
+            "vpn_repair_error_type": "TelegramProbeError",
+        })
+        rendered = render_status(value, "a" * 64)
+        self.assertIn("Проверка нового VPN", rendered)
+        self.assertIn("testing", rendered)
+        self.assertIn("3", rendered)
+        self.assertIn("TelegramProbeError", rendered)
+
+        secret_url = "https://subscription.example/sub/?token=status-secret"
+        value.update({
+            "vpn_repair_state": {"secret": secret_url},
+            "vpn_repair_attempted": secret_url,
+            "vpn_repair_error_type": secret_url,
+        })
+        rendered = render_status(value, "a" * 64)
+        self.assertNotIn(secret_url, rendered)
+        self.assertNotIn("status-secret", rendered)
 
     def test_vpn_migration_blocks_every_telegram_action(self):
         value = status("configured")

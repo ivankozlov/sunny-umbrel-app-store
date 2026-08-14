@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sunny_digest.ipc import _handle
+from sunny_digest.ipc import _handle, dispatch
 from sunny_digest.web import (
     IPC_CONNECT_TIMEOUT_S,
     IPC_RESPONSE_TIMEOUT_S,
@@ -24,6 +24,19 @@ class _StatusCollector:
 class _FailingStatusCollector:
     async def public_status(self):
         raise RuntimeError("secret-provider-detail")
+
+
+class _VPNCollector:
+    def __init__(self):
+        self.sources = []
+
+    async def replace_vpn(self, source):
+        self.sources.append(source)
+        return {
+            "phase": "chat_locked",
+            "vpn_repair_state": "fetching",
+            "vpn_repair_attempted": 0,
+        }
 
 
 class _Reader:
@@ -92,6 +105,26 @@ class _Socket:
 
 
 class IPCTests(unittest.TestCase):
+    def test_dispatches_live_vpn_replacement_as_an_exact_string(self):
+        collector = _VPNCollector()
+        secret_url = "https://subscription.example/sub/?token=secret"
+        result = asyncio.run(dispatch(collector, {
+            "command": "replace_vpn",
+            "data": secret_url,
+        }))
+
+        self.assertEqual(collector.sources, [secret_url])
+        self.assertEqual(result["vpn_repair_state"], "fetching")
+
+    def test_rejects_non_string_live_vpn_replacement_data(self):
+        collector = _VPNCollector()
+        with self.assertRaisesRegex(ValueError, "replace_vpn data"):
+            asyncio.run(dispatch(collector, {
+                "command": "replace_vpn",
+                "data": {"url": "https://subscription.example/sub/"},
+            }))
+        self.assertEqual(collector.sources, [])
+
     def test_client_defaults_cover_longest_synchronous_collector_action(self):
         self.assertEqual(IPC_RESPONSE_TIMEOUT_S, 150)
         self.assertGreater(IPC_RESPONSE_TIMEOUT_S, 120)

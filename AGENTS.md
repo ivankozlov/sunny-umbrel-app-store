@@ -13,11 +13,26 @@ runtime configuration.
   after either an interrupted attempt or chat selection. Telegram may include
   the latest messages for up to 500 dialogs across those responses; the app may use
   only peer/title metadata and must not persist links or returned message text.
-- VPN setup accepts one HTTPS bearer subscription. Its raw/base64 share-list or Clash
-  YAML response is parsed in a killable worker; YAML constructors, aliases, anchors,
-  tags, directives, merge keys, duplicate keys, and unknown VLESS capabilities are
-  rejected. Only a freshly built allowlisted VLESS/REALITY TCP/Vision node may be
-  persisted. Every Telegram client remains SOCKS-only with no direct fallback.
+- VPN setup and locked-state repair accept one HTTPS bearer subscription. Its
+  raw/base64 share-list or Clash YAML response is parsed in a killable worker;
+  YAML constructors, aliases, anchors, tags, directives, merge keys, duplicate
+  keys, and unknown VLESS capabilities are rejected. Only freshly built
+  allowlisted VLESS/REALITY TCP/Vision nodes may be tested or persisted. Every
+  Telegram client remains SOCKS-only with no direct fallback.
+- Locked-state VPN repair preserves the Telegram session, immutable chat set,
+  receiver generation, and durable monitor/digest state. It downloads before
+  taking the run lock, then tests bounded candidates in provider order. Each
+  candidate must pass a killable child-process `connect()` plus
+  `is_user_authorized()` through the exact loopback Mihomo SOCKS endpoint; the
+  probe may not inspect dialogs, messages, history, peers, or read state. API hash
+  and StringSession reach that fixed worker only over stdin. The previous node
+  remains byte-exact until a candidate succeeds; ordinary failure restores its
+  runtime, while reset/revocation stops the candidate and proceeds fail-closed.
+  The subscription URL, provider response, rejected candidates, and probe secrets
+  are never persisted or logged. Initial setup still starts the first sanitized
+  node because no authorized session exists yet; the Telegram login is its first
+  end-to-end reachability check, and locked-state repair is not a substitute for
+  completing that login.
 - Changing the Telegram account, selected chats, OpenRouter key/model, or upload
   endpoint requires factory reset. Before its first await, reset persists a
   blocking revocation warning; it then cancels active work, attempts Telegram
@@ -96,3 +111,5 @@ python3 -m compileall -q src tests scripts
 multi-architecture GHCR digest replaces the release placeholder and the app
 manifest is enabled. The publish job stays `main`-only behind the protected
 `ghcr-release` Environment; privileged QEMU/BuildKit helpers remain digest-pinned.
+The manifest's `defaultShell` stays pinned to `collector`, because VPN and
+session diagnostics require the private/config mounts absent from `web`.
