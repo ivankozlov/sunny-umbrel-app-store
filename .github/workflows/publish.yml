@@ -6,7 +6,7 @@ on:
       version:
         description: Semver matching umbrel-app.yml (without v)
         required: true
-        default: "0.2.3"
+        default: "0.2.4"
         type: string
       bootstrap_empty_package:
         description: One-time bootstrap for an absent GHCR package

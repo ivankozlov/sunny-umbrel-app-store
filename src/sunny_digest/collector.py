@@ -1635,6 +1635,7 @@ class Collector:
             current_task = asyncio.current_task()
             self._active_run_task = current_task
             revoked = self.revoked
+            failed_chat_count = 0
             try:
                 async with self.state_lock:
                     self._require_no_revocation_warning()
@@ -1659,10 +1660,25 @@ class Collector:
                 await self._ensure_vpn()
                 self._require_current_epoch(revoked)
                 gateway = self._gateway(credentials)
-                gate, gate_received_mono, mentions, failed_chat_count = await self._run_monitor(
-                    gate, gate_received_mono, transport, gateway, settings,
-                    session, revoked,
-                )
+                monitor_error_type = None
+                try:
+                    gate, gate_received_mono, mentions, failed_chat_count = await self._run_monitor(
+                        gate, gate_received_mono, transport, gateway, settings,
+                        session, revoked,
+                    )
+                except asyncio.TimeoutError:
+                    # 2026-08-14: one hanging active-monitor operation consumed
+                    # the aggregate deadline on every tick and starved the
+                    # independent daily stream. Baseline transitions remain
+                    # fail-closed; active state continues only from a fresh,
+                    # authenticated receiver gate.
+                    watch = self._load_watch_state(source_id, chat_ids)
+                    if watch["phase"] != "active":
+                        raise
+                    monitor_error_type = "TimeoutError"
+                    failed_chat_count = len(chat_ids)
+                    gate, gate_received_mono = await self._fresh_gate(
+                        transport, source_id, chat_ids, revoked)
                 watch = self._load_watch_state(source_id, chat_ids)
                 if watch["phase"] != "active":
                     return self._write_status(
@@ -1676,7 +1692,8 @@ class Collector:
                 )
                 return self._write_status(
                     last_run_at=self.clock().isoformat(), last_result=result,
-                    last_error_type=None, last_message_count=message_count,
+                    last_error_type=monitor_error_type,
+                    last_message_count=message_count,
                     pending_digest_upload=self.paths.pending.exists(),
                     pending_monitor_upload=self.paths.monitor_pending.exists(),
                     failed_chat_count=failed_chat_count,
@@ -1695,7 +1712,7 @@ class Collector:
                     last_error_type=type(exc).__name__,
                     pending_digest_upload=self.paths.pending.exists(),
                     pending_monitor_upload=self.paths.monitor_pending.exists(),
-                    failed_chat_count=0,
+                    failed_chat_count=failed_chat_count,
                 )
             finally:
                 if self._active_run_task is current_task:

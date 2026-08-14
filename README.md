@@ -16,8 +16,11 @@ generation and does not migrate the unpublished v0.1 pilot state.
 
 The current enabled app release is `0.2.3`, pinned for both services at
 `sha256:e4166a4586e867fa0c858f22f8abc5f57ad6d62a9b4ba9d33948d662338134b2`.
-The physical Umbrel still has `0.2.2` installed and is at fresh setup, ready for
-the app update. Wire `COLLECTOR_VERSION` remains `0.2.1`.
+The physical Umbrel runs `0.2.3`: seven exact peers are locked, the new receiver
+generation and durable baseline are accepted, and monitoring is active. The first
+production daily on 2026-08-14 was starved by an active-monitor timeout. `0.2.4` is
+the disabled, placeholder-pinned source candidate for that fix; it is not published
+or installable yet. Wire `COLLECTOR_VERSION` remains `0.2.1`.
 
 ## Product contract
 
@@ -46,7 +49,9 @@ the app update. Wire `COLLECTOR_VERSION` remains `0.2.1`.
   before the next poll.
 - One daily OpenRouter call produces one combined Russian digest for all selected
   chats. The monitor and digest hash/cursor chains are independent, so an LLM or
-  daily failure cannot stop frequent read handling.
+  daily failure cannot stop frequent read handling. The receiver accepts a daily
+  only from 03:00 through 04:45 in the configured IANA timezone; there is no
+  same-day catch-up after that window.
 
 ## Security model
 
@@ -76,14 +81,18 @@ specific chats. Containment is enforced locally and fails closed:
   receiver. Without a valid gate there is no Telegram scan, read acknowledgement,
   or OpenRouter request;
 - a watcher cycle shares one Telegram connection across every selected peer and
-  one connection for batched read acknowledgements; one broken peer does not block
-  healthy peers;
+  one connection for batched read acknowledgements. At most four whole peer operations
+  run concurrently, each has a 30-second deadline, result order remains deterministic,
+  and cancellation joins every sibling before disconnect;
+- only an aggregate `TimeoutError` from an already-active monitor may continue to the
+  independent digest path, and only after a fresh authenticated gate. Baseline,
+  receiver-chain, pending conflicts, and cancellation remain fail-closed;
 - the first daily run derives each 72-hour lower boundary from authenticated
   receiver `server_time`, not the Umbrel wall clock. Later runs continue independent
   digest cursors without dropping accumulated backlog;
 - raw daily chat text exists only in collector memory and the ZDR OpenRouter
   request. Every request sets `provider.zdr=true` and
-  `provider.data_collection=deny`;
+  `provider.data_collection=deny`; Opus uses an explicit `max_tokens=16384` budget;
 - bounded mention events are an explicit privacy exception: they are durable on
   Umbrel while pending, in DO receiver/inbox/backups, and in Sunny's Telegram
   outbox. Locked runtime health/status never contains titles, snippets, digest
@@ -214,7 +223,11 @@ pull without registry credentials.
 The `0.2.3` release followed this exact sequence: disabled source first, the
 protected `Publish image` workflow with `bootstrap_empty_package=false`, independent
 public OCI verification for `linux/amd64` and `linux/arm64`, and only then the exact
-digest pin plus `disabled: false`. Future versions must repeat the same sequence.
+digest pin plus `disabled: false`. `0.2.4` is currently at the first phase only:
+its manifest is disabled and both image references intentionally contain the release
+placeholder. It is not a release until publish, independent OCI verification, digest
+pinning, and the separate enabling commit all succeed. Future versions must repeat
+the same sequence.
 Wire `COLLECTOR_VERSION` deliberately stays `0.2.1` until an explicit chain migration.
 Run `python3 scripts/check_package.py --release` before every enabling commit.
 
@@ -232,6 +245,14 @@ After activation, create one **new** real mention for the smoke test. Verify dur
 receiver receipt before read disappearance, delivery to the Sunny topic **Чаты**, no
 duplicate after retry, independent monitor/digest health, and then the first combined
 daily digest.
+
+Production has completed setup, receiver rotation, activation, and the mention path
+with seven peers on `0.2.3`. The first daily on 2026-08-14 exposed monitor-timeout
+starvation before any digest upload. After releasing and installing `0.2.4`, verify
+the persisted lock/session/baseline, VPN readiness, and the next real 03:00–04:45 daily.
+There is deliberately no manual same-day backfill. The DO host watchdog update is a
+separate deployment: it suppresses only duplicate `missing_daily_digest` reminders;
+all other monitor and digest errors remain alerting.
 
 ## Incident response
 

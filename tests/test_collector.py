@@ -1403,5 +1403,157 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(path.exists(), str(path))
 
 
+class TestBugMonitorDigestStarvation20260814(
+        unittest.IsolatedAsyncioTestCase):
+    """A hung mention batch must not consume the whole daily digest window."""
+
+    @staticmethod
+    def sequenced_transport(paths, *values):
+        class SequencedTransport(FakeTransport):
+            def __init__(self):
+                super().__init__(paths, values[0])
+                self._values = list(values)
+
+            async def gate(self, source_id, chat_ids, revoked):
+                self.trace.append("status")
+                self.gate_calls += 1
+                if source_id != SOURCE_ID or chat_ids != CHAT_IDS or revoked.is_set():
+                    raise AssertionError("invalid status binding")
+                index = min(self.gate_calls - 1, len(self._values) - 1)
+                return copy.deepcopy(self._values[index])
+
+        return SequencedTransport()
+
+    async def test_due_digest_runs_after_active_monitor_timeout_with_fresh_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+
+            class HangingMonitorGateway(FakeGateway):
+                async def snapshot_and_scan_mentions(self, *_args):
+                    await asyncio.Event().wait()
+
+            gateway = HangingMonitorGateway(paths)
+            transport = FakeTransport(paths, gate(digest_due=True))
+            digest_calls = []
+            collector = collector_for(paths, gateway, transport, digest_calls)
+
+            with patch.object(
+                    collector_module, "TELEGRAM_FETCH_TIMEOUT_S", 0.01):
+                result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            self.assertEqual(result["last_error_type"], "TimeoutError")
+            self.assertEqual(result["failed_chat_count"], len(CHAT_IDS))
+            self.assertEqual(transport.gate_calls, 2)
+            self.assertEqual(len(digest_calls), 1)
+            self.assertEqual(len(transport.digest_uploads), 1)
+            self.assertFalse(paths.monitor_pending.exists())
+
+    async def test_monitor_timeout_before_active_phase_never_runs_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="activation_requested")
+
+            class HangingBaselineGateway(FakeGateway):
+                async def snapshot_tops(self, *_args):
+                    await asyncio.Event().wait()
+
+            gateway = HangingBaselineGateway(paths)
+            transport = FakeTransport(paths, gate(
+                baseline_required=True, digest_due=True,
+            ))
+            digest_calls = []
+            collector = collector_for(paths, gateway, transport, digest_calls)
+
+            with patch.object(
+                    collector_module, "TELEGRAM_FETCH_TIMEOUT_S", 0.01):
+                result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "error")
+            self.assertEqual(result["last_error_type"], "TimeoutError")
+            self.assertEqual(digest_calls, [])
+            self.assertEqual(transport.digest_uploads, [])
+
+    async def test_fresh_not_due_gate_after_timeout_never_fetches_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+
+            class HangingMonitorGateway(FakeGateway):
+                async def snapshot_and_scan_mentions(self, *_args):
+                    await asyncio.Event().wait()
+
+            gateway = HangingMonitorGateway(paths)
+            transport = self.sequenced_transport(
+                paths, gate(digest_due=True), gate(digest_due=False),
+            )
+            digest_calls = []
+            collector = collector_for(paths, gateway, transport, digest_calls)
+
+            with patch.object(
+                    collector_module, "TELEGRAM_FETCH_TIMEOUT_S", 0.01):
+                result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "watched_not_due")
+            self.assertEqual(result["last_error_type"], "TimeoutError")
+            self.assertEqual(digest_calls, [])
+            self.assertEqual(gateway.bootstrap_calls, [])
+            self.assertEqual(gateway.fetch_calls, [])
+            self.assertEqual(transport.digest_uploads, [])
+
+    async def test_fresh_digest_chain_jump_still_blocks_all_digest_work(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+
+            class HangingMonitorGateway(FakeGateway):
+                async def snapshot_and_scan_mentions(self, *_args):
+                    await asyncio.Event().wait()
+
+            jumped = gate(
+                digest_due=True, digest_sequence=2,
+                digest_previous="a" * 64,
+            )
+            gateway = HangingMonitorGateway(paths)
+            transport = self.sequenced_transport(
+                paths, gate(digest_due=True), jumped,
+            )
+            digest_calls = []
+            collector = collector_for(paths, gateway, transport, digest_calls)
+
+            with patch.object(
+                    collector_module, "TELEGRAM_FETCH_TIMEOUT_S", 0.01):
+                result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "error")
+            self.assertEqual(result["last_error_type"], "RuntimeError")
+            self.assertEqual(result["failed_chat_count"], len(CHAT_IDS))
+            self.assertEqual(digest_calls, [])
+            self.assertEqual(gateway.bootstrap_calls, [])
+            self.assertEqual(gateway.fetch_calls, [])
+            self.assertEqual(transport.digest_uploads, [])
+
+    async def test_revocation_cancellation_during_monitor_never_runs_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+
+            class CancelledMonitorGateway(FakeGateway):
+                async def snapshot_and_scan_mentions(self, *_args):
+                    raise asyncio.CancelledError
+
+            gateway = CancelledMonitorGateway(paths)
+            transport = FakeTransport(paths, gate(digest_due=True))
+            digest_calls = []
+            result = await collector_for(
+                paths, gateway, transport, digest_calls,
+            ).run_once()
+
+            self.assertEqual(result["last_result"], "revoked")
+            self.assertEqual(digest_calls, [])
+            self.assertEqual(transport.digest_uploads, [])
+
+
 if __name__ == "__main__":
     unittest.main()

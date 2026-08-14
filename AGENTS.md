@@ -40,6 +40,13 @@ runtime configuration.
   before pending bytes are deleted. Receiver rollback or chain jumps must fail
   before Telegram access. The two streams remain independent so a failed daily
   digest cannot block mention delivery or read acknowledgements.
+- Peer work uses one Telegram client with at most four concurrent whole-peer units;
+  each unit gets a 30-second deadline after acquiring the semaphore, results retain
+  locked-peer order, and cancellation must cancel and join every sibling before a
+  cancellation-resistant disconnect. Only aggregate `TimeoutError` from an already
+  active monitor may continue to digest, after reloading durable phase and taking a
+  fresh authenticated gate. Baseline, chain/pending failures, and cancellation remain
+  fail-closed.
 - Every minute run obtains an authenticated remote monitor gate before Telegram
   access. OpenRouter and the daily history scan additionally require
   `digest.due: true`. Consent is checked locally before the gate and against the
@@ -64,7 +71,12 @@ runtime configuration.
   Read-ACK always uses the exact peer and a bounded `max_id`.
 - Every OpenRouter request must set `provider.zdr=true` and
   `provider.data_collection=deny`; account/key privacy controls remain defence
-  in depth and may not replace the per-request guard.
+  in depth and may not replace the per-request guard. Opus must use explicit
+  `max_tokens>=16384` so adaptive thinking cannot consume the usable response budget.
+- The receiver daily window is exactly 03:00–04:45 inclusive in its authenticated
+  IANA timezone, with no same-day catch-up. Sunny `chats` emits one durable
+  `missing_daily_digest` per local date; the host watchdog suppresses only that
+  duplicate code and must keep alerting every other monitor/digest failure.
 - SSH must use the generated dedicated Ed25519 key and the exact pinned
   `known_hosts` entry. Never add `StrictHostKeyChecking=no` or `ssh-keyscan`.
 - Do not add host networking, raw ports, Docker socket mounts, `privileged`,

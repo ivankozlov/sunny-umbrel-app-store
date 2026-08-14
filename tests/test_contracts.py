@@ -415,6 +415,18 @@ class TestBugOpenRouterPrivacy20260810(unittest.TestCase):
         self.assertEqual(request.get_header("X-title"), "Sunny Personal Chats")
 
 
+class TestBugOpusDigestBudget20260814(unittest.TestCase):
+    """Opus reasoning must not consume the whole bounded response budget."""
+
+    def test_opus_request_has_explicit_reasoning_safe_output_budget(self):
+        with patch("sunny_digest.openrouter.urllib.request.urlopen",
+                   return_value=FakeResponse("Готово")) as urlopen:
+            _blocking_digest([], "anthropic/claude-opus-4.8", "secret")
+
+        body = json.loads(urlopen.call_args.args[0].data)
+        self.assertGreaterEqual(body["max_tokens"], 16_384)
+
+
 class OpenRouterProcessTests(unittest.IsolatedAsyncioTestCase):
     async def test_revocation_terminates_blocking_openrouter_worker_process(self):
         worker = FakeHungWorker()

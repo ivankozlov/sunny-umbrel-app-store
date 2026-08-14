@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Chats
-version: "0.2.3"
+version: "0.2.4"
 tagline: Mentions, read receipts, and one digest for selected chats
 description: >-
   Resolves message links for only the explicitly selected Telegram groups,
@@ -18,10 +18,10 @@ description: >-
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  Fixes pinned HTTPS downloads on Python 3.12 and accepts strictly sanitized
-  Clash YAML subscriptions in addition to raw/base64 VLESS share-link lists.
-  Raw provider responses are never persisted. Telegram remains fail-closed
-  behind the app-scoped SOCKS client; the collector wire protocol remains 0.2.1.
+  Prevents a hung chat-monitor request from starving other selected chats or
+  the independent daily digest. It also raises the Opus output budget and
+  removes duplicate missing-digest watchdog alerts. The collector wire
+  protocol remains 0.2.1.
 
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store

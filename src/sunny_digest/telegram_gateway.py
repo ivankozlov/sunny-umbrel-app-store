@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -44,6 +45,43 @@ _MEDIA_TIMESTAMP = re.compile(
     r"(?:(?:[0-9]+h)?(?:[0-9]{1,2}m)?(?:[0-9]{1,2}s)?))"
 )
 _BASE64URL = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
+PEER_OPERATION_TIMEOUT_S = 30.0
+PEER_OPERATION_CONCURRENCY = 4
+
+
+async def _gather_peer_tasks(tasks):
+    """Cancel and join every peer task before its shared client disconnects."""
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        async def cancel_and_join() -> None:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        cleanup = asyncio.create_task(cancel_and_join())
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
+        raise
+
+
+async def _disconnect_client(client) -> None:
+    """Finish disconnect even if cancellation arrives during cleanup."""
+    cleanup = asyncio.ensure_future(client.disconnect())
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+    cleanup.result()
+    if cancelled:
+        raise asyncio.CancelledError()
 
 
 def _positive_decimal(value: str, label: str, *, maximum: int = 2**63 - 1) -> int:
@@ -520,28 +558,53 @@ class TelethonGateway:
         self._validate_selected_peers(pairs)
         _, utils, _, _, _, _, _ = self._modules()
         client = self._client(session_text)
-        await client.connect()
         try:
+            await client.connect()
             if not await client.is_user_authorized():
                 raise RuntimeError("Telegram session is not authorized")
             tops: Dict[int, int] = {}
             scans: Dict[int, MentionScanResult] = {}
             failed: List[int] = []
-            for chat_id, peer, title, start in selected:
-                try:
-                    top = (await self._snapshot_tops_connected(
-                        client, [(chat_id, peer)], utils))[chat_id]
+            semaphore = asyncio.Semaphore(PEER_OPERATION_CONCURRENCY)
+
+            async def scan_one(
+                    chat_id: int, peer: PeerSpec, title: str, start: int,
+            ) -> Tuple[int, Optional[int], Optional[MentionScanResult], bool]:
+                async with semaphore:
+                    try:
+                        async def peer_operation() -> Tuple[int, MentionScanResult]:
+                            top = (await self._snapshot_tops_connected(
+                                client, [(chat_id, peer)], utils))[chat_id]
+                            scan = await self._scan_mentions_connected(
+                                client, utils, peer, chat_id, title, source_id,
+                                start, top,
+                            )
+                            return top, scan
+
+                        top, scan = await asyncio.wait_for(
+                            peer_operation(), timeout=PEER_OPERATION_TIMEOUT_S,
+                        )
+                        return chat_id, top, scan, True
+                    except Exception:
+                        # Peer-local failures are intentionally redacted. One
+                        # stale access_hash or hanging RPC must not starve the
+                        # other locked chats.
+                        return chat_id, None, None, False
+
+            tasks = [
+                asyncio.create_task(scan_one(chat_id, peer, title, start))
+                for chat_id, peer, title, start in selected
+            ]
+            for chat_id, top, scan, succeeded in await _gather_peer_tasks(tasks):
+                if succeeded:
+                    assert top is not None and scan is not None
                     tops[chat_id] = top
-                    scans[chat_id] = await self._scan_mentions_connected(
-                        client, utils, peer, chat_id, title, source_id, start, top,
-                    )
-                except Exception:
-                    # Peer-local failures are intentionally redacted. One stale
-                    # access_hash must not starve the other locked chats.
+                    scans[chat_id] = scan
+                else:
                     failed.append(chat_id)
             return tops, scans, failed
         finally:
-            await client.disconnect()
+            await _disconnect_client(client)
 
     async def acknowledge_read(self, session_text: str, peer: PeerSpec,
                                through_message_id: int) -> None:
@@ -562,24 +625,39 @@ class TelethonGateway:
             if type(through_message_id) is not int or through_message_id < 0:
                 raise ValueError("Telegram read acknowledgement ID is invalid")
         client = self._client(session_text)
-        await client.connect()
         succeeded: List[int] = []
         failed: List[int] = []
         try:
+            await client.connect()
             if not await client.is_user_authorized():
                 raise RuntimeError("Telegram session is not authorized")
-            for chat_id, peer, through_message_id in acknowledgements:
-                try:
-                    await client.send_read_acknowledge(
-                        self._input_peer(peer), max_id=through_message_id,
-                        clear_mentions=True,
-                    )
-                    succeeded.append(chat_id)
-                except Exception:
-                    failed.append(chat_id)
+            semaphore = asyncio.Semaphore(PEER_OPERATION_CONCURRENCY)
+
+            async def acknowledge_one(
+                    chat_id: int, peer: PeerSpec, through_message_id: int,
+            ) -> Tuple[int, bool]:
+                async with semaphore:
+                    try:
+                        await asyncio.wait_for(
+                            client.send_read_acknowledge(
+                                self._input_peer(peer), max_id=through_message_id,
+                                clear_mentions=True,
+                            ),
+                            timeout=PEER_OPERATION_TIMEOUT_S,
+                        )
+                        return chat_id, True
+                    except Exception:
+                        return chat_id, False
+
+            tasks = [
+                asyncio.create_task(acknowledge_one(chat_id, peer, through_message_id))
+                for chat_id, peer, through_message_id in acknowledgements
+            ]
+            for chat_id, succeeded_one in await _gather_peer_tasks(tasks):
+                (succeeded if succeeded_one else failed).append(chat_id)
             return succeeded, failed
         finally:
-            await client.disconnect()
+            await _disconnect_client(client)
 
     async def bootstrap_cursor(self, session_text: str, peer: PeerSpec,
                                now: datetime) -> int:

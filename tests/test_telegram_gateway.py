@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sunny_digest.models import DigestChat, PeerSpec
 from sunny_digest.prompting import prompt_size, render_digest_prompt
@@ -686,6 +688,288 @@ class TelegramMonitorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed, [-2])
         self.assertEqual(list(scans), [-1])
         self.assertEqual(client.connect_calls, 1)
+
+
+class TestBugPeerTimeoutIsolation20260814(unittest.IsolatedAsyncioTestCase):
+    """One hanging peer must become a local failure, not cancel the whole batch."""
+
+    async def test_hung_first_scan_peer_does_not_block_second(self):
+        class IsolatingClient(FakeClient):
+            async def __call__(self, request):
+                requested = request.peers[0].peer
+                if requested == -2:
+                    await asyncio.Event().wait()
+                return SimpleNamespace(dialogs=[
+                    SimpleNamespace(peer=requested, top_message=0),
+                ])
+
+        class MultiGateway(GatewayUnderTest):
+            def _input_peer(self, peer):
+                return peer.telegram_chat_id()
+
+        client = IsolatingClient([], upper_id=None)
+        with patch(
+                "sunny_digest.telegram_gateway.PEER_OPERATION_TIMEOUT_S", 0.01):
+            _, scans, failed = await MultiGateway(
+                client,
+            ).snapshot_and_scan_mentions("session", "source", [
+                (-2, PeerSpec("chat", 2, None), "Hung", 0),
+                (-1, PeerSpec("chat", 1, None), "Good", 0),
+            ])
+
+        self.assertEqual(failed, [-2])
+        self.assertEqual(list(scans), [-1])
+        self.assertEqual(client.connect_calls, 1)
+        self.assertEqual(client.disconnect_calls, 1)
+
+    async def test_many_hung_scan_peers_cannot_starve_healthy_tail(self):
+        class IsolatingClient(FakeClient):
+            def __init__(self):
+                super().__init__([], upper_id=None)
+                self.active = 0
+                self.max_active = 0
+
+            async def __call__(self, request):
+                requested = request.peers[0].peer
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                try:
+                    if requested <= -5:
+                        await asyncio.Event().wait()
+                    return SimpleNamespace(dialogs=[
+                        SimpleNamespace(peer=requested, top_message=0),
+                    ])
+                finally:
+                    self.active -= 1
+
+        class MultiGateway(GatewayUnderTest):
+            def _input_peer(self, peer):
+                return peer.telegram_chat_id()
+
+        selected = [
+            (-index, PeerSpec("chat", index, None), f"Chat {index}", 0)
+            for index in range(16, 0, -1)
+        ]
+        client = IsolatingClient()
+        with patch(
+                "sunny_digest.telegram_gateway.PEER_OPERATION_TIMEOUT_S", 0.02):
+            _, scans, failed = await asyncio.wait_for(
+                MultiGateway(client).snapshot_and_scan_mentions(
+                    "session", "source", selected),
+                timeout=0.15,
+            )
+
+        self.assertEqual(failed, list(range(-16, -4)))
+        self.assertEqual(list(scans), [-4, -3, -2, -1])
+        self.assertEqual(client.max_active, 4)
+        self.assertEqual(client.disconnect_calls, 1)
+
+    async def test_hung_first_read_ack_does_not_block_second(self):
+        class IsolatingClient(FakeClient):
+            async def send_read_acknowledge(self, peer, **kwargs):
+                self.read_ack_calls.append((peer, kwargs))
+                if peer == -2:
+                    await asyncio.Event().wait()
+                return True
+
+        class MultiGateway(GatewayUnderTest):
+            def _input_peer(self, peer):
+                return peer.telegram_chat_id()
+
+        client = IsolatingClient([], upper_id=None)
+        with patch(
+                "sunny_digest.telegram_gateway.PEER_OPERATION_TIMEOUT_S", 0.01):
+            succeeded, failed = await MultiGateway(client).acknowledge_reads(
+                "session", [
+                    (-2, PeerSpec("chat", 2, None), 20),
+                    (-1, PeerSpec("chat", 1, None), 10),
+                ],
+            )
+
+        self.assertEqual(succeeded, [-1])
+        self.assertEqual(failed, [-2])
+        self.assertEqual([row[0] for row in client.read_ack_calls], [-2, -1])
+        self.assertEqual(client.connect_calls, 1)
+        self.assertEqual(client.disconnect_calls, 1)
+
+    async def test_many_hung_read_acks_cannot_starve_healthy_tail(self):
+        class IsolatingClient(FakeClient):
+            def __init__(self):
+                super().__init__([], upper_id=None)
+                self.active = 0
+                self.max_active = 0
+
+            async def send_read_acknowledge(self, peer, **kwargs):
+                self.read_ack_calls.append((peer, kwargs))
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                try:
+                    if peer <= -5:
+                        await asyncio.Event().wait()
+                    return True
+                finally:
+                    self.active -= 1
+
+        class MultiGateway(GatewayUnderTest):
+            def _input_peer(self, peer):
+                return peer.telegram_chat_id()
+
+        targets = [
+            (-index, PeerSpec("chat", index, None), index)
+            for index in range(16, 0, -1)
+        ]
+        client = IsolatingClient()
+        with patch(
+                "sunny_digest.telegram_gateway.PEER_OPERATION_TIMEOUT_S", 0.02):
+            succeeded, failed = await asyncio.wait_for(
+                MultiGateway(client).acknowledge_reads("session", targets),
+                timeout=0.15,
+            )
+
+        self.assertEqual(failed, list(range(-16, -4)))
+        self.assertEqual(succeeded, [-4, -3, -2, -1])
+        self.assertEqual(client.max_active, 4)
+        self.assertEqual(client.disconnect_calls, 1)
+
+    async def test_cancelled_scan_batch_joins_siblings_before_disconnect(self):
+        class CancellingClient(FakeClient):
+            def __init__(self):
+                super().__init__([], upper_id=None)
+                self.started = asyncio.Event()
+                self.started_count = 0
+                self.cancelled = []
+
+            async def __call__(self, request):
+                requested = request.peers[0].peer
+                self.started_count += 1
+                if self.started_count == 2:
+                    self.started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled.append(requested)
+                    raise
+
+        class MultiGateway(GatewayUnderTest):
+            def _input_peer(self, peer):
+                return peer.telegram_chat_id()
+
+        client = CancellingClient()
+        task = asyncio.create_task(
+            MultiGateway(client).snapshot_and_scan_mentions(
+                "session", "source", [
+                    (-2, PeerSpec("chat", 2, None), "Two", 0),
+                    (-1, PeerSpec("chat", 1, None), "One", 0),
+                ],
+            ),
+        )
+        await asyncio.wait_for(client.started.wait(), timeout=0.1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(sorted(client.cancelled), [-2, -1])
+        self.assertEqual(client.disconnect_calls, 1)
+
+    async def test_cancelled_ack_batch_joins_siblings_before_disconnect(self):
+        class CancellingClient(FakeClient):
+            def __init__(self):
+                super().__init__([], upper_id=None)
+                self.started = asyncio.Event()
+                self.started_count = 0
+                self.cancelled = []
+
+            async def send_read_acknowledge(self, peer, **kwargs):
+                self.read_ack_calls.append((peer, kwargs))
+                self.started_count += 1
+                if self.started_count == 2:
+                    self.started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled.append(peer)
+                    raise
+
+        class MultiGateway(GatewayUnderTest):
+            def _input_peer(self, peer):
+                return peer.telegram_chat_id()
+
+        client = CancellingClient()
+        task = asyncio.create_task(MultiGateway(client).acknowledge_reads(
+            "session", [
+                (-2, PeerSpec("chat", 2, None), 20),
+                (-1, PeerSpec("chat", 1, None), 10),
+            ],
+        ))
+        await asyncio.wait_for(client.started.wait(), timeout=0.1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(sorted(client.cancelled), [-2, -1])
+        self.assertEqual(client.disconnect_calls, 1)
+
+    async def test_cancelled_connect_still_disconnects_partial_client(self):
+        class ConnectingClient(FakeClient):
+            def __init__(self):
+                super().__init__([], upper_id=None)
+                self.connect_started = asyncio.Event()
+
+            async def connect(self):
+                self.connect_calls += 1
+                self.connected = True
+                self.connect_started.set()
+                await asyncio.Event().wait()
+
+        client = ConnectingClient()
+        task = asyncio.create_task(GatewayUnderTest(
+            client,
+        ).snapshot_and_scan_mentions("session", "source", [
+            (CHAT_ID, PeerSpec("channel", 100123, 998877), "Chat", 0),
+        ]))
+        await asyncio.wait_for(client.connect_started.wait(), timeout=0.1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertFalse(client.connected)
+
+    async def test_repeated_cancel_waits_for_disconnect_to_finish(self):
+        class SlowDisconnectClient(FakeClient):
+            def __init__(self):
+                super().__init__([], upper_id=None)
+                self.disconnect_started = asyncio.Event()
+                self.allow_disconnect = asyncio.Event()
+
+            def disconnect(self):
+                self.disconnect_calls += 1
+                self.disconnect_started.set()
+
+                async def finish():
+                    await self.allow_disconnect.wait()
+                    self.connected = False
+
+                return asyncio.shield(asyncio.create_task(finish()))
+
+        client = SlowDisconnectClient()
+        task = asyncio.create_task(GatewayUnderTest(
+            client,
+        ).snapshot_and_scan_mentions("session", "source", [
+            (CHAT_ID, PeerSpec("channel", 100123, 998877), "Chat", 0),
+        ]))
+        await asyncio.wait_for(client.disconnect_started.wait(), timeout=0.1)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        client.allow_disconnect.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertFalse(client.connected)
 
 
 class TestBugTrustedLookback20260810(unittest.IsolatedAsyncioTestCase):
