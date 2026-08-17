@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import email.message
 import json
+import os
 import unittest
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -378,14 +381,14 @@ class ContractTests(unittest.TestCase):
 
     def test_openrouter_uses_same_3700_boundary(self):
         self.assertIn("at most 3400 UTF-16 code units", _prompt([]))
-        with patch("sunny_digest.openrouter.urllib.request.urlopen",
+        with patch("urllib.request.OpenerDirector.open",
                    return_value=FakeResponse("x" * MAX_DIGEST_CHARS)):
             self.assertEqual(
                 len(_blocking_digest([], "anthropic/example", "secret")),
                 MAX_DIGEST_CHARS,
             )
         for invalid in ("x" * (MAX_DIGEST_CHARS + 1), "unsafe\u2066text"):
-            with patch("sunny_digest.openrouter.urllib.request.urlopen",
+            with patch("urllib.request.OpenerDirector.open",
                        return_value=FakeResponse(invalid)):
                 with self.assertRaises(OpenRouterError):
                     _blocking_digest([], "anthropic/example", "secret")
@@ -404,7 +407,7 @@ class ContractTests(unittest.TestCase):
 
 class TestBugOpenRouterPrivacy20260810(unittest.TestCase):
     def test_every_request_denies_collection_and_requires_zdr(self):
-        with patch("sunny_digest.openrouter.urllib.request.urlopen",
+        with patch("urllib.request.OpenerDirector.open",
                    return_value=FakeResponse("Готово")) as urlopen:
             _blocking_digest([], "anthropic/example", "secret")
         request = urlopen.call_args.args[0]
@@ -415,11 +418,78 @@ class TestBugOpenRouterPrivacy20260810(unittest.TestCase):
         self.assertEqual(request.get_header("X-title"), "Sunny Personal Chats")
 
 
+class TestBugOpenRouterDirectEgress20260817(unittest.TestCase):
+    """Инцидент 2026-08-17: запрос к OpenRouter уходил мимо VPN.
+
+    Telegram ходил через SOCKS-listener Mihomo, а digest-запрос — обычным
+    urlopen напрямую, и фильтр на маршруте отвечал HTTP 403 «Access denied by
+    security policy». Внешне это выглядело отказом OpenRouter: monitor
+    зелёный, digest падает OpenRouterError каждые пять минут, дайджест не
+    пришёл ни разу с момента активации."""
+
+    def _sent_request(self, env=None):
+        """Прогон по НАСТОЯЩЕМУ opener'у: подменяется только сокетный слой.
+
+        Мок build_opener проверял бы намерение, а не маршрут — реальный путь
+        зависит ещё и от bypass-логики urllib."""
+        sent = []
+
+        class _Response(FakeResponse):
+            """FakeResponse + минимум полей, которых ждут обработчики urllib."""
+            code = 200
+            msg = "OK"
+
+            def info(self):
+                return email.message.Message()
+
+        def https_open(_self, req):
+            sent.append(req)
+            return _Response("Готово")
+
+        with patch.dict(os.environ, env or {}):
+            with patch("urllib.request.HTTPSHandler.https_open", https_open):
+                _blocking_digest([], "anthropic/example", "secret")
+        return sent[0]
+
+    def test_request_goes_through_mihomo_http_proxy(self):
+        from sunny_digest.mihomo import MIHOMO_HTTP_PORT, MIHOMO_SOCKS_HOST
+        from sunny_digest.openrouter import OPENROUTER_PROXY
+
+        self.assertEqual(
+            OPENROUTER_PROXY, f"{MIHOMO_SOCKS_HOST}:{MIHOMO_HTTP_PORT}")
+
+        request = self._sent_request()
+        # CONNECT на loopback Mihomo, TLS — сквозной до openrouter.ai
+        self.assertEqual(request.host, OPENROUTER_PROXY)
+        self.assertEqual(request._tunnel_host, "openrouter.ai")
+
+    def test_no_proxy_in_environment_cannot_return_the_request_to_direct(self):
+        """`no_proxy=*` не должен возвращать запрос на прямой путь.
+
+        Через ProxyHandler это происходило бы молча: он спрашивает
+        proxy_bypass, и переменная окружения отменила бы весь смысл пиннинга —
+        запрос снова ушёл бы мимо туннеля и получил 403."""
+        from sunny_digest.openrouter import OPENROUTER_PROXY
+
+        request = self._sent_request({"no_proxy": "*", "NO_PROXY": "openrouter.ai",
+                                      "https_proxy": "http://198.51.100.7:9"})
+        self.assertEqual(request.host, OPENROUTER_PROXY)
+        self.assertEqual(request._tunnel_host, "openrouter.ai")
+
+    def test_redirects_are_refused_so_the_key_cannot_leave_the_tunnel(self):
+        """Редирект создаётся новым Request без нашего прокси; на http:// он
+        унёс бы bearer-ключ открытым текстом мимо туннеля."""
+        from sunny_digest.openrouter import _RefuseRedirects
+
+        self.assertIsNone(_RefuseRedirects().redirect_request(
+            None, None, 302, "Found", {}, "http://openrouter.ai/v1/x"))
+
+
 class TestBugOpusDigestBudget20260814(unittest.TestCase):
     """Opus reasoning must not consume the whole bounded response budget."""
 
     def test_opus_request_has_explicit_reasoning_safe_output_budget(self):
-        with patch("sunny_digest.openrouter.urllib.request.urlopen",
+        with patch("urllib.request.OpenerDirector.open",
                    return_value=FakeResponse("Готово")) as urlopen:
             _blocking_digest([], "anthropic/claude-opus-4.8", "secret")
 

@@ -14,6 +14,18 @@ from .storage import canonical_json_bytes
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Запрос обязан идти через тот же VPN, что и Telegram. Прямой выход из
+# домашней сети возвращает HTTP 403 от фильтра на маршруте, и дайджест не
+# собирается ни разу (инцидент 2026-08-17: monitor работал, digest падал
+# OpenRouterError каждые пять минут). Прокси — HTTP-listener Mihomo; DIRECT
+# fallback'а здесь нет и быть не должно: без туннеля запрос всё равно не
+# пройдёт, а тихий обход маскировал бы поломку VPN.
+#
+# Пиннится на самом Request через set_proxy, а НЕ через ProxyHandler: тот
+# спрашивает urllib.request.proxy_bypass, и `no_proxy=*` в окружении вернул бы
+# запрос на прямой путь — то есть ровно ту поломку, ради которой этот прокси и
+# появился, только молча.
+OPENROUTER_PROXY = "127.0.0.1:7892"
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_WORKER_REQUEST_BYTES = 128 * 1024
 WORKER_SCHEMA = "sunny.personal-chats.openrouter-worker.v2"
@@ -22,6 +34,18 @@ WORKER_TERMINATE_GRACE_S = 2.0
 
 class OpenRouterError(RuntimeError):
     pass
+
+
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Не следовать за 3xx.
+
+    Редирект создаётся новым Request без нашего set_proxy, поэтому поход по
+    Location ушёл бы мимо туннеля, а на `http://` унёс бы ещё и bearer-ключ
+    открытым текстом. Легитимных редиректов у completions-эндпоинта нет:
+    отказ превращается в HTTPError и дальше в OpenRouterError."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def _prompt(chats: List[DigestChat]) -> str:
@@ -58,8 +82,12 @@ def _blocking_digest_prompt(prompt: str, model: str, api_key: str) -> str:
             "X-Title": "Sunny Personal Chats",
         },
     )
+    # CONNECT на loopback-listener Mihomo; TLS до openrouter.ai остаётся
+    # сквозным, прокси видит только имя хоста, но не тело и не bearer-ключ.
+    request.set_proxy(OPENROUTER_PROXY, "https")
+    opener = urllib.request.build_opener(_RefuseRedirects())
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with opener.open(request, timeout=90) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except (urllib.error.URLError, TimeoutError) as exc:
         raise OpenRouterError(f"OpenRouter transport failed: {type(exc).__name__}") from None

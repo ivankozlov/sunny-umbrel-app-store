@@ -15,6 +15,7 @@ import sunny_digest.collector as collector_module
 from sunny_digest.collector import (
     Collector,
     DIALOG_CANDIDATES_SCHEMA,
+    RECENT_RUNS_LIMIT,
     VPNMigrationRequiredError,
     WATCH_STATE_SCHEMA,
 )
@@ -2221,6 +2222,144 @@ class TestBugMonitorDigestStarvation20260814(
             self.assertEqual(result["last_result"], "revoked")
             self.assertEqual(digest_calls, [])
             self.assertEqual(transport.digest_uploads, [])
+
+
+class TestRecentRunsJournal20260817(unittest.IsolatedAsyncioTestCase):
+    """Журнал прогонов в интерфейсе.
+
+    Статус описывает только последний тик и перезаписывается каждую минуту,
+    поэтому редкий отказ жил один тик: разбор падающего digest в августе
+    2026 занял день ровно из-за этого. Журнал делает историю видимой, не
+    вынося наружу ничего из переписки."""
+
+    def _collector(self, paths):
+        return collector_for(paths, FakeGateway(paths),
+                             FakeTransport(paths, gate()), [])
+
+    async def test_repeated_results_collapse_and_history_is_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            collector = self._collector(paths)
+
+            for _ in range(30):
+                collector._write_status(last_run_at="2026-08-17T10:00:00+00:00",
+                                        last_result="digest_cooldown",
+                                        last_error_type=None)
+            status = collector._write_status(
+                last_run_at="2026-08-17T10:05:00+00:00",
+                last_result="error", last_error_type="OpenRouterError")
+
+            runs = status["recent_runs"]
+            self.assertLessEqual(len(runs), RECENT_RUNS_LIMIT)
+            # тридцать одинаковых тиков — одна строка со счётчиком, иначе
+            # ошибка вытеснялась бы из журнала ещё до того, как её увидят
+            cooldowns = [row for row in runs if row["result"] == "digest_cooldown"]
+            self.assertEqual(len(cooldowns), 1)
+            self.assertEqual(cooldowns[0]["repeated"], 30)
+            self.assertEqual(runs[-1]["result"], "error")
+            self.assertEqual(runs[-1]["error_type"], "OpenRouterError")
+
+    async def test_journal_survives_status_rewrites_and_carries_no_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            self._collector(paths)._write_status(
+                last_run_at="2026-08-17T10:00:00+00:00",
+                last_result="error", last_error_type="OpenRouterError")
+            # другой инстанс читает журнал с диска, а не начинает с нуля
+            status = await self._collector(paths).public_status()
+
+            runs = status["recent_runs"]
+            failures = [row for row in runs if row["result"] == "error"]
+            self.assertEqual(failures[-1]["error_type"], "OpenRouterError")
+            self.assertEqual(failures[-1]["at"], "2026-08-17T10:00:00+00:00")
+            self.assertEqual(
+                set(failures[-1]) - {"repeated"},
+                {"at", "result", "error_type", "message_count", "failed_chat_count"},
+            )
+
+    async def test_distinct_outcomes_are_bounded_and_status_stays_small(self):
+        """Граница журнала проверяется РАЗНЫМИ исходами: серия одинаковых
+        схлопывается в одну строку и предела не достигает вовсе."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            collector = self._collector(paths)
+
+            for index in range(RECENT_RUNS_LIMIT * 3):
+                collector._write_status(
+                    last_run_at=f"2026-08-17T03:{index % 60:02d}:00+00:00",
+                    last_result="error" if index % 2 else "watched_not_due",
+                    last_error_type="OpenRouterError" if index % 2 else None)
+
+            status = json.loads(paths.status.read_text(encoding="utf-8"))
+            self.assertEqual(len(status["recent_runs"]), RECENT_RUNS_LIMIT)
+            # статус читается с лимитом 16 КБ — журнал обязан в него влезать
+            self.assertLess(len(paths.status.read_bytes()), 16 * 1024)
+
+    async def test_non_run_entries_carry_own_time_and_no_inherited_error(self):
+        """Ревью 2026-08-17: запись «starting» после ночного падения брала
+        время и тип ошибки предыдущего прогона — журнал показывал отказ,
+        которого не было, да ещё и датированный чужим часом."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            self._collector(paths)._write_status(
+                last_run_at="2026-08-17T03:05:00+00:00", last_result="error",
+                last_error_type="OpenRouterError", failed_chat_count=2)
+            # рестарт контейнера: конструктор пишет «starting» без last_run_at
+            status = await self._collector(paths).public_status()
+
+            starting = [row for row in status["recent_runs"]
+                        if row["result"] == "starting"][-1]
+            self.assertIsNone(starting["error_type"])
+            self.assertIsNone(starting["failed_chat_count"])
+            self.assertNotEqual(starting["at"], "2026-08-17T03:05:00+00:00")
+
+    async def test_peer_failure_spike_is_not_collapsed_away(self):
+        """Ревью 2026-08-17: схлопывание шло только по result/error_type, и
+        одиночный тик, где отвалились все peer'ы, исчезал внутри длинной серии
+        одинаковых исходов — то есть ровно та редкая ошибка, ради которой
+        журнал и заводился."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            collector = self._collector(paths)
+
+            collector._write_status(last_run_at="2026-08-17T03:00:00+00:00",
+                                    last_result="digest_cooldown",
+                                    last_error_type=None, failed_chat_count=0)
+            collector._write_status(last_run_at="2026-08-17T03:01:00+00:00",
+                                    last_result="digest_cooldown",
+                                    last_error_type=None, failed_chat_count=16)
+            status = collector._write_status(
+                last_run_at="2026-08-17T03:02:00+00:00",
+                last_result="digest_cooldown", last_error_type=None,
+                failed_chat_count=0)
+
+            spikes = [row for row in status["recent_runs"]
+                      if row.get("failed_chat_count") == 16]
+            self.assertEqual(len(spikes), 1)
+
+    async def test_broken_repeated_value_from_disk_cannot_crash_the_write(self):
+        """`repeated` приходит из файла статуса; строка вместо числа роняла бы
+        планировщик на int()."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            collector = self._collector(paths)
+            collector._write_status(last_result="watched_not_due",
+                                    last_error_type=None)
+            poisoned = json.loads(paths.status.read_text(encoding="utf-8"))
+            poisoned["recent_runs"][-1]["repeated"] = "очень много"
+            paths.status.write_text(json.dumps(poisoned), encoding="utf-8")
+
+            # тот же коллектор: он перечитывает статус с диска, а новый
+            # экземпляр вписал бы «starting» и разорвал серию
+            status = collector._write_status(
+                last_result="watched_not_due", last_error_type=None)
+            self.assertEqual(status["recent_runs"][-1]["repeated"], 2)
 
 
 if __name__ == "__main__":

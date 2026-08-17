@@ -1,6 +1,7 @@
 # Sunny Personal Chats for Umbrel
 
-Community App Store package for a narrowly scoped Telegram user-session client.
+Umbrel package for a narrowly scoped Telegram user-session client. It was released
+through a Community App Store, but public distribution was withdrawn on 2026-08-14.
 It watches 1–16 immutable groups/supergroups, clears read state about once a
 minute, forwards bounded native-mention events to Sunny, and creates one combined
 daily digest through OpenRouter.
@@ -14,15 +15,20 @@ The app/package/image ID remains `sunny-personal-digest` for release continuity;
 the v0.2 product name is **Sunny Personal Chats**. v0.2 is a breaking credential
 generation and does not migrate the unpublished v0.1 pilot state.
 
-The current enabled app release is `0.2.4`, pinned for both services at
-`sha256:3a5b9f9b6e3eab67f0e18df53443fed0907f2cadc6a3bf4d1cccec69f0ea1685`.
-The physical Umbrel runs `0.2.4`: seven exact peers, the receiver generation,
-durable baseline, session, and monitoring state remain intact. That release prevents
-an aggregate monitor timeout from starving the independent digest path, but live
-diagnosis then found the persisted VLESS route resetting Telegram's initial MTProto
-exchange. `0.2.5` is the disabled, placeholder-pinned source candidate for replacing
-that route in place; it is not published or installable yet. Wire
+The physical Umbrel runs `0.2.5`: seven exact peers, the receiver generation,
+durable baseline, session, and active monitoring state survived the update and a
+subsequent reboot. The locked-state VPN replacement authorized Telegram through the
+first tested route; pending uploads and peer errors were both zero after reboot. The
+first real 03:00–04:45 daily after that replacement has not yet been observed. Wire
 `COLLECTOR_VERSION` remains `0.2.1`.
+
+The Store repository is now private and the public GHCR package has been deleted.
+The installed app starts from its local image cache. Do not use Umbrel **Update**,
+uninstall/reinstall, or Docker image pruning until the snapshot has been restored into
+runtime-usable local Docker or an explicitly approved private registry and the real
+recreate/pull path has been verified. The `umbrel/` subtree of private source repository
+`ivankozlov/sunny/main` deliberately remains a disabled, placeholder-pinned Phase-A
+candidate; the separate private Store `main` retains the historical enabled release.
 
 ## Product contract
 
@@ -157,8 +163,10 @@ Telegram, acknowledge that action in the UI, and provision a fresh credential ep
    allowlist as far as practical.
 4. Obtain the DO Ed25519 SSH host-key line through an independent trusted channel.
    Never bootstrap trust with `ssh-keyscan` on the Umbrel.
-5. Complete the public repository/image release gate below.
-6. Install **Sunny Personal Chats** from the Community App Store. The additional
+5. If public distribution is explicitly reopened, complete the repository/image
+   release gate below with a new immutable version. There is currently no anonymous
+   Community App Store install or GHCR pull path.
+6. Install **Sunny Personal Chats** only from that verified source. The additional
    username is `sunny`; Umbrel displays the deterministic app password.
 7. Enter Telegram/VPN/OpenRouter/SSH settings and consent. VPN-source validation,
    any required subscription download/DNS pinning, Mihomo startup, and SOCKS readiness finish before
@@ -239,26 +247,42 @@ Open `http://127.0.0.1:18080/` and authenticate as `sunny` / `test-only`.
 Use the fixture phases to inspect login, message-link confirmation, locked, and
 activation screens.
 
-## Two-phase GitHub/GHCR release
+## Two-phase GitHub/GHCR release (only if explicitly reopened)
 
-The target repository is
-`https://github.com/ivankozlov/sunny-umbrel-app-store`. Both the repository and
-`ghcr.io/ivankozlov/sunny-personal-digest` must be public so umbrelOS can clone and
-pull without registry credentials.
+Anonymous umbrelOS install/update requires both a public Store repository and a
+public `ghcr.io/ivankozlov/sunny-personal-digest` image. Those surfaces were closed
+on 2026-08-14: the Store is private and the public GHCR package is absent. Do not
+silently republish either one.
 
-The `0.2.4` release followed this exact sequence: disabled source first, the
-protected `Publish image` workflow with `bootstrap_empty_package=false`, independent
-public OCI verification for `linux/amd64` and `linux/arm64`, and only then the exact
-digest pin plus `disabled: false`. `0.2.5` is currently at the first phase only:
-its manifest is disabled and both image references intentionally contain the release
-placeholder. It is not a release until publish, independent OCI verification, digest
-pinning, and the separate enabling commit all succeed. Future versions must repeat
-the same sequence.
+The enabled `0.2.5` release previously followed this exact sequence: disabled source
+first, the protected `Publish image` workflow with `bootstrap_empty_package=false`,
+independent public OCI verification for `linux/amd64` and `linux/arm64`, and only then
+the exact digest pin plus `disabled: false`. Its enabled Store commit and OCI index are
+preserved in the offline recovery snapshot described below. The `umbrel/` subtree of
+the private source repository `ivankozlov/sunny/main` still carries `disabled: true`
+and the release placeholder intentionally; the separate private Store `main` retains
+the historical enabled commit. Any future republication must use a new semver/tag and
+repeat the full sequence.
 Wire `COLLECTOR_VERSION` deliberately stays `0.2.1` until an explicit chain migration.
 Run `python3 scripts/check_package.py --release` before every enabling commit.
 
 Never overwrite a version tag, use a mutable tag without its digest, or enable the
-app before both the repository and image are public.
+app before both the repository and image are available through the explicitly approved
+distribution path.
+
+## Offline recovery after public withdrawal
+
+The verified owner snapshot is
+`~/Downloads/Sunny-recovery-2026-08-14` on the development Mac. It contains git
+bundles/source snapshots, the enabled Store commit
+`fed43bacfdb82ebb5bccc17036314db6ce0b2d85`, and multi-architecture OCI index
+`sha256:b7a68169b37e884ed2b1cd0d17e24b4278fe1c9119ba2bd36268d6759631cea7`.
+Run `shasum -a 256 -c SHA256SUMS` inside that directory before recovery.
+
+The snapshot deliberately contains no Umbrel `data/private`, Telegram StringSession,
+credentials, or runtime state. Losing app-data therefore requires fresh Telegram
+authorization and receiver/key rotation; the source/image snapshot alone is not a
+seamless credential backup.
 
 ## Rollout boundary
 
@@ -273,14 +297,15 @@ duplicate after retry, independent monitor/digest health, and then the first com
 daily digest.
 
 Production has completed setup, receiver rotation, activation, and the mention path
-with seven peers on `0.2.4`. The first daily, while `0.2.3` was installed on
+with seven peers. The first daily, while `0.2.3` was installed on
 2026-08-14, exposed monitor-timeout starvation before any digest upload; `0.2.4`
 shipped that isolation fix and the matching watchdog suppression. The next live run
 exposed a separate failure before peer access:
-the persisted route reset Telegram initialization. After releasing and installing
-`0.2.5`, submit the replacement subscription in the locked UI, verify a successful
-authorization probe, unchanged lock/session/baseline/checkpoints, active monitoring,
-and the next real 03:00–04:45 daily. There is deliberately no manual same-day backfill.
+the persisted route reset Telegram initialization. `0.2.5` was then installed; the
+replacement subscription passed authorization on the first tested route, preserved
+lock/session/baseline/checkpoints and active monitoring, and survived a reboot. The
+remaining live gate is the next real 03:00–04:45 daily. There is deliberately no
+manual same-day backfill.
 
 ## Incident response
 

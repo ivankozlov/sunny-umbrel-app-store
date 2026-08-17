@@ -1,9 +1,10 @@
 # Sunny Personal Chats — contributor rules
 
-This directory is designed to become the root of the public
-`ivankozlov/sunny-umbrel-app-store` repository. It must contain no production
-credentials, Telegram sessions, chat content, receiver keys, or rendered
-runtime configuration.
+This directory is the source snapshot used for the private
+`ivankozlov/sunny-umbrel-app-store` repository. Public distribution was withdrawn
+on 2026-08-14 and must not be reopened without explicit approval. The directory
+must contain no production credentials, Telegram sessions, chat content, receiver
+keys, or rendered runtime configuration.
 
 ## Security invariants
 
@@ -19,6 +20,15 @@ runtime configuration.
   keys, and unknown VLESS capabilities are rejected. Only freshly built
   allowlisted VLESS/REALITY TCP/Vision nodes may be tested or persisted. Every
   Telegram client remains SOCKS-only with no direct fallback.
+- Both egress paths go through the tunnel. Mihomo exposes two loopback
+  listeners: SOCKS on 7891 for Telegram and HTTP on 7892 for OpenRouter, and
+  readiness waits for both. The OpenRouter request pins that proxy explicitly
+  rather than reading `https_proxy` from the environment, and has no direct
+  fallback: without the tunnel it would not succeed anyway, and a silent bypass
+  would hide a broken VPN. On 2026-08-17 the digest request still went out
+  directly and a filter on the route answered HTTP 403 `Access denied by
+  security policy`, so no digest was ever produced — monitor stayed green while
+  digest failed `OpenRouterError` every five minutes.
 - Locked-state VPN repair preserves the Telegram session, immutable chat set,
   receiver generation, and durable monitor/digest state. It downloads before
   taking the run lock, then tests bounded candidates in provider order. Each
@@ -43,6 +53,13 @@ runtime configuration.
   network request and remains in config backups. Restoring config without private
   session material must require manual device revocation and acknowledgement before
   any new setup; never clear that marker merely because the session file is absent.
+- The status file describes only the latest tick and is rewritten every minute,
+  so a rare failure used to survive exactly one tick and was overwritten before
+  anyone saw it. A bounded journal of the last 20 runs — timestamp, result,
+  exception type, counters, with consecutive identical outcomes collapsed into a
+  repeat count — is kept in the status and rendered in the UI. It carries no
+  message text, chat titles, or senders, and is sanitized like every other
+  status field.
 - The web service never mounts `data/private` or `data/config`. Setup credentials
   necessarily transit its authenticated form and memory, but it does not persist
   them; its only disk view is redacted runtime state and the narrow Unix socket.
@@ -107,9 +124,15 @@ python3 scripts/check_package.py
 python3 -m compileall -q src tests scripts
 ```
 
-`scripts/check_package.py --release` must remain red until the real public
-multi-architecture GHCR digest replaces the release placeholder and the app
-manifest is enabled. The publish job stays `main`-only behind the protected
-`ghcr-release` Environment; privileged QEMU/BuildKit helpers remain digest-pinned.
+In the `umbrel/` subtree of the private source repository `ivankozlov/sunny/main`,
+`scripts/check_package.py --release` must remain red: the disabled manifest and release
+placeholder are the intentional closed-distribution Phase-A state. This does not
+describe the separate private Store `main`, which retains the historical enabled
+`v0.2.5` commit that passed the release gate. The public GHCR package is absent.
+Reopening distribution requires separate approval, a new semver/tag, a real
+independently verified multi-architecture digest, and a separate enabling commit;
+never overwrite the withdrawn `v0.2.5` tag. The publish job stays `main`-only behind
+the protected `ghcr-release` Environment;
+privileged QEMU/BuildKit helpers remain digest-pinned.
 The manifest's `defaultShell` stays pinned to `collector`, because VPN and
 session diagnostics require the private/config mounts absent from `web`.

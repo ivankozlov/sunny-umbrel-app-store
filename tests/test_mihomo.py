@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from sunny_digest.mihomo import (
+    MIHOMO_HTTP_PORT,
     MIHOMO_SOCKS_HOST,
     MIHOMO_SOCKS_PORT,
     MihomoExitedError,
@@ -151,6 +152,10 @@ class TestBugMihomoVlessRealityRuntime20260812(unittest.IsolatedAsyncioTestCase)
                 "allow-lan", "ipv6", "listeners", "log-level", "mode",
                 "proxies", "rules",
             })
+            # Два listener'а и ровно два: SOCKS для Telegram и HTTP для
+            # OpenRouter. Разные порты намеренно — Telegram-клиенту отдаётся
+            # только SOCKS, а digest-запрос физически не может уйти мимо
+            # туннеля (инцидент 2026-08-17).
             self.assertEqual(value["listeners"], [{
                 "listen": MIHOMO_SOCKS_HOST,
                 "name": "telegram-socks",
@@ -158,7 +163,14 @@ class TestBugMihomoVlessRealityRuntime20260812(unittest.IsolatedAsyncioTestCase)
                 "type": "socks",
                 "udp": False,
                 "users": [],
+            }, {
+                "listen": MIHOMO_SOCKS_HOST,
+                "name": "openrouter-http",
+                "port": MIHOMO_HTTP_PORT,
+                "type": "http",
+                "users": [],
             }])
+            self.assertNotEqual(MIHOMO_SOCKS_PORT, MIHOMO_HTTP_PORT)
             self.assertEqual(value["rules"], ["MATCH,vpn-active"])
             self.assertEqual(value["proxies"][0]["name"], "vpn-active")
             self.assertIs(value["proxies"][0]["udp"], False)
@@ -203,7 +215,12 @@ class TestBugMihomoVlessRealityRuntime20260812(unittest.IsolatedAsyncioTestCase)
             reader = FakeReader()
             writer = FakeWriter()
             create = AsyncMock(return_value=process)
-            connect = AsyncMock(side_effect=[OSError, (reader, writer)])
+            # Готовность требует ОБЕ пробы: SOCKS-рукопожатие для Telegram и
+            # TCP до HTTP-listener'а для OpenRouter. Раньше ждали только SOCKS,
+            # и digest-запрос мог уйти в ещё не поднятый порт.
+            connect = AsyncMock(side_effect=[
+                OSError, (reader, writer), (FakeReader(), FakeWriter()),
+            ])
             runtime = MihomoRuntime(
                 private_dir,
                 binary="/opt/mihomo/mihomo",
@@ -223,6 +240,9 @@ class TestBugMihomoVlessRealityRuntime20260812(unittest.IsolatedAsyncioTestCase)
                 await runtime.stop()
 
             self.assertEqual(create.await_count, 1)
+            probed_ports = [call.args[1] for call in connect.await_args_list]
+            self.assertEqual(probed_ports[-2:],
+                             [MIHOMO_SOCKS_PORT, MIHOMO_HTTP_PORT])
             args = create.await_args.args
             kwargs = create.await_args.kwargs
             self.assertEqual(runtime_root, Path(args[2]))
@@ -244,8 +264,12 @@ class TestBugMihomoVlessRealityRuntime20260812(unittest.IsolatedAsyncioTestCase)
                 "TMPDIR": str(paths.root),
                 "XDG_CONFIG_HOME": str(paths.root),
             })
-            self.assertEqual(connect.await_args_list[-1].args,
+            # SOCKS-проба идёт предпоследней: после неё раннер дополнительно
+            # убеждается, что поднят HTTP-listener (последний вызов).
+            self.assertEqual(connect.await_args_list[-2].args,
                              (MIHOMO_SOCKS_HOST, MIHOMO_SOCKS_PORT))
+            self.assertEqual(connect.await_args_list[-1].args,
+                             (MIHOMO_SOCKS_HOST, MIHOMO_HTTP_PORT))
             self.assertEqual(reader.requests, [2])
             self.assertEqual(writer.writes, [b"\x05\x01\x00"])
             self.assertTrue(writer.closed)
@@ -356,6 +380,39 @@ class TestBugMihomoVlessRealityRuntime20260812(unittest.IsolatedAsyncioTestCase)
             self.assertIsNotNone(process.returncode)
             self.assertFalse(runtime_root.exists())
             self.assertIsNone(runtime._process)
+
+    async def test_http_listener_failure_blocks_readiness(self):
+        """Живой SOCKS сам по себе не делает рантайм готовым.
+
+        Раньше готовность ждала только SOCKS, и digest-запрос мог уйти в ещё
+        не поднятый HTTP-listener — отказ выглядел бы отказом OpenRouter."""
+        with tempfile.TemporaryDirectory() as temporary:
+            process = FakeProcess()
+            # SOCKS отвечает всегда, HTTP-порт не поднимается никогда
+            def connect_side_effect(_host, port):
+                if port == MIHOMO_HTTP_PORT:
+                    raise OSError("connection refused")
+                return (FakeReader(), FakeWriter())
+
+            connect = AsyncMock(side_effect=connect_side_effect)
+            runtime = MihomoRuntime(
+                Path(temporary) / "private",
+                binary="/opt/mihomo/mihomo",
+                runtime_parent=Path(temporary),
+                startup_timeout=0.2,
+                stop_timeout=1,
+                probe_interval=0,
+            )
+
+            with patch("sunny_digest.mihomo.asyncio.create_subprocess_exec",
+                       AsyncMock(return_value=process)), \
+                    patch("sunny_digest.mihomo.asyncio.open_connection", connect):
+                with self.assertRaises(TimeoutError):
+                    await runtime.start(reality_node())
+                await runtime.stop()
+
+            self.assertIn(MIHOMO_HTTP_PORT,
+                          [call.args[1] for call in connect.await_args_list])
 
 
 if __name__ == "__main__":

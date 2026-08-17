@@ -148,6 +148,49 @@ def _hidden_csrf(csrf: str) -> str:
     return f'<input type="hidden" name="csrf" value="{_escape(csrf)}">'
 
 
+def _render_recent_runs(rows: Any) -> str:
+    """Журнал последних прогонов: время, исход, тип ошибки, счётчики.
+
+    Статус описывает только последний тик и перезаписывается каждую минуту,
+    поэтому редкая ошибка исчезала раньше, чем её успевали увидеть. Здесь
+    всё служебное и ничего из переписки: тексты, имена чатов и отправители
+    сюда не попадают by design. Значения санитизируются так же строго, как
+    остальные поля статуса — они приходят по IPC от collector'а."""
+    if not isinstance(rows, list) or not rows:
+        return ""
+    items = []
+    for row in rows[-20:]:
+        if not isinstance(row, dict):
+            continue
+        result = row.get("result")
+        result = (result if isinstance(result, str)
+                  and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", result)
+                  else "unknown")
+        error = row.get("error_type")
+        error = (error if isinstance(error, str)
+                 and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", error)
+                 else None)
+        at = row.get("at")
+        # Валидируем формой, а не длиной: произвольная 19-символьная строка
+        # печаталась бы как время. Смещение сохраняем — окно дайджеста задано
+        # в локальном времени, и «03:05» без пояса читается неоднозначно.
+        at = (at[:25] if isinstance(at, str)
+              and re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", at)
+              else "—")
+        repeated = row.get("repeated")
+        repeated = f" ×{int(repeated)}" if isinstance(repeated, int) and repeated > 1 else ""
+        failed = row.get("failed_chat_count")
+        failed = f", ошибок peer: {int(failed)}" if isinstance(failed, int) and failed else ""
+        suffix = f" — {_escape(error)}" if error else ""
+        items.append(
+            f"<li><code>{_escape(at)}</code> {_escape(result)}{_escape(repeated)}"
+            f"{suffix}{_escape(failed)}</li>")
+    if not items:
+        return ""
+    return ("<details><summary>Журнал прогонов</summary><ul class=\"runs\">"
+            + "".join(items) + "</ul></details>")
+
+
 def _safe_failure_notice(status: Dict[str, Any], exc: Exception) -> str:
     # IPC only exposes a bounded exception class name; never reflect its message.
     error_type = (
@@ -298,6 +341,7 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
             else "CollectorError" if error_value else None
         )
         error_row = f'<dt>Последняя ошибка</dt><dd>{_escape(error)}</dd>' if error else ""
+        recent_rows = _render_recent_runs(status.get("recent_runs"))
         repair_state_value = status.get("vpn_repair_state")
         repair_state = (
             repair_state_value
@@ -355,6 +399,7 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
   <dt>Проверено маршрутов</dt><dd>{repair_attempted}</dd>
   <dt>Ошибка замены VPN</dt><dd>{_escape(repair_error)}</dd>
 </dl>
+{recent_rows}
 <p class="muted">Добавьте этот публичный ключ в конфигурацию forced-command receiver’а Sunny:</p>
 <code>{_escape(status.get("upload_public_key") or "")}</code>
 <p class="muted">Fingerprint: {_escape(status.get("upload_key_fingerprint") or "—")}</p>

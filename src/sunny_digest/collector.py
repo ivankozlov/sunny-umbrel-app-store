@@ -81,6 +81,10 @@ TELEGRAM_DIALOG_TIMEOUT_S = 120
 TELEGRAM_FETCH_TIMEOUT_S = 180
 KEYGEN_TIMEOUT_S = 30
 OPENROUTER_TIMEOUT_S = 120
+# Глубина журнала прогонов в интерфейсе. Двадцати записей со схлопыванием
+# повторов хватает, чтобы увидеть ночное окно целиком; статус при этом
+# остаётся в пределах 16 КБ, которыми ограничено его чтение.
+RECENT_RUNS_LIMIT = 20
 VPN_SUBSCRIPTION_TIMEOUT_S = 30
 VPN_REPAIR_RUN_LOCK_TIMEOUT_S = 240
 VPN_REPAIR_TEST_TIMEOUT_S = 300
@@ -415,7 +419,7 @@ class Collector:
                 for key in (
                     "last_run_at", "last_result", "last_error_type",
                     "last_message_count", "last_through_message_id",
-                    "failed_chat_count",
+                    "failed_chat_count", "recent_runs",
                 ):
                     if key in previous:
                         status[key] = previous[key]
@@ -458,6 +462,8 @@ class Collector:
     def _write_status(self, **changes: Any) -> Dict[str, Any]:
         status = self._base_status()
         status.update(changes)
+        if "last_result" in changes:
+            status["recent_runs"] = self._append_recent_run(status, changes)
         allowed = {
             "schema", "phase", "configured", "chat_locked", "consent_active",
             "pending_digest_upload", "pending_monitor_upload", "source_id", "chats",
@@ -466,7 +472,7 @@ class Collector:
             "model", "upload_target", "consent_expires_at",
             "phone_masked", "dialogs", "selection_id", "last_run_at", "last_result",
             "last_error_type", "last_message_count", "last_through_message_id",
-            "failed_chat_count", "revocation_required",
+            "failed_chat_count", "revocation_required", "recent_runs",
             "vpn_configured", "vpn_ready", "vpn_migration_required",
             "vpn_repairing", "vpn_repair_state", "vpn_repair_attempted",
             "vpn_repair_error_type",
@@ -475,6 +481,57 @@ class Collector:
         atomic_write_json(self.paths.status, status, 0o600)
         atomic_write_bytes(self.paths.heartbeat, b"ok\n", 0o600)
         return status
+
+    def _append_recent_run(
+        self, status: Dict[str, Any], changes: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Кольцевой журнал последних прогонов для интерфейса.
+
+        Статус описывает ТОЛЬКО последний тик и перезаписывается каждую
+        минуту, поэтому редкая ошибка живёт один тик и к утру затёрта: в
+        августе 2026 разбор падающего digest занял день ровно потому, что
+        `last_result` приходилось ловить вручную в нужную минуту. Здесь
+        хранится только служебное — время, исход, тип исключения и счётчики;
+        ни текста дайджеста, ни сообщений, ни имён чатов.
+
+        Запись строится из `changes`, а не из накопленного статуса: тот
+        наследует поля предыдущего прогона, и событие «starting» после ночного
+        падения получило бы его время и его тип ошибки — журнал показывал бы
+        отказ, которого не было."""
+        previous = status.get("recent_runs")
+        if not isinstance(previous, list):
+            previous = []
+        entry = {
+            # Своё время события. `last_run_at` обновляют только писатели из
+            # run_once, поэтому «starting», ремонт VPN и смена конфигурации
+            # унаследовали бы чужой штамп.
+            "at": changes.get("last_run_at") or self.clock().isoformat(),
+            "result": changes.get("last_result"),
+            "error_type": changes.get("last_error_type"),
+            "message_count": changes.get("last_message_count"),
+            "failed_chat_count": changes.get("failed_chat_count"),
+        }
+        kept = [row for row in previous if isinstance(row, dict)]
+        # Подряд идущие одинаковые исходы схлопываются в один со счётчиком:
+        # иначе двадцать записей журнала занимает один digest_cooldown, а
+        # редкая ошибка вытесняется ещё до того, как её увидят. Счётчики
+        # входят в ключ намеренно: тик, где отвалились все peer'ы, обязан
+        # порвать серию, иначе он исчезнет ровно как раньше.
+        collapse_keys = ("result", "error_type", "message_count",
+                         "failed_chat_count")
+        if kept and all(kept[-1].get(key) == entry[key] for key in collapse_keys):
+            last = dict(kept[-1])
+            count = last.get("repeated")
+            if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+                # значение пришло из файла статуса — доверять ему нельзя:
+                # строка вместо числа роняла бы планировщик на int()
+                count = 1
+            last["repeated"] = min(count + 1, 10 ** 6)
+            last["at"] = entry["at"]
+            kept[-1] = last
+        else:
+            kept.append(entry)
+        return kept[-RECENT_RUNS_LIMIT:]
 
     async def public_status(self) -> Dict[str, Any]:
         return self._write_status()
@@ -1127,6 +1184,9 @@ class Collector:
             last_error_type=None if logout_confirmed else "TelegramLogoutUnconfirmed",
             revocation_required=not logout_confirmed,
             last_message_count=None, last_through_message_id=None,
+            # Журнал принадлежит прежней конфигурации: после factory reset
+            # следующий владелец не должен видеть историю предыдущей.
+            recent_runs=[], failed_chat_count=None,
         )
         return result
 

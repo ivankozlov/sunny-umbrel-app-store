@@ -16,6 +16,12 @@ from .vpn_subscription import is_public_unicast_ipv4
 
 MIHOMO_SOCKS_HOST = "127.0.0.1"
 MIHOMO_SOCKS_PORT = 7891
+# Отдельный HTTP-listener для OpenRouter: urllib умеет HTTP-прокси нативно
+# (включая CONNECT для TLS), а SOCKS — нет, и тащить ради этого PySocks в
+# образ незачем. Порт разнесён с SOCKS намеренно: Telegram-клиент получает
+# только 7891, так что перепутать транспорты нельзя (инцидент 2026-08-17 —
+# запрос к OpenRouter шёл мимо туннеля и ловил 403 от фильтра на маршруте).
+MIHOMO_HTTP_PORT = 7892
 MIHOMO_PROXY_NAME = "vpn-active"
 _BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 _HEX = re.compile(r"^[0-9A-Fa-f]+$")
@@ -140,6 +146,12 @@ def render_mihomo_config(node: Mapping[str, Any]) -> bytes:
             "port": MIHOMO_SOCKS_PORT,
             "type": "socks",
             "udp": False,
+            "users": [],
+        }, {
+            "listen": MIHOMO_SOCKS_HOST,
+            "name": "openrouter-http",
+            "port": MIHOMO_HTTP_PORT,
+            "type": "http",
             "users": [],
         }],
         "log-level": "silent",
@@ -325,7 +337,7 @@ class MihomoRuntime:
                 raise TimeoutError("Mihomo SOCKS readiness timed out")
             try:
                 await asyncio.wait_for(
-                    self._probe_socks(), timeout=min(1.0, remaining))
+                    self._probe_ready(), timeout=min(1.0, remaining))
                 if process.returncode is not None:
                     raise MihomoExitedError(
                         "Mihomo exited before readiness with status "
@@ -336,6 +348,24 @@ class MihomoRuntime:
                 delay = min(self.probe_interval, max(0.0, deadline - loop.time()))
                 if delay:
                     await asyncio.sleep(delay)
+
+    async def _probe_ready(self) -> None:
+        """Оба listener'а обязаны отвечать до того, как раннер объявлен готовым.
+
+        Раньше ждали только SOCKS. С появлением HTTP-listener'а (OpenRouter)
+        этого мало: digest-запрос ушёл бы в ещё не поднятый порт и упал бы
+        connection refused, а выглядело бы это как отказ OpenRouter."""
+        await self._probe_socks()
+        await self._probe_http()
+
+    async def _probe_http(self) -> None:
+        _reader, writer = await asyncio.open_connection(
+            MIHOMO_SOCKS_HOST, MIHOMO_HTTP_PORT)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     async def _probe_socks(self) -> None:
         reader, writer = await asyncio.open_connection(

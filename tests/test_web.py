@@ -413,5 +413,40 @@ class WebTests(unittest.TestCase):
         self.assertIn("durable baseline ACK", locked)
 
 
+class TestRecentRunsRendering20260817(unittest.TestCase):
+    """Журнал прогонов виден в интерфейсе и санитизируется как всё остальное."""
+
+    def _page(self, runs):
+        value = status("chat_locked")
+        value["recent_runs"] = runs
+        return render_status(value, "a" * 64)
+
+    def test_journal_shows_results_errors_and_repeat_counts(self):
+        page = self._page([
+            {"at": "2026-08-17T10:00:00+00:00", "result": "digest_cooldown",
+             "error_type": None, "repeated": 4},
+            {"at": "2026-08-17T10:05:00+00:00", "result": "error",
+             "error_type": "OpenRouterError", "failed_chat_count": 0},
+        ])
+        self.assertIn("Журнал прогонов", page)
+        self.assertIn("digest_cooldown", page)
+        self.assertIn("×4", page)
+        self.assertIn("OpenRouterError", page)
+        self.assertIn("2026-08-17T10:05:00", page)
+
+    def test_hostile_values_cannot_inject_markup(self):
+        page = self._page([
+            {"at": "<img src=x onerror=alert(1)>", "result": "<script>",
+             "error_type": "<script>alert(1)</script>", "repeated": "3"},
+        ])
+        self.assertNotIn("<script>", page)
+        self.assertNotIn("<img", page)
+        self.assertIn("unknown", page)
+
+    def test_empty_or_broken_journal_renders_nothing(self):
+        for rows in (None, [], "не список", [42, "мусор"]):
+            self.assertNotIn("Журнал прогонов", self._page(rows))
+
+
 if __name__ == "__main__":
     unittest.main()
