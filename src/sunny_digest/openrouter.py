@@ -3,29 +3,30 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import http.client
+import socket
+import ssl
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List
 
 from .contracts import validate_digest_text
+from .openrouter_tunnel import TUNNEL_HOST, TUNNEL_PORT
 from .models import DigestChat
 from .prompting import render_digest_prompt
 from .storage import canonical_json_bytes
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-# Запрос обязан идти через тот же VPN, что и Telegram. Прямой выход из
-# домашней сети возвращает HTTP 403 от фильтра на маршруте, и дайджест не
-# собирается ни разу (инцидент 2026-08-17: monitor работал, digest падал
-# OpenRouterError каждые пять минут). Прокси — HTTP-listener Mihomo; DIRECT
-# fallback'а здесь нет и быть не должно: без туннеля запрос всё равно не
-# пройдёт, а тихий обход маскировал бы поломку VPN.
+# Запрос обязан идти через DO: прямой путь из домашней сети отбивает фильтр
+# (`Access denied by security policy`), а через VLESS-туннель Cloudflare
+# отвечает 403 с любого узла (инцидент 2026-08-17/18). Дроплет openrouter.ai
+# отдаёт штатно, поэтому соединение идёт сквозь ssh-форвард до него.
 #
-# Пиннится на самом Request через set_proxy, а НЕ через ProxyHandler: тот
-# спрашивает urllib.request.proxy_bypass, и `no_proxy=*` в окружении вернул бы
-# запрос на прямой путь — то есть ровно ту поломку, ради которой этот прокси и
-# появился, только молча.
-OPENROUTER_PROXY = "127.0.0.1:7892"
+# Адрес локального конца туннеля, НЕ прокси: ssh форвардит на openrouter.ai:443
+# напрямую, а TLS остаётся сквозным — ни DO, ни ssh тела запроса не видят.
+# Имя хоста для проверки сертификата и SNI задаётся отдельно, иначе python
+# проверял бы сертификат против 127.0.0.1 и соединение падало бы.
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_WORKER_REQUEST_BYTES = 128 * 1024
 WORKER_SCHEMA = "sunny.personal-chats.openrouter-worker.v2"
@@ -46,6 +47,34 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+class _TunnelHTTPSConnection(http.client.HTTPSConnection):
+    """TCP идёт на локальный конец форварда, TLS проверяется против openrouter.ai.
+
+    Разделение обязательно: подменить `host` нельзя — по нему же открывается
+    сокет, и запрос ушёл бы на openrouter.ai:7893. А проверять сертификат
+    против 127.0.0.1 нельзя тем более: тогда любой, кто занял локальный порт,
+    получил бы и запрос, и bearer-ключ."""
+
+    def __init__(self, tls_host: str, **kwargs: Any) -> None:
+        super().__init__(TUNNEL_HOST, TUNNEL_PORT, **kwargs)
+        self._tls_host = tls_host
+
+    def connect(self) -> None:
+        sock = socket.create_connection(
+            (TUNNEL_HOST, TUNNEL_PORT), self.timeout, self.source_address)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self._tls_host)
+
+
+class _TunnelHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):  # noqa: ANN001
+        def build(host: str, **kwargs: Any) -> http.client.HTTPSConnection:
+            kwargs.pop("context", None)
+            return _TunnelHTTPSConnection(
+                host.split(":", 1)[0], context=ssl.create_default_context(), **kwargs)
+
+        return self.do_open(build, req)
 
 
 def _prompt(chats: List[DigestChat]) -> str:
@@ -82,14 +111,17 @@ def _blocking_digest_prompt(prompt: str, model: str, api_key: str) -> str:
             "X-Title": "Sunny Personal Chats",
         },
     )
-    # CONNECT на loopback-listener Mihomo; TLS до openrouter.ai остаётся
-    # сквозным, прокси видит только имя хоста, но не тело и не bearer-ключ.
-    request.set_proxy(OPENROUTER_PROXY, "https")
-    opener = urllib.request.build_opener(_RefuseRedirects())
+    opener = urllib.request.build_opener(
+        _TunnelHTTPSHandler(), _RefuseRedirects())
     try:
         with opener.open(request, timeout=90) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except (urllib.error.URLError, TimeoutError, http.client.HTTPException,
+            OSError) as exc:
+        # http.client.HTTPException и OSError тоже: упавший ssh-туннель рвёт
+        # соединение как RemoteDisconnected/ConnectionReset, а это не URLError —
+        # без них отказ канала улетал бы наружу необёрнутым и попадал в статус
+        # чужим типом вместо OpenRouterError.
         raise OpenRouterError(f"OpenRouter transport failed: {type(exc).__name__}") from None
     if len(raw) > MAX_RESPONSE_BYTES:
         raise OpenRouterError("OpenRouter response exceeds size limit")

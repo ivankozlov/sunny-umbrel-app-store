@@ -148,6 +148,24 @@ def _hidden_csrf(csrf: str) -> str:
     return f'<input type="hidden" name="csrf" value="{_escape(csrf)}">'
 
 
+def _render_openrouter_key(public_key: Any) -> str:
+    """Ключ канала до OpenRouter — отдельный от upload-ключа.
+
+    Дайджест собирается через ssh-форвард до DO: прямой путь из домашней сети
+    и путь через VPN одинаково отбиваются (инциденты 2026-08-17/18). Ключ надо
+    добавить на дроплет с `permitopen`, иначе sshd форвард не разрешит."""
+    if not isinstance(public_key, str):
+        return ""
+    value = public_key.strip()
+    if not value.startswith("ssh-ed25519 ") or len(value) > 256:
+        return ""
+    return (
+        '<p class="muted">Ключ канала до OpenRouter — добавьте его на DO '
+        'скриптом install_openrouter_tunnel.sh (он пропишет '
+        '<code>permitopen=&quot;openrouter.ai:443&quot;</code>):</p>'
+        f'<code>{_escape(value)}</code>')
+
+
 def _render_recent_runs(rows: Any) -> str:
     """Журнал последних прогонов: время, исход, тип ошибки, счётчики.
 
@@ -403,6 +421,7 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
 <p class="muted">Добавьте этот публичный ключ в конфигурацию forced-command receiver’а Sunny:</p>
 <code>{_escape(status.get("upload_public_key") or "")}</code>
 <p class="muted">Fingerprint: {_escape(status.get("upload_key_fingerprint") or "—")}</p>
+{_render_openrouter_key(status.get("openrouter_public_key"))}
 {activation}
 <details><summary>Проверить и заменить VPN-маршрут</summary>
   <form method="post" autocomplete="off">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="replace_vpn">

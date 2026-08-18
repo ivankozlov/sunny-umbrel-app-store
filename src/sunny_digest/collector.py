@@ -28,6 +28,7 @@ from .mihomo import (
     render_mihomo_config,
 )
 from .openrouter import create_digest
+from .openrouter_tunnel import OpenRouterTunnel, generate_openrouter_key
 from .settings import (
     MAX_CONSENT_DAYS,
     CONSENT_SCOPE,
@@ -146,6 +147,8 @@ class Collector:
         *,
         gateway_factory: GatewayFactory = TelethonGateway,
         digest_function: DigestFunction = create_digest,
+        tunnel_factory: Any = OpenRouterTunnel,
+        openrouter_keygen_function: Any = generate_openrouter_key,
         transport_factory: TransportFactory = SSHTransport,
         keygen_function: KeygenFunction = generate_upload_key,
         vpn_runtime_factory: VPNRuntimeFactory = MihomoRuntime,
@@ -158,6 +161,8 @@ class Collector:
         self.paths.ensure()
         self.gateway_factory = gateway_factory
         self.digest_function = digest_function
+        self.tunnel_factory = tunnel_factory
+        self.openrouter_keygen_function = openrouter_keygen_function
         self.transport_factory = transport_factory
         self.keygen_function = keygen_function
         self.subscription_fetcher = subscription_fetcher
@@ -336,6 +341,7 @@ class Collector:
             "monitoring_active": False,
             "upload_public_key": None,
             "upload_key_fingerprint": None,
+            "openrouter_public_key": None,
             "model": None,
             "upload_target": None,
             "consent_expires_at": None,
@@ -413,6 +419,12 @@ class Collector:
                         status["phone_masked"] = setup["phone_masked"]
             except Exception as exc:
                 status.update(phase="error", last_error_type=type(exc).__name__)
+        if self.paths.openrouter_public_key.exists():
+            try:
+                status["openrouter_public_key"] = (
+                    self.paths.openrouter_public_key.read_text(encoding="ascii").strip())
+            except OSError:
+                pass
         if self.paths.status.exists():
             try:
                 previous = read_json(self.paths.status, max_bytes=16 * 1024)
@@ -473,6 +485,7 @@ class Collector:
             "phone_masked", "dialogs", "selection_id", "last_run_at", "last_result",
             "last_error_type", "last_message_count", "last_through_message_id",
             "failed_chat_count", "revocation_required", "recent_runs",
+            "openrouter_public_key",
             "vpn_configured", "vpn_ready", "vpn_migration_required",
             "vpn_repairing", "vpn_repair_state", "vpn_repair_attempted",
             "vpn_repair_error_type",
@@ -1942,13 +1955,32 @@ class Collector:
                 digest_chats.append(DigestChat(chat["title"], fetched.messages))
 
         total = sum(row["message_count"] for row in ranges)
-        digest = "" if total == 0 else await self._bounded_external(
-            self.digest_function(
-                digest_chats, settings["openrouter_model"],
-                credentials["openrouter_api_key"], revoked,
-            ),
-            OPENROUTER_TIMEOUT_S,
-        )
+        if total == 0:
+            digest = ""
+        else:
+            # Туннель до OpenRouter поднимается только на время запроса: канал
+            # нужен раз в сутки, а живущий круглосуточно ssh пришлось бы
+            # сторожить и переподнимать. Падение туннеля роняет попытку —
+            # DIRECT fallback'а нет намеренно, иначе запрос ушёл бы мимо DO и
+            # молча упёрся в фильтр, как это было до 18.08.
+            # Ключ нужен только здесь. В общем префиксе run_once его генерация
+            # роняла бы весь тик: отказ ssh-keygen (например, ENOSPC) уносил бы
+            # с собой и monitor, хотя канал — забота исключительно digest.
+            # Инвариант «ошибка digest не блокирует monitor» держится этим.
+            await self._ensure_openrouter_key(source_id)
+            tunnel = self.tunnel_factory(self.paths, settings["upload"])
+            await tunnel.start()
+            try:
+                digest = await self._bounded_external(
+                    self.digest_function(
+                        digest_chats, settings["openrouter_model"],
+                        credentials["openrouter_api_key"], revoked,
+                    ),
+                    OPENROUTER_TIMEOUT_S,
+                )
+                tunnel.ensure_alive()
+            finally:
+                await tunnel.stop()
         await self._assert_active(
             revoked, source_id, chat_ids,
             self._generated_at(gate, gate_received_mono),
@@ -1978,6 +2010,22 @@ class Collector:
         self._last_attempt = None
         return "uploaded_digest", total
 
+    async def _ensure_openrouter_key(self, source_id: str) -> None:
+        """Догенерировать ключ канала на уже настроенном экземпляре.
+
+        Ключи фиксируются один раз, при lock'е чатов, а канал до OpenRouter
+        появился позже (0.2.7). Без этого обновлённый экземпляр остался бы без
+        ключа и дайджест не собрался бы — молча, по отсутствию файла. Публичная
+        часть показывается в интерфейсе: её надо добавить на DO с
+        `permitopen="openrouter.ai:443"`."""
+        if self.paths.openrouter_key.exists():
+            return
+        unlink_atomic_material((
+            self.paths.openrouter_key, self.paths.openrouter_public_key))
+        await self._bounded_external(
+            self.openrouter_keygen_function(self.paths, source_id),
+            KEYGEN_TIMEOUT_S)
+
     async def run_once(self) -> Dict[str, Any]:
         async with self.run_lock:
             current_task = asyncio.current_task()
@@ -2000,6 +2048,7 @@ class Collector:
                         )
                     session = self._session_text()
                     source_id = settings["source_id"]
+                async with self.state_lock:
                     chat_ids = [row["chat_id"] for row in settings["chats"]]
                     upload_config = dict(settings["upload"])
                 transport = self.transport_factory(self.paths, upload_config)

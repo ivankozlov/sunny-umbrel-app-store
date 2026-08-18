@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import email.message
+import io
+import ssl
 import json
 import os
 import unittest
@@ -418,67 +420,70 @@ class TestBugOpenRouterPrivacy20260810(unittest.TestCase):
         self.assertEqual(request.get_header("X-title"), "Sunny Personal Chats")
 
 
-class TestBugOpenRouterDirectEgress20260817(unittest.TestCase):
-    """Инцидент 2026-08-17: запрос к OpenRouter уходил мимо VPN.
+class TestBugOpenRouterEgress20260818(unittest.TestCase):
+    """Инциденты 2026-08-17/18: запрос к OpenRouter не проходил ничем.
 
-    Telegram ходил через SOCKS-listener Mihomo, а digest-запрос — обычным
-    urlopen напрямую, и фильтр на маршруте отвечал HTTP 403 «Access denied by
-    security policy». Внешне это выглядело отказом OpenRouter: monitor
-    зелёный, digest падает OpenRouterError каждые пять минут, дайджест не
-    пришёл ни разу с момента активации."""
+    Прямой путь из домашней сети отбивал фильтр (`Access denied by security
+    policy`), а через VLESS-туннель Cloudflare отвечал 403 с любого из трёх
+    узлов — при том, что с самих узлов и с DO тот же запрос проходил. Поэтому
+    соединение идёт ssh-форвардом до DO, и только им."""
 
-    def _sent_request(self, env=None):
-        """Прогон по НАСТОЯЩЕМУ opener'у: подменяется только сокетный слой.
+    def _sent_connection(self):
+        """Прогон по настоящему opener'у: подменяется только сокетный слой."""
+        made = {}
 
-        Мок build_opener проверял бы намерение, а не маршрут — реальный путь
-        зависит ещё и от bypass-логики urllib."""
-        sent = []
+        class FakeSocket:
+            """Достаточно, чтобы http.client дошёл до отправки и оборвался."""
 
-        class _Response(FakeResponse):
-            """FakeResponse + минимум полей, которых ждут обработчики urllib."""
-            code = 200
-            msg = "OK"
+            def __init__(self, hostname):
+                made["server_hostname"] = hostname
 
-            def info(self):
-                return email.message.Message()
+            def sendall(self, *_a, **_kw):
+                return None
 
-        def https_open(_self, req):
-            sent.append(req)
-            return _Response("Готово")
+            def settimeout(self, *_a, **_kw):
+                return None
 
-        with patch.dict(os.environ, env or {}):
-            with patch("urllib.request.HTTPSHandler.https_open", https_open):
+            def close(self, *_a, **_kw):
+                return None
+
+            def makefile(self, *_a, **_kw):
+                return io.BytesIO(b"")
+
+        def fake_wrap(_self, sock, server_hostname=None, **_kw):
+            made["wrapped"] = sock
+            made["context"] = _self
+            return FakeSocket(server_hostname)
+
+        def fake_create_connection(address, *_a, **_kw):
+            made["address"] = address
+            return object()
+
+        with patch("socket.create_connection", fake_create_connection), \
+                patch("ssl.SSLContext.wrap_socket", fake_wrap):
+            try:
                 _blocking_digest([], "anthropic/example", "secret")
-        return sent[0]
+            except OpenRouterError:
+                pass  # ответ не эмулируем — проверяется сам маршрут
+        return made
 
-    def test_request_goes_through_mihomo_http_proxy(self):
-        from sunny_digest.mihomo import MIHOMO_HTTP_PORT, MIHOMO_SOCKS_HOST
-        from sunny_digest.openrouter import OPENROUTER_PROXY
+    def test_connects_to_local_tunnel_end_not_to_openrouter_directly(self):
+        from sunny_digest.openrouter_tunnel import TUNNEL_HOST, TUNNEL_PORT
 
-        self.assertEqual(
-            OPENROUTER_PROXY, f"{MIHOMO_SOCKS_HOST}:{MIHOMO_HTTP_PORT}")
+        made = self._sent_connection()
+        self.assertEqual(made.get("address"), (TUNNEL_HOST, TUNNEL_PORT))
 
-        request = self._sent_request()
-        # CONNECT на loopback Mihomo, TLS — сквозной до openrouter.ai
-        self.assertEqual(request.host, OPENROUTER_PROXY)
-        self.assertEqual(request._tunnel_host, "openrouter.ai")
-
-    def test_no_proxy_in_environment_cannot_return_the_request_to_direct(self):
-        """`no_proxy=*` не должен возвращать запрос на прямой путь.
-
-        Через ProxyHandler это происходило бы молча: он спрашивает
-        proxy_bypass, и переменная окружения отменила бы весь смысл пиннинга —
-        запрос снова ушёл бы мимо туннеля и получил 403."""
-        from sunny_digest.openrouter import OPENROUTER_PROXY
-
-        request = self._sent_request({"no_proxy": "*", "NO_PROXY": "openrouter.ai",
-                                      "https_proxy": "http://198.51.100.7:9"})
-        self.assertEqual(request.host, OPENROUTER_PROXY)
-        self.assertEqual(request._tunnel_host, "openrouter.ai")
+    def test_tls_is_verified_against_openrouter_not_against_loopback(self):
+        """Проверять сертификат против 127.0.0.1 нельзя: тогда любой, кто занял
+        локальный порт, получил бы и запрос, и bearer-ключ."""
+        made = self._sent_connection()
+        self.assertEqual(made.get("server_hostname"), "openrouter.ai")
+        # одного имени мало: снятая верификация прошла бы этот тест зелёной
+        context = made.get("context")
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
 
     def test_redirects_are_refused_so_the_key_cannot_leave_the_tunnel(self):
-        """Редирект создаётся новым Request без нашего прокси; на http:// он
-        унёс бы bearer-ключ открытым текстом мимо туннеля."""
         from sunny_digest.openrouter import _RefuseRedirects
 
         self.assertIsNone(_RefuseRedirects().redirect_request(

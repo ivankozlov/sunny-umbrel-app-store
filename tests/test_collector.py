@@ -425,6 +425,34 @@ def mention(chat_index: int, message_id: int) -> MentionEvent:
     )
 
 
+class FakeTunnel:
+    """Фейк ssh-туннеля: тесты не поднимают настоящий ssh.
+
+    Считает start/stop, чтобы регресс мог проверить, что канал закрывается
+    даже при провале запроса."""
+
+    instances = []
+
+    def __init__(self, paths, upload):
+        self.paths = paths
+        self.upload = upload
+        self.started = 0
+        self.stopped = 0
+        self.alive = True
+        FakeTunnel.instances.append(self)
+
+    async def start(self):
+        self.started += 1
+
+    def ensure_alive(self):
+        if not self.alive:
+            from sunny_digest.openrouter_tunnel import TunnelUnavailableError
+            raise TunnelUnavailableError("tunnel died")
+
+    async def stop(self):
+        self.stopped += 1
+
+
 def collector_for(paths, gateway, transport, digest_calls=None, runtime=None):
     digest_calls = digest_calls if digest_calls is not None else []
 
@@ -432,12 +460,21 @@ def collector_for(paths, gateway, transport, digest_calls=None, runtime=None):
         digest_calls.append((chats, model, key, revoked.is_set()))
         return "Общий дайджест"
 
+    async def fake_openrouter_keygen(paths_, source_id):
+        # реальный ssh-keygen в 27 прогонах не нужен и делает тесты медленными
+        paths_.openrouter_key.write_text("private", encoding="ascii")
+        paths_.openrouter_public_key.write_text(
+            f"ssh-ed25519 AAAAtest {source_id}@sunny-openrouter", encoding="ascii")
+        return "ssh-ed25519 AAAAtest", "SHA256:test"
+
     runtime = runtime or FakeVPNRuntime(paths.private_dir)
     return Collector(
         paths,
         gateway_factory=lambda *_: gateway,
         digest_function=digest,
         transport_factory=lambda *_: transport,
+        tunnel_factory=FakeTunnel,
+        openrouter_keygen_function=fake_openrouter_keygen,
         vpn_runtime_factory=lambda _private: runtime,
         clock=lambda: NOW,
     )
@@ -2360,6 +2397,108 @@ class TestRecentRunsJournal20260817(unittest.IsolatedAsyncioTestCase):
             status = collector._write_status(
                 last_result="watched_not_due", last_error_type=None)
             self.assertEqual(status["recent_runs"][-1]["repeated"], 2)
+
+
+class TestOpenRouterTunnelLifecycle20260818(unittest.IsolatedAsyncioTestCase):
+    """Канал до OpenRouter: поднимается на запрос, гасится всегда, digest-only."""
+
+    def setUp(self):
+        FakeTunnel.instances.clear()
+
+    async def test_tunnel_is_raised_for_the_request_and_torn_down(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            transport = FakeTransport(paths, gate(digest_due=True))
+            digest_calls = []
+            result = await collector_for(
+                paths, FakeGateway(paths), transport, digest_calls).run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            self.assertEqual(len(FakeTunnel.instances), 1)
+            self.assertEqual(FakeTunnel.instances[0].started, 1)
+            self.assertEqual(FakeTunnel.instances[0].stopped, 1)
+
+    async def test_tunnel_is_torn_down_even_when_the_request_fails(self):
+        """Иначе ssh оставался бы жить после каждой неудачи."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+
+            async def failing_digest(*_args):
+                raise RuntimeError("OpenRouter refused")
+
+            collector = collector_for(
+                paths, FakeGateway(paths), FakeTransport(paths, gate(digest_due=True)))
+            collector.digest_function = failing_digest
+            result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "error")
+            self.assertEqual(FakeTunnel.instances[-1].stopped, 1)
+
+    async def test_dead_tunnel_after_request_fails_the_attempt(self):
+        """Молчаливый успех при умершем канале означал бы дайджест,
+        собранный неизвестно каким маршрутом."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+
+            class DyingTunnel(FakeTunnel):
+                async def start(self):
+                    await super().start()
+                    self.alive = False
+
+            transport = FakeTransport(paths, gate(digest_due=True))
+            collector = collector_for(paths, FakeGateway(paths), transport)
+            collector.tunnel_factory = DyingTunnel
+            result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "error")
+            self.assertEqual(result["last_error_type"], "TunnelUnavailableError")
+            self.assertEqual(transport.digest_uploads, [])
+
+    async def test_keygen_failure_does_not_stop_mention_monitoring(self):
+        """Инвариант «ошибка digest не блокирует monitor»: канал — забота
+        только дайджеста, и отказ ssh-keygen не должен уносить упоминания."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+
+            async def failing_keygen(*_args):
+                raise RuntimeError("ssh-keygen failed")
+
+            trace = []
+            transport = FakeTransport(paths, gate(digest_due=True), trace)
+            collector = collector_for(paths, FakeGateway(paths), transport)
+            collector.openrouter_keygen_function = failing_keygen
+            result = await collector.run_once()
+
+            # monitor успел пройти: гейт запрошен, Telegram просканирован —
+            # раньше keygen стоял в общем префиксе и ронял тик до этого
+            self.assertGreater(transport.gate_calls, 0)
+            self.assertIn("status", trace)
+            self.assertEqual(result["last_result"], "error")
+
+
+class TestResetWipesTunnelKey20260818(unittest.IsolatedAsyncioTestCase):
+    """Ревью 2026-08-18: ключ канала переживал factory reset и оставался
+    авторизованным на DO, а его публичная часть светилась в статусе."""
+
+    async def test_factory_reset_deletes_the_tunnel_keypair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            paths.openrouter_key.write_text("private", encoding="ascii")
+            paths.openrouter_public_key.write_text(
+                "ssh-ed25519 AAAAold old@sunny-openrouter", encoding="ascii")
+
+            collector = collector_for(
+                paths, FakeGateway(paths), FakeTransport(paths, gate()))
+            status = await collector.revoke_and_reset()
+
+            self.assertFalse(paths.openrouter_key.exists())
+            self.assertFalse(paths.openrouter_public_key.exists())
+            self.assertIsNone(status.get("openrouter_public_key"))
 
 
 if __name__ == "__main__":

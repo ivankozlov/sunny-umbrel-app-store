@@ -20,15 +20,34 @@ keys, or rendered runtime configuration.
   keys, and unknown VLESS capabilities are rejected. Only freshly built
   allowlisted VLESS/REALITY TCP/Vision nodes may be tested or persisted. Every
   Telegram client remains SOCKS-only with no direct fallback.
-- Both egress paths go through the tunnel. Mihomo exposes two loopback
-  listeners: SOCKS on 7891 for Telegram and HTTP on 7892 for OpenRouter, and
-  readiness waits for both. The OpenRouter request pins that proxy explicitly
-  rather than reading `https_proxy` from the environment, and has no direct
-  fallback: without the tunnel it would not succeed anyway, and a silent bypass
-  would hide a broken VPN. On 2026-08-17 the digest request still went out
-  directly and a filter on the route answered HTTP 403 `Access denied by
-  security policy`, so no digest was ever produced — monitor stayed green while
-  digest failed `OpenRouterError` every five minutes.
+- Telegram and OpenRouter use different egress paths on purpose. Telegram goes
+  through the Mihomo SOCKS listener; OpenRouter goes through an ssh forward to
+  the DO droplet (`openrouter_tunnel.py`), because in August 2026 no other path
+  worked: a direct request from the home network was answered by a filter with
+  HTTP 403 `Access denied by security policy`, and through the VLESS tunnel
+  Cloudflare answered 403 from all three nodes — while the same request
+  succeeded from those nodes themselves and from DO. TLS stays end-to-end: the
+  droplet and sshd see the host name, never the body or the key. The
+  certificate is verified against `openrouter.ai`, never against the loopback
+  address, so occupying the local port cannot capture the request. There is no
+  direct fallback: without the tunnel the request fails anyway, and a silent
+  bypass would hide it.
+- The tunnel key is separate from the upload key, is generated lazily so an
+  already-configured instance gets one on upgrade, and is wiped by factory
+  reset like every other credential. It authenticates as its own unprivileged
+  account, never as the receiver's root: `permitopen` constrains only local
+  forward targets while the `port-forwarding` flag also enables reverse
+  forwarding, so a root key with those options could open a port on the droplet
+  to the outside. The real restriction is an sshd `Match User` block —
+  `AllowTcpForwarding local`, `PermitOpen openrouter.ai:443`, no reverse,
+  stream-local or agent forwarding, `ForceCommand /bin/false` — installed by
+  `deploy/install_openrouter_tunnel.sh`, dry-run by default, validating the
+  config with `sshd -t` before and after replacement and reloading rather than
+  restarting. Key-line options duplicate that block so a lost `Match` still
+  leaves no shell and no other address. The forward is raised only for the
+  request and torn down after; a dead tunnel fails the attempt rather than
+  falling back, and keygen lives in the digest path so its failure cannot stop
+  mention monitoring.
 - Locked-state VPN repair preserves the Telegram session, immutable chat set,
   receiver generation, and durable monitor/digest state. It downloads before
   taking the run lock, then tests bounded candidates in provider order. Each

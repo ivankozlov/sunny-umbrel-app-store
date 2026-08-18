@@ -181,6 +181,18 @@ class Paths:
         return self.private_dir / "upload-ed25519"
 
     @property
+    def openrouter_key(self) -> Path:
+        # Отдельный ключ, а не upload-ключ: у того в authorized_keys стоит
+        # restrict с forced command, и порт-форвард по нему невозможен. Этому
+        # sshd разрешает ровно один permitopen на openrouter.ai:443 — даже при
+        # компрометации приложения ключ не откроет ничего другого.
+        return self.private_dir / "openrouter-ed25519"
+
+    @property
+    def openrouter_public_key(self) -> Path:
+        return self.private_dir / "openrouter-ed25519.pub"
+
+    @property
     def upload_public_key(self) -> Path:
         return self.private_dir / "upload-ed25519.pub"
 
@@ -214,6 +226,10 @@ class Paths:
             self.dialog_candidates,
             self.chat_locked,
             self.upload_key,
+            # ключ канала до OpenRouter — тоже credential владельца:
+            # переживший reset ключ остался бы авторизован на DO
+            self.openrouter_key,
+            self.openrouter_public_key,
             self.upload_public_key,
             self.vpn_active_node,
         )

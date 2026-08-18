@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Chats
-version: "0.2.6"
+version: "0.2.7"
 tagline: Mentions, read receipts, and one digest for selected chats
 description: >-
   Resolves message links for only the explicitly selected Telegram groups,
