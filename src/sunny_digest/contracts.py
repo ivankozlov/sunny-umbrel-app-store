@@ -293,6 +293,17 @@ def _validate_range(row: Any, label: str) -> Dict[str, int]:
     }
 
 
+def supergroup_link_prefix(chat_id: int) -> Optional[str]:
+    """`https://t.me/c/<peer_id>` для супергруппы, иначе None.
+
+    Одна формула на двух потребителей: проверку ссылки mention-события и
+    сборку ссылок дайджеста. У обычной группы адресуемых ссылок нет — там
+    None, и пункт дайджеста останется без источника, а не получит чужой."""
+    if chat_id <= -1_000_000_000_000:
+        return f"https://t.me/c/{-chat_id - 1_000_000_000_000}"
+    return None
+
+
 def _validate_event(event: Any, source_id: str, chat_id: int) -> Dict[str, Any]:
     if not isinstance(event, dict):
         raise ValueError("monitor event is invalid")
@@ -308,10 +319,9 @@ def _validate_event(event: Any, source_id: str, chat_id: int) -> Dict[str, Any]:
         maximum=MAX_MENTION_SNIPPET_UTF16, allow_empty=True,
     )
     link = event["link"]
-    if chat_id <= -1_000_000_000_000:
-        expected_peer_id = -chat_id - 1_000_000_000_000
-        expected_link = f"https://t.me/c/{expected_peer_id}/{message_id}"
-        if link != expected_link:
+    prefix = supergroup_link_prefix(chat_id)
+    if prefix is not None:
+        if link != f"{prefix}/{message_id}":
             raise ValueError("event link does not match supergroup chat_id")
     elif link is not None:
         raise ValueError("legacy group event link must be null")

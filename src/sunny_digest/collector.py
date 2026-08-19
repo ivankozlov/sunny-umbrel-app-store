@@ -19,6 +19,7 @@ from .contracts import (
     validate_digest_upload,
     validate_gate,
     validate_monitor_upload,
+    supergroup_link_prefix,
 )
 from .models import DialogCandidate, DigestChat, PeerSpec
 from .mihomo import (
@@ -28,6 +29,7 @@ from .mihomo import (
     render_mihomo_config,
 )
 from .openrouter import create_digest
+from .prompting import PROMPT_PREFIX_BYTES, fit_by_lines
 from .openrouter_tunnel import OpenRouterTunnel, generate_openrouter_key
 from .settings import (
     MAX_CONSENT_DAYS,
@@ -58,7 +60,13 @@ from .version import (
     MAX_SELECTED_CHATS,
     MAX_UPLOAD_BYTES,
 )
-from .vpn_subscription import fetch_vless_subscription, validate_subscription_url
+from .vpn_subscription import (
+    ORIGIN_KEY,
+    resolve_public_node_servers,
+    _valid_dns_hostname,
+    fetch_vless_subscription,
+    validate_subscription_url,
+)
 
 
 GatewayFactory = Callable[[int, str, Dict[str, Any]], Any]
@@ -87,6 +95,15 @@ OPENROUTER_TIMEOUT_S = 120
 # остаётся в пределах 16 КБ, которыми ограничено его чтение.
 RECENT_RUNS_LIMIT = 20
 VPN_SUBSCRIPTION_TIMEOUT_S = 30
+VPN_RESOLVE_TIMEOUT_S = 15
+# Сколько подряд тиков Telegram должен быть недоступен целиком,
+# прежде чем заподозрить протухший адрес. Один тик — это обычная
+# сетевая рябь; три подряд при живом gate (он идёт к приёмнику
+# мимо VPN) означают, что маршрут мёртв, а не Telegram.
+VPN_STALL_TICKS_BEFORE_RERESOLVE = 3
+# Между попытками авторезолва: DNS обновляется не мгновенно, а
+# каждая попытка гасит и поднимает маршрут.
+VPN_RERESOLVE_COOLDOWN_S = 1800
 VPN_REPAIR_RUN_LOCK_TIMEOUT_S = 240
 VPN_REPAIR_TEST_TIMEOUT_S = 300
 VPN_REPAIR_MAX_CANDIDATES = 8
@@ -153,6 +170,7 @@ class Collector:
         keygen_function: KeygenFunction = generate_upload_key,
         vpn_runtime_factory: VPNRuntimeFactory = MihomoRuntime,
         subscription_fetcher: SubscriptionFetcher = fetch_vless_subscription,
+        node_resolver: Callable[..., Any] = resolve_public_node_servers,
         telegram_probe_function: TelegramProbeFunction = probe_telegram_session,
         clock: Callable[[], datetime] = _now,
         monotonic: Callable[[], float] = time.monotonic,
@@ -166,6 +184,7 @@ class Collector:
         self.transport_factory = transport_factory
         self.keygen_function = keygen_function
         self.subscription_fetcher = subscription_fetcher
+        self.node_resolver = node_resolver
         self.telegram_probe_function = telegram_probe_function
         self._vpn_runtime = vpn_runtime_factory(self.paths.private_dir)
         self.clock = clock
@@ -181,6 +200,8 @@ class Collector:
         self._vpn_repair_state = "idle"
         self._vpn_repair_attempted = 0
         self._vpn_repair_error_type: Optional[str] = None
+        self._telegram_stall_ticks = 0
+        self._vpn_reresolve_after_mono: Optional[float] = None
         self._last_attempt: Optional[tuple[int, float]] = None
         # Pre-lock Telegram metadata access has no authenticated server clock.
         # A single in-process monotonic lease prevents wall-clock rollback from
@@ -253,6 +274,46 @@ class Collector:
         # The runtime validator is a second, independent boundary before exec.
         render_mihomo_config(node)
         return node
+
+    @staticmethod
+    def _take_node_origin(value: Any) -> tuple:
+        """Отделить имя хоста от узла.
+
+        Набор ключей узла сверяется строгим множеством, поэтому транспортный
+        ключ обязан быть снят ДО валидации. Узел без ключа — это узел из
+        старой версии или из теста: тогда имени просто нет."""
+        if not isinstance(value, dict):
+            return value, None
+        node = dict(value)
+        origin = node.pop(ORIGIN_KEY, None)
+        if origin is not None and (
+                not isinstance(origin, str) or not _valid_dns_hostname(origin)):
+            origin = None
+        return node, origin
+
+    def _write_node_origin(self, origin: Optional[str]) -> None:
+        """Сохранить имя хоста активного узла — или убрать протухшее.
+
+        Файл пишется РЯДОМ с узлом и всегда после него: имя без узла
+        бесполезно, а имя от прежнего узла хуже, чем его отсутствие — по нему
+        авторезолв переехал бы на чужой адрес."""
+        if origin is None:
+            unlink_atomic_material((self.paths.vpn_node_origin,))
+            return
+        atomic_write_json(
+            self.paths.vpn_node_origin, {"hostname": origin}, 0o600)
+
+    def _read_node_origin(self) -> Optional[str]:
+        try:
+            value = read_json(self.paths.vpn_node_origin, max_bytes=4 * 1024)
+        except (FileNotFoundError, ValueError, OSError):
+            return None
+        if not isinstance(value, dict) or set(value) != {"hostname"}:
+            return None
+        hostname = value["hostname"]
+        if not isinstance(hostname, str) or not _valid_dns_hostname(hostname):
+            return None
+        return hostname
 
     def _load_vpn_node(self) -> Dict[str, Any]:
         if not self.paths.vpn_active_node.exists():
@@ -367,6 +428,8 @@ class Collector:
             "vpn_repair_state": self._vpn_repair_state,
             "vpn_repair_attempted": self._vpn_repair_attempted,
             "vpn_repair_error_type": self._vpn_repair_error_type,
+            "telegram_stall_ticks": self._telegram_stall_ticks,
+            "vpn_node_origin_known": self._read_node_origin() is not None,
         }
         if self.paths.settings.exists():
             try:
@@ -488,7 +551,8 @@ class Collector:
             "openrouter_public_key",
             "vpn_configured", "vpn_ready", "vpn_migration_required",
             "vpn_repairing", "vpn_repair_state", "vpn_repair_attempted",
-            "vpn_repair_error_type",
+            "vpn_repair_error_type", "telegram_stall_ticks",
+            "vpn_node_origin_known",
         }
         status = {key: status.get(key) for key in allowed}
         atomic_write_json(self.paths.status, status, 0o600)
@@ -581,10 +645,12 @@ class Collector:
                 self._require_current_epoch(epoch)
                 if not isinstance(nodes, list) or not nodes:
                     raise RuntimeError("Telegram VPN subscription is empty")
-                node = self._validate_vpn_node(nodes[0])
+                node, origin = self._take_node_origin(nodes[0])
+                node = self._validate_vpn_node(node)
                 await self._start_vpn_node(node)
                 self._require_current_epoch(epoch)
                 atomic_write_json(self.paths.vpn_active_node, node, 0o600)
+                self._write_node_origin(origin)
                 save_initial_config(self.paths, settings, credentials, known_host)
             except BaseException:
                 try:
@@ -597,6 +663,7 @@ class Collector:
                 finally:
                     unlink_atomic_material((
                         self.paths.vpn_active_node,
+                        self.paths.vpn_node_origin,
                         self.paths.credentials,
                         self.paths.known_hosts,
                         self.paths.settings,
@@ -692,6 +759,118 @@ class Collector:
             if self._vpn_repair_task is current:
                 self._vpn_repair_task = None
 
+    async def _run_vpn_reresolve(self, epoch: asyncio.Event) -> None:
+        """Переехать на текущий адрес того же узла после ротации.
+
+        Провайдер ротирует Primary IP по расписанию, а приложение держит
+        IP-литерал: имя резолвится один раз, при настройке. После ротации
+        Telegram молча пропадает до ручной замены узла — инцидент 13–16.08 и
+        снова 19.08. Подписка на диске не хранится (bearer-секрет), поэтому
+        перефетчить её нельзя; зато имя хоста не секрет и лежит рядом с узлом.
+
+        Дальше работает тот же путь, что и у ручной замены: кандидат
+        поднимается, проверяется probe'ом авторизации через SOCKS и
+        коммитится, только если Telegram на нём ожил. Старый узел до этого
+        байт-в-байт нетронут, а при неудаче возвращается его runtime."""
+        current = asyncio.current_task()
+        try:
+            hostname = self._read_node_origin()
+            if hostname is None:
+                raise VPNRepairFailed("VPN node origin is unknown")
+            async with self.state_lock:
+                self._require_current_epoch(epoch)
+                old_node = self._load_vpn_node()
+            # Резолв синхронный и блокирующий, поэтому уходит в поток. Поток
+            # переживёт таймаут, но несёт только DNS-запрос: ни секретов, ни
+            # состояния — в отличие от bearer-фетчера, которому нужен
+            # killable процесс.
+            resolved = await self._bounded_external(
+                asyncio.to_thread(
+                    self.node_resolver,
+                    [{**old_node, "server": hostname}],
+                ),
+                VPN_RESOLVE_TIMEOUT_S,
+            )
+            self._require_current_epoch(epoch)
+            candidate = resolved[0]
+            if candidate["server"] == old_node["server"]:
+                # Адрес не менялся — маршрут сломан чем-то другим. Гасить и
+                # поднимать тот же узел бессмысленно и только добавит простоя.
+                raise VPNRepairFailed("VPN node address did not change")
+            self._vpn_repair_state = "waiting_for_run"
+            self._write_status(
+                last_result="vpn_repairing", last_error_type=None)
+            await self._replace_vpn_nodes(
+                [{**candidate, ORIGIN_KEY: hostname}], epoch)
+        except asyncio.CancelledError:
+            self._vpn_repair_state = "idle"
+            self._vpn_repair_error_type = None
+            raise
+        except Exception as exc:
+            self._vpn_repair_state = "failed"
+            self._vpn_repair_error_type = (
+                "VPNRollbackError" if isinstance(exc, VPNRollbackError)
+                else type(exc).__name__)
+            if (isinstance(exc, asyncio.TimeoutError)
+                    and self._vpn_repair_attempted == 0):
+                # Не дождались run_lock: тик мёртвого маршрута тянется долго,
+                # а попытки не было вовсе. Списать за неё получасовое окно
+                # значило бы отложить лечение из-за самой поломки.
+                self._vpn_reresolve_after_mono = None
+            try:
+                self._write_status(
+                    last_result="vpn_repair_failed",
+                    last_error_type=self._vpn_repair_error_type,
+                )
+            except Exception:
+                # Фоновая задача не имеет права уронить тик из-за неудачной
+                # записи статуса.
+                pass
+        else:
+            self._vpn_repair_state = "succeeded"
+            self._vpn_repair_error_type = None
+            try:
+                self._write_status(
+                    last_result="vpn_repaired", last_error_type=None)
+            except Exception:
+                pass
+        finally:
+            if self._vpn_repair_task is current:
+                self._vpn_repair_task = None
+
+    def _note_telegram_stall(self, stalled: bool) -> None:
+        """Счётчик подряд идущих тиков с полностью недоступным Telegram."""
+        if not stalled:
+            self._telegram_stall_ticks = 0
+            return
+        self._telegram_stall_ticks += 1
+
+    def _maybe_start_vpn_reresolve(self) -> bool:
+        """Запустить авторезолв, если маршрут выглядит протухшим.
+
+        Гейты намеренно консервативные: авторезолв гасит рабочий маршрут,
+        поэтому он не должен срабатывать ни от одиночного таймаута, ни чаще
+        раза в полчаса, ни поверх уже идущей замены узла."""
+        if self._telegram_stall_ticks < VPN_STALL_TICKS_BEFORE_RERESOLVE:
+            return False
+        if (self._vpn_repair_task is not None
+                and not self._vpn_repair_task.done()):
+            return False
+        if self._read_node_origin() is None:
+            return False
+        now_mono = self.monotonic()
+        if (self._vpn_reresolve_after_mono is not None
+                and now_mono < self._vpn_reresolve_after_mono):
+            return False
+        self._vpn_reresolve_after_mono = now_mono + VPN_RERESOLVE_COOLDOWN_S
+        self._telegram_stall_ticks = 0
+        self._vpn_repair_state = "fetching"
+        self._vpn_repair_attempted = 0
+        self._vpn_repair_error_type = None
+        self._vpn_repair_task = asyncio.create_task(
+            self._run_vpn_reresolve(self.revoked))
+        return True
+
     async def _replace_vpn_nodes(
         self, nodes: Any, epoch: asyncio.Event,
     ) -> None:
@@ -722,21 +901,24 @@ class Collector:
                 raise VPNRepairFailed("VPN subscription is empty")
             old_key = canonical_json_bytes(old_node)
             candidates: List[Dict[str, Any]] = []
+            origins: List[Optional[str]] = []
             seen = {old_key}
             for value in nodes:
-                candidate = self._validate_vpn_node(value)
+                candidate, origin = self._take_node_origin(value)
+                candidate = self._validate_vpn_node(candidate)
                 key = canonical_json_bytes(candidate)
                 if key in seen:
                     continue
                 seen.add(key)
                 if len(candidates) < VPN_REPAIR_MAX_CANDIDATES:
                     candidates.append(candidate)
+                    origins.append(origin)
             if not candidates:
                 raise VPNRepairFailed("VPN subscription has no new candidates")
             await asyncio.wait_for(
                 self._test_vpn_candidates(
                     candidates, old_bytes, old_node,
-                    credentials, session, epoch,
+                    credentials, session, epoch, origins,
                 ),
                 timeout=VPN_REPAIR_TEST_TIMEOUT_S,
             )
@@ -752,6 +934,7 @@ class Collector:
         credentials: Dict[str, Any],
         session: str,
         epoch: asyncio.Event,
+        origins: List[Optional[str]],
     ) -> None:
         runtime_touched = False
         committed = False
@@ -762,7 +945,7 @@ class Collector:
             runtime_touched = True
             await self._stop_vpn()
             self._vpn_repair_state = "testing"
-            for candidate in candidates:
+            for candidate, origin in zip(candidates, origins):
                 self._require_current_epoch(epoch)
                 self._vpn_repair_attempted += 1
                 self._write_status(
@@ -792,6 +975,9 @@ class Collector:
                         raise RuntimeError("Telegram VPN node changed concurrently")
                     atomic_write_json(
                         self.paths.vpn_active_node, candidate, 0o600)
+                    # Имя хоста пишется под тем же lock'ом и сразу за узлом:
+                    # разъехавшись, они дали бы авторезолв на чужой адрес.
+                    self._write_node_origin(origin)
                 committed = True
                 return
             raise VPNRepairFailed("no working Telegram VPN node was found")
@@ -1185,6 +1371,11 @@ class Collector:
                     self._vpn_repair_state = "idle"
                     self._vpn_repair_attempted = 0
                     self._vpn_repair_error_type = None
+                    # Счётчик и cooldown принадлежат прежней эпохе: пережив
+                    # reset, они дали бы авторезолв поверх узла нового
+                    # владельца — или, наоборот, запретили бы его на полчаса.
+                    self._telegram_stall_ticks = 0
+                    self._vpn_reresolve_after_mono = None
         result = self._write_status(
             phase="fresh", configured=False, chat_locked=False,
             consent_active=False, pending_digest_upload=False,
@@ -1223,6 +1414,8 @@ class Collector:
             self._vpn_repair_state = "idle"
             self._vpn_repair_attempted = 0
             self._vpn_repair_error_type = None
+            self._telegram_stall_ticks = 0
+            self._vpn_reresolve_after_mono = None
             return self._write_status(
                 phase="fresh", configured=False, chat_locked=False,
                 consent_active=False, pending_digest_upload=False,
@@ -1904,7 +2097,8 @@ class Collector:
 
         cutoff = parse_utc(gate["server_time"], "server_time")
         first = acknowledged is None and sequence == 1
-        per_chat_budget = max(1024, MAX_PROMPT_BYTES // len(chats))
+        per_chat_budget = max(1024, PROMPT_PREFIX_BYTES + (
+            MAX_PROMPT_BYTES - PROMPT_PREFIX_BYTES) // len(chats))
         digest_chats: List[DigestChat] = []
         ranges: List[Dict[str, int]] = []
         for chat, cursor in zip(chats, gate["digest"]["cursors"]):
@@ -1952,7 +2146,10 @@ class Collector:
                 "message_count": len(fetched.messages),
             })
             if fetched.messages:
-                digest_chats.append(DigestChat(chat["title"], fetched.messages))
+                digest_chats.append(DigestChat(
+                    chat["title"], fetched.messages,
+                    supergroup_link_prefix(chat["chat_id"]),
+                ))
 
         total = sum(row["message_count"] for row in ranges)
         if total == 0:
@@ -1991,8 +2188,26 @@ class Collector:
             generated_at=self._generated_at(gate, gate_received_mono),
         )
         pending = canonical_digest_bytes(payload)
-        if len(pending) > gate["digest"]["max_upload_bytes"]:
-            raise RuntimeError("digest exceeds receiver max_upload_bytes")
+        limit = gate["digest"]["max_upload_bytes"]
+        if len(pending) > limit:
+            # Приёмник объявляет свой потолок в gate, и он может быть НИЖЕ
+            # нашего: приложение обновляется раньше приёмника, иначе тот
+            # объявил бы потолок, которого мы ещё не умеем принимать, и
+            # уронил бы вместе с дайджестом монитор упоминаний. В этот зазор
+            # выпуск не должен пропадать целиком — лучше отдать начало и
+            # сказать вслух, что хвост срезан.
+            digest = self._fit_digest(digest, limit, lambda text: len(
+                canonical_digest_bytes(build_digest_upload(
+                    source_id=source_id, gate=gate, chat_ranges=ranges,
+                    digest=text, model=settings["openrouter_model"],
+                    generated_at=self._generated_at(gate, gate_received_mono),
+                ))))
+            payload = build_digest_upload(
+                source_id=source_id, gate=gate, chat_ranges=ranges,
+                digest=digest, model=settings["openrouter_model"],
+                generated_at=self._generated_at(gate, gate_received_mono),
+            )
+            pending = canonical_digest_bytes(payload)
         async with self.state_lock:
             self._assert_active_locked(
                 revoked, source_id, chat_ids,
@@ -2009,6 +2224,15 @@ class Collector:
             safe_unlink(self.paths.pending)
         self._last_attempt = None
         return "uploaded_digest", total
+
+    @staticmethod
+    def _fit_digest(digest: str, limit: int,
+                    size_of: Callable[[str], int]) -> str:
+        """Уложить выпуск в потолок приёмника, срезав хвост по строкам."""
+        fitted = fit_by_lines(digest, size_of, limit)
+        if fitted is None:
+            raise RuntimeError("digest exceeds receiver max_upload_bytes")
+        return fitted
 
     async def _ensure_openrouter_key(self, source_id: str) -> None:
         """Догенерировать ключ канала на уже настроенном экземпляре.
@@ -2027,11 +2251,24 @@ class Collector:
             KEYGEN_TIMEOUT_S)
 
     async def run_once(self) -> Dict[str, Any]:
+        """Тик наблюдения; замена протухшего адреса запускается после него.
+
+        Авторезолв берёт `run_lock` сам, поэтому стартовать его изнутри тика
+        значило бы заставить ждать конца этого же тика — а мёртвый маршрут
+        растягивает тик на десятки минут (по 180 с на чат плюс дайджест).
+        Попытка сгорала бы вместе с получасовым cooldown."""
+        try:
+            return await self._run_once_locked()
+        finally:
+            self._maybe_start_vpn_reresolve()
+
+    async def _run_once_locked(self) -> Dict[str, Any]:
         async with self.run_lock:
             current_task = asyncio.current_task()
             self._active_run_task = current_task
             revoked = self.revoked
             failed_chat_count = 0
+            gate_answered = False
             try:
                 async with self.state_lock:
                     self._require_no_revocation_warning()
@@ -2054,6 +2291,7 @@ class Collector:
                 transport = self.transport_factory(self.paths, upload_config)
                 gate, gate_received_mono = await self._fresh_gate(
                     transport, source_id, chat_ids, revoked)
+                gate_answered = True
                 await self._ensure_vpn()
                 self._require_current_epoch(revoked)
                 gateway = self._gateway(credentials)
@@ -2076,6 +2314,16 @@ class Collector:
                     failed_chat_count = len(chat_ids)
                     gate, gate_received_mono = await self._fresh_gate(
                         transport, source_id, chat_ids, revoked)
+                # Gate живёт через ssh к приёмнику, мимо VPN, поэтому свежий
+                # gate рядом с недоступным Telegram — это подпись мёртвого
+                # маршрута, а не занятого Telegram. Форм отказа две, и обе
+                # обязаны считаться: агрегатный таймаут монитора и штатный
+                # возврат, где по своему таймауту отвалились ВСЕ чаты, —
+                # второй встречается чаще и раньше выглядел как успех.
+                self._note_telegram_stall(
+                    len(chat_ids) > 0
+                    and (monitor_error_type == "TimeoutError"
+                         or failed_chat_count >= len(chat_ids)))
                 watch = self._load_watch_state(source_id, chat_ids)
                 if watch["phase"] != "active":
                     return self._write_status(
@@ -2104,6 +2352,13 @@ class Collector:
                     failed_chat_count=0,
                 )
             except Exception as exc:
+                # Протухший адрес чаще отдаёт быстрый отказ, чем зависание:
+                # переиспользованный другим арендатором IP отвечает RST, и
+                # Telethon поднимает ConnectionError задолго до таймаута.
+                # Считать stall'ом только TimeoutError значило бы не увидеть
+                # ровно тот отказ, ради которого всё и делалось.
+                if gate_answered:
+                    self._note_telegram_stall(True)
                 return self._write_status(
                     last_run_at=self.clock().isoformat(), last_result="error",
                     last_error_type=type(exc).__name__,

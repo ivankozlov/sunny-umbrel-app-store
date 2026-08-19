@@ -8,16 +8,18 @@ import socket
 import ssl
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .contracts import validate_digest_text
 from .openrouter_tunnel import TUNNEL_HOST, TUNNEL_PORT
 from .models import DigestChat
-from .prompting import render_digest_prompt
+from .prompting import digest_sources, fit_by_lines, render_digest_prompt
 from .storage import canonical_json_bytes
+from .version import MAX_DIGEST_CHARS
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+NOTHING_NOTABLE = "За сутки в чатах не было ничего существенного."
 # Запрос обязан идти через DO: прямой путь из домашней сети отбивает фильтр
 # (`Access denied by security policy`), а через VLESS-туннель Cloudflare
 # отвечает 403 с любого узла (инцидент 2026-08-17/18). Дроплет openrouter.ai
@@ -27,9 +29,16 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # напрямую, а TLS остаётся сквозным — ни DO, ни ssh тела запроса не видят.
 # Имя хоста для проверки сертификата и SNI задаётся отдельно, иначе python
 # проверял бы сертификат против 127.0.0.1 и соединение падало бы.
-MAX_RESPONSE_BYTES = 128 * 1024
+# Ответ теперь структурный и вмещает выпуск целиком: 24 000 UTF-16
+# единиц кириллицы — это уже ~48 КБ UTF-8, плюс JSON-обвязка и
+# экранирование. Потолок держится выше того, что физически способен
+# выдать max_tokens, чтобы предел ставила модель, а не наш буфер.
+MAX_RESPONSE_BYTES = 256 * 1024
 MAX_WORKER_REQUEST_BYTES = 128 * 1024
-WORKER_SCHEMA = "sunny.personal-chats.openrouter-worker.v2"
+# v3: воркер отдаёт СТРУКТУРУ ответа модели, а текст со ссылками
+# собирает родитель. Карта «номер → t.me-ссылка» живёт только там,
+# поэтому message_id и peer_id не попадают даже в подпроцесс.
+WORKER_SCHEMA = "sunny.personal-chats.openrouter-worker.v3"
 WORKER_TERMINATE_GRACE_S = 2.0
 
 
@@ -77,6 +86,115 @@ class _TunnelHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(build, req)
 
 
+def _utf16_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _clean(value: Any, limit: int) -> str:
+    """Строка из ответа модели: обрезаем и чистим, но не доверяем длине."""
+    if not isinstance(value, str):
+        raise OpenRouterError("OpenRouter digest field is not text")
+    text = " ".join(value.split())
+    return text[:limit]
+
+
+def _link(sources: Dict[int, str], ref: Any) -> Optional[str]:
+    """Ссылка по номеру, названному моделью.
+
+    `isinstance(True, int)` — истина, поэтому bool отсекается явно: `ref: true`
+    иначе дал бы ссылку на ПЕРВОЕ сообщение прогона. Строку с цифрами принимаем
+    (модели легко отдают "12" вместо 12), всё остальное — не источник."""
+    if isinstance(ref, bool):
+        return None
+    if isinstance(ref, str) and ref.isdigit():
+        ref = int(ref)
+    if not isinstance(ref, int):
+        return None
+    return sources.get(ref)
+
+
+def render_digest(parsed: Any, sources: Dict[int, str]) -> str:
+    """Собрать текст выпуска из структурированного ответа.
+
+    Ссылки подставляет КОД по порядковым номерам: модель их не пишет и
+    Telegram-идентификаторов не видит. Номер вне карты источников молча
+    отбрасывается — выдуманная моделью ссылка не должна дойти до Ивана.
+    Ссылка стоит отдельной строкой: доставка снимает markdown, а голый URL
+    Telegram делает кликабельным сам."""
+    if not isinstance(parsed, dict) or set(parsed) != {"chats"}:
+        raise OpenRouterError("OpenRouter digest JSON has unexpected fields")
+    chats = parsed["chats"]
+    if not isinstance(chats, list):
+        raise OpenRouterError("OpenRouter digest chats are invalid")
+
+    blocks = []
+    for chat in chats:
+        if not isinstance(chat, dict) or set(chat) - {"chat", "topics", "links"}:
+            raise OpenRouterError("OpenRouter digest chat is invalid")
+        title = _clean(chat.get("chat", ""), 160)
+        topics = chat.get("topics") or []
+        links = chat.get("links") or []
+        if not isinstance(topics, list) or not isinstance(links, list):
+            raise OpenRouterError("OpenRouter digest sections are invalid")
+
+        lines = []
+        for topic in topics:
+            if not isinstance(topic, dict):
+                raise OpenRouterError("OpenRouter digest topic is invalid")
+            lines.append(f"▸ {_clean(topic.get('title', ''), 200)}")
+            summary = _clean(topic.get("summary", ""), 4000)
+            if summary:
+                lines.append(summary)
+            refs = topic.get("refs") or []
+            if isinstance(refs, list):
+                for ref in refs[:5]:
+                    link = _link(sources, ref)
+                    if link:
+                        lines.append(link)
+            lines.append("")
+
+        link_lines = []
+        for row in links:
+            if not isinstance(row, dict):
+                raise OpenRouterError("OpenRouter digest link is invalid")
+            note = _clean(row.get("note", ""), 400)
+            entry = _clean(row.get("title", ""), 200)
+            link_lines.append(f"• {entry}" + (f" — {note}" if note else ""))
+            ref = row.get("ref")
+            link = _link(sources, ref)
+            if link:
+                link_lines.append(f"  {link}")
+
+        if not lines and not link_lines:
+            continue
+        block = [f"**{title}**", ""] if title else []
+        block.extend(lines)
+        if link_lines:
+            block.append("📎 Ссылки и материалы")
+            block.extend(link_lines)
+            block.append("")
+        blocks.append("\n".join(block).strip())
+
+    if not blocks:
+        # Промпт прямо разрешает «за сутки ничего стоящего»: пустые списки у
+        # каждого чата — это ответ, а не сбой. Отказ здесь оборачивался бы
+        # ночным `missing_daily_digest` вместо честного тихого дня. Но пустой
+        # `chats` — уже не ответ: модель не прошла ни по одному чату.
+        if not chats:
+            raise OpenRouterError("OpenRouter digest has no chats")
+        return NOTHING_NOTABLE
+    text = "\n\n".join(blocks).strip()
+    if _utf16_units(text) <= MAX_DIGEST_CHARS:
+        return text
+    # Модель может выдать больше, чем помещается в потолок дайджеста: тем
+    # много, каждая обрезана по отдельности, а их сумма никем не гейтится.
+    # Ронять из-за этого весь выпуск — худший исход, чем отдать начало.
+    fitted = fit_by_lines(text, _utf16_units, MAX_DIGEST_CHARS)
+    if fitted is None:
+        raise OpenRouterError("OpenRouter digest text is invalid")
+    return fitted
+
+
 def _prompt(chats: List[DigestChat]) -> str:
     try:
         return render_digest_prompt(chats)
@@ -84,7 +202,8 @@ def _prompt(chats: List[DigestChat]) -> str:
         raise OpenRouterError("prompt exceeds bounded input size") from exc
 
 
-def _blocking_digest_prompt(prompt: str, model: str, api_key: str) -> str:
+def blocking_fetch_answer(prompt: str, model: str, api_key: str) -> Any:
+    """Запрос к OpenRouter и разбор JSON-ответа модели. Текст НЕ собирает."""
     request_body = canonical_json_bytes({
         "model": model,
         "provider": {
@@ -96,7 +215,9 @@ def _blocking_digest_prompt(prompt: str, model: str, api_key: str) -> str:
             {"role": "user", "content": prompt},
         ],
         "temperature": 0,
-        "max_tokens": 16_384,
+        # Выпуск стал длиннее одного сообщения Telegram: 16 384 токена
+        # адаптивное мышление Opus съедало почти целиком.
+        "max_tokens": 32_768,
         "response_format": {"type": "json_object"},
     })
     request = urllib.request.Request(
@@ -137,12 +258,11 @@ def _blocking_digest_prompt(prompt: str, model: str, api_key: str) -> str:
         raise
     except (KeyError, IndexError, TypeError, ValueError, UnicodeDecodeError):
         raise OpenRouterError("OpenRouter response shape is invalid") from None
-    if not isinstance(parsed, dict) or set(parsed) != {"digest"}:
-        raise OpenRouterError("OpenRouter digest JSON has unexpected fields")
-    digest = parsed["digest"]
-    if not isinstance(digest, str):
-        raise OpenRouterError("OpenRouter digest is not text")
-    digest = digest.strip()
+    return parsed
+
+
+def _render_and_validate(parsed: Any, chats: List[DigestChat]) -> str:
+    digest = render_digest(parsed, digest_sources(chats))
     try:
         validate_digest_text(digest, allow_empty=False)
     except ValueError as exc:
@@ -151,7 +271,9 @@ def _blocking_digest_prompt(prompt: str, model: str, api_key: str) -> str:
 
 
 def _blocking_digest(chats: List[DigestChat], model: str, api_key: str) -> str:
-    return _blocking_digest_prompt(_prompt(chats), model, api_key)
+    """Синхронный путь целиком — им пользуются тесты контракта запроса."""
+    return _render_and_validate(
+        blocking_fetch_answer(_prompt(chats), model, api_key), chats)
 
 
 async def _terminate_worker_inner(process: Any) -> None:
@@ -265,9 +387,8 @@ async def create_digest(chats: List[DigestChat], model: str, api_key: str,
         response = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise OpenRouterError("OpenRouter worker response is invalid") from None
-    if not isinstance(response, dict) or set(response) != {"digest"}:
+    if not isinstance(response, dict) or set(response) != {"answer"}:
         raise OpenRouterError("OpenRouter worker response is invalid")
-    try:
-        return validate_digest_text(response["digest"], allow_empty=False)
-    except ValueError:
-        raise OpenRouterError("OpenRouter worker digest is invalid") from None
+    # Сборка текста и подстановка ссылок — здесь, а не в воркере: только у
+    # родителя есть карта «номер → сообщение», и она никуда не уезжает.
+    return _render_and_validate(response["answer"], chats)

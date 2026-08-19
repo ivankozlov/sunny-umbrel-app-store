@@ -13,8 +13,11 @@ import sunny_digest.vpn_subscription_worker as subscription_worker
 from sunny_digest.vpn_subscription import (
     MAX_SUBSCRIPTION_BYTES,
     WORKER_SCHEMA,
+    SubscriptionFetchError,
+    _decode_worker_nodes,
     _fetch_https_bytes,
     fetch_vless_subscription,
+    origin_hostname,
     parse_vless_subscription,
     resolve_public_node_servers,
     resolve_public_subscription_host,
@@ -292,12 +295,14 @@ class SubscriptionURLTests(unittest.TestCase):
         ), patch.object(
             subscription_worker, "_fetch_https_bytes", fetch,
         ):
-            nodes = subscription_worker._fetch_nodes(
+            nodes, origins = subscription_worker._fetch_nodes(
                 "https://subscription.example/client?token=secret", 5.0,
             )
 
         self.assertEqual(calls, ["preflight", "fetch"])
         self.assertEqual(nodes[0]["server"], "1.1.1.1")
+        # Адрес задан литералом — имени хоста нет, и выдумывать его нельзя.
+        self.assertEqual(origins, [None])
 
     def test_worker_accepts_clash_yaml_and_returns_only_sanitized_nodes(self):
         def preflight(_url):
@@ -312,12 +317,13 @@ class SubscriptionURLTests(unittest.TestCase):
         ), patch.object(
             subscription_worker, "_fetch_https_bytes", fetch,
         ):
-            nodes = subscription_worker._fetch_nodes(
+            nodes, origins = subscription_worker._fetch_nodes(
                 "https://subscription.example/client?token=secret", 5.0,
             )
 
         self.assertEqual(nodes, [parsed_node()])
-        encoded = json.dumps(nodes, sort_keys=True)
+        self.assertEqual(len(origins), len(nodes))
+        encoded = json.dumps([nodes, origins], sort_keys=True)
         self.assertNotIn("DIRECT", encoded)
         self.assertNotIn("provider-choice", encoded)
 
@@ -703,7 +709,9 @@ class SubscriptionFetchTests(unittest.IsolatedAsyncioTestCase):
     async def test_default_fetch_passes_bearer_only_over_worker_stdin(self):
         secret = "secret-bearer-token"
         url = f"https://subscription.example/client?token={secret}"
-        response = json.dumps({"nodes": [parsed_node()]}, separators=(",", ":"))
+        response = json.dumps(
+            {"nodes": [parsed_node()], "origins": ["vpn.example.com"]},
+            separators=(",", ":"))
         worker = FakeWorker(response.encode())
         create = AsyncMock(return_value=worker)
 
@@ -729,7 +737,7 @@ class SubscriptionFetchTests(unittest.IsolatedAsyncioTestCase):
         node = parsed_node()
         node["server"] = "224.0.0.1"
         response = json.dumps({
-            "nodes": [node],
+            "nodes": [node], "origins": [None],
         }, separators=(",", ":")).encode()
         worker = FakeWorker(response)
         with patch(
@@ -813,6 +821,49 @@ class SubscriptionFetchTests(unittest.IsolatedAsyncioTestCase):
                     f"https://subscription.example/client?token={secret}",
                 )
         self.assertNotIn(secret, str(raised.exception))
+
+
+class TestBugVPNNodeOrigin20260819(unittest.TestCase):
+    """Имя хоста узла обязано пережить пиннинг адреса.
+
+    Резолв затирает имя IP-литералом, а подписку хранить нельзя, поэтому
+    после ротации Primary IP новый адрес взять неоткуда — приложение молча
+    теряет Telegram до ручной замены узла (13–16.08, снова 19.08)."""
+
+    def test_hostname_survives_pinning_and_literals_yield_nothing(self):
+        parsed = parse_vless_subscription(
+            vless_uri(host="vpn.example.com").encode())
+        self.assertEqual(origin_hostname(parsed[0]), "vpn.example.com")
+
+        def resolver(host, port, **_kwargs):
+            self.assertEqual(host, "vpn.example.com")
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                     ("1.1.1.9", port))]
+
+        resolved = resolve_public_node_servers(parsed, resolver=resolver)
+        # Узел уезжает с литералом, а имя остаётся у вызывающего.
+        self.assertEqual(resolved[0]["server"], "1.1.1.9")
+        self.assertEqual(origin_hostname(resolved[0]), None)
+        # Адрес, заданный литералом, имени не имеет и выдумывать его нельзя.
+        self.assertIsNone(origin_hostname(parsed_node("1.1.1.1")))
+
+    def test_worker_envelope_carries_one_origin_per_node(self):
+        nodes = [parsed_node("1.1.1.1")]
+        raw = json.dumps(
+            {"nodes": nodes, "origins": ["vpn.example.com"]},
+            separators=(",", ":")).encode()
+        decoded = _decode_worker_nodes(raw)
+        self.assertEqual(decoded[0]["origin"], "vpn.example.com")
+
+        for broken in (
+            {"nodes": nodes},
+            {"nodes": nodes, "origins": []},
+            {"nodes": nodes, "origins": ["not a hostname"]},
+            {"nodes": nodes, "origins": [{"hostname": "vpn.example.com"}]},
+        ):
+            with self.assertRaises(SubscriptionFetchError):
+                _decode_worker_nodes(
+                    json.dumps(broken, separators=(",", ":")).encode())
 
 
 if __name__ == "__main__":

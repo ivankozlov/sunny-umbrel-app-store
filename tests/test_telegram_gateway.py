@@ -455,7 +455,10 @@ class TelegramFetchTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(prompt_size(result.messages), MAX_PROMPT_BYTES)
 
     async def test_per_chat_prompt_budget_stops_before_omitted_text(self):
-        budget = 2_000
+        # Бюджет чата считается вместе с инструкцией промпта, поэтому
+        # отсчитываем его ОТ неё: иначе тест ломается каждый раз, когда
+        # инструкция меняется, и выглядит это как поломка бюджета.
+        budget = prompt_size([]) + 2_000
         rows = [message(i, text="я" * 500) for i in range(1, 8)]
         client = FakeClient(rows, upper_id=7)
         gateway = GatewayUnderTest(client)

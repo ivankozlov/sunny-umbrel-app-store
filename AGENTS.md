@@ -48,6 +48,25 @@ keys, or rendered runtime configuration.
   request and torn down after; a dead tunnel fails the attempt rather than
   falling back, and keygen lives in the digest path so its failure cannot stop
   mention monitoring.
+- The provider rotates its node address on a schedule while the app pins an IP
+  literal, so Telegram vanished silently until someone replaced the node by
+  hand (13–16.08, again on 19.08). The subscription URL is bearer material and
+  is deliberately never stored, so the recovery key is the node's host name,
+  which is not a secret: it is written next to the active node, under the same
+  lock, and wiped by factory reset together with the stall counter and the
+  cooldown. The detector counts a tick as stalled whenever the receiver gate —
+  which reaches the droplet outside the VPN — answered but Telegram did not, in
+  any of its forms: the aggregate monitor timeout, a normal return where every
+  chat failed on its own timeout, or any exception raised after the gate. Only
+  the first form is a hang; a stale address reassigned to another tenant
+  answers with RST, so watching for timeouts alone would miss the very failure
+  this exists for. After three such ticks the app re-resolves the name and
+  moves itself, starting the attempt outside the run lock it will need.
+  The candidate goes through the same path as a manual replacement: it is
+  started, proven by a killable SOCKS authorization probe, and only then
+  committed; an unchanged address is refused before the route is touched, and
+  attempts are rate-limited. A node configured by an older version has no
+  stored host name, and one manual replacement is what restores self-healing.
 - Locked-state VPN repair preserves the Telegram session, immutable chat set,
   receiver generation, and durable monitor/digest state. It downloads before
   taking the run lock, then tests bounded candidates in provider order. Each
@@ -120,6 +139,31 @@ keys, or rendered runtime configuration.
   mention-bearing range is marked read only after its event batch has a durable
   receiver receipt; a no-mention range is checkpointed locally before read-ACK.
   Read-ACK always uses the exact peer and a bounded `max_id`.
+- The model returns structure, never a rendered message: chats, topics with
+  summaries, and a separate list of links, each pointing at sources by the
+  per-run ordinal `n` printed in the prompt rows. The killable worker returns
+  that structure verbatim (`worker.v3`); the digest text and every
+  `https://t.me/c/<peer>/<id>` link are assembled in the parent, which is the
+  only process holding the ordinal-to-message map. Stable Telegram message IDs
+  therefore reach neither OpenRouter nor the subprocess, and an ordinal the
+  model invented resolves to nothing and is dropped. The selection budget must
+  count the `n` field: the gateway sizes one chat at a time while the assembled
+  prompt is numbered across all of them, and bytes missing from the estimate
+  overflow the bound after selection, failing the whole day.
+- Every chat returning empty lists is an answer, not a failure — the prompt
+  explicitly allows "nothing notable today", and the issue then says so in one
+  line. An empty `chats` array is a failure: the model walked no chat at all.
+- Sections are separated by a blank line because Sunny splits the issue into
+  Telegram messages on exactly that boundary, and a chat heading is never left
+  dangling at the end of a part. The first part keeps the historical delivery
+  key, so an issue delivered before splitting existed is not re-sent.
+- The digest ceiling (24 000 UTF-16 units) and the receiver's payload ceiling
+  are two different limits, and the text is trimmed by whole lines against both
+  — an over-long issue is cut with a visible note, never dropped and never
+  refused. The receiver's ceiling arrives in the gate and may be LOWER than
+  ours: the app is released first so it can accept a raised ceiling, and only
+  then does the receiver raise it. The reverse order fails gate validation and
+  takes mention monitoring down with the digest.
 - Every OpenRouter request must set `provider.zdr=true` and
   `provider.data_collection=deny`; account/key privacy controls remain defence
   in depth and may not replace the per-request guard. Opus must use explicit

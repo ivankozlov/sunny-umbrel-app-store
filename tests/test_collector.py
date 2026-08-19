@@ -38,7 +38,15 @@ from sunny_digest.settings import (
     SETTINGS_SCHEMA,
     load_credentials,
 )
-from sunny_digest.storage import Paths, atomic_write_bytes, atomic_write_json, read_json
+from sunny_digest.contracts import supergroup_link_prefix
+from sunny_digest.prompting import DIGEST_TRUNCATION_NOTE
+from sunny_digest.storage import (
+    Paths,
+    atomic_write_bytes,
+    atomic_write_json,
+    canonical_json_bytes,
+    read_json,
+)
 
 
 NOW = datetime(2026, 8, 4, 0, 30, tzinfo=timezone.utc)
@@ -2399,6 +2407,66 @@ class TestRecentRunsJournal20260817(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status["recent_runs"][-1]["repeated"], 2)
 
 
+class TestBugDigestOverReceiverLimit20260818(unittest.IsolatedAsyncioTestCase):
+    """Выпуск длиннее потолка приёмника обрезается, а не теряется целиком.
+
+    Приложение обновляется раньше приёмника: пока тот объявляет старый
+    потолок, длинный выпуск в него не влезает. Падение здесь означало бы
+    сутки без дайджеста вместо срезанного хвоста."""
+
+    def setUp(self):
+        FakeTunnel.instances.clear()
+
+    async def test_chats_carry_the_link_prefix_of_their_own_peer(self):
+        """Префикс ссылки выводится из chat_id того же чата.
+
+        Перепутанный порядок или чужой chat_id дал бы ссылки, ведущие в
+        другую группу, — и заметить это можно было бы только по клику."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            calls = []
+            await collector_for(
+                paths, FakeGateway(paths),
+                FakeTransport(paths, gate(digest_due=True)), calls).run_once()
+
+            chats = calls[0][0]
+            self.assertTrue(chats)
+            expected = {
+                title: supergroup_link_prefix(chat_id)
+                for chat_id, title in zip(CHAT_IDS, TITLES)
+            }
+            for chat in chats:
+                self.assertEqual(chat.link_prefix, expected[chat.title])
+                self.assertTrue(chat.link_prefix.startswith("https://t.me/c/"))
+
+    async def test_long_digest_is_truncated_to_the_gate_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            transport = FakeTransport(paths, gate(digest_due=True))
+
+            async def long_digest(*_args):
+                # В потолок дайджеста (24 000 UTF-16 единиц) текст влезает,
+                # а в 32 КБ payload старого приёмника — уже нет: кириллица
+                # это два байта UTF-8 на единицу.
+                return "\n".join(f"Строка {i}: " + "и" * 200
+                                  for i in range(100))
+
+            collector = collector_for(paths, FakeGateway(paths), transport)
+            collector.digest_function = long_digest
+            result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            payload = transport.digest_uploads[-1]
+            limit = gate(digest_due=True)["digest"]["max_upload_bytes"]
+            self.assertLessEqual(
+                len(canonical_json_bytes(payload)), limit)
+            self.assertTrue(payload["digest"].endswith(
+                DIGEST_TRUNCATION_NOTE.strip()))
+            self.assertIn("Строка 0", payload["digest"])
+
+
 class TestOpenRouterTunnelLifecycle20260818(unittest.IsolatedAsyncioTestCase):
     """Канал до OpenRouter: поднимается на запрос, гасится всегда, digest-only."""
 
@@ -2499,6 +2567,308 @@ class TestResetWipesTunnelKey20260818(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(paths.openrouter_key.exists())
             self.assertFalse(paths.openrouter_public_key.exists())
             self.assertIsNone(status.get("openrouter_public_key"))
+
+
+
+
+class TestBugVPNAddressRotation20260819(unittest.IsolatedAsyncioTestCase):
+    """Ротация Primary IP не должна убивать Telegram до утра.
+
+    Провайдер меняет адрес узла по расписанию, приложение держит IP-литерал
+    (имя резолвится один раз), и Telegram молча пропадает до ручной замены
+    узла — 13–16.08 четыре ночи подряд, затем снова 19.08. Подписку на диске
+    хранить нельзя, поэтому лечение опирается на имя хоста: оно не секрет.
+    """
+
+    @staticmethod
+    def _seed_origin(paths, hostname="vpn.example.com"):
+        atomic_write_json(paths.vpn_node_origin, {"hostname": hostname}, 0o600)
+
+    def _collector(self, paths, *, runtime, probe, resolved):
+        """Резолвер подменяется целиком: DNS в тестах не спрашиваем, но путь
+        от имени хоста до узла остаётся продакшновым."""
+        def node_resolver(nodes):
+            self.assertEqual(nodes[0]["server"], "vpn.example.com")
+            return [dict(nodes[0], server=resolved)]
+
+        return Collector(
+            paths,
+            vpn_runtime_factory=lambda _private: runtime,
+            telegram_probe_function=probe,
+            node_resolver=node_resolver,
+            clock=lambda: NOW,
+        )
+
+    async def test_stall_triggers_reresolve_and_commits_the_new_address(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            self._seed_origin(paths)
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+
+            async def probe(*_args):
+                return True
+
+            collector = self._collector(
+                paths, runtime=runtime, probe=probe, resolved="9.9.9.9")
+            collector._telegram_stall_ticks = 3
+            self.assertTrue(collector._maybe_start_vpn_reresolve())
+            await collector._vpn_repair_task
+
+            self.assertEqual(collector._vpn_repair_state, "succeeded")
+            self.assertEqual(read_json(paths.vpn_active_node)["server"], "9.9.9.9")
+            # Имя хоста переживает переезд, иначе следующая ротация снова
+            # потребовала бы человека.
+            self.assertEqual(
+                read_json(paths.vpn_node_origin), {"hostname": "vpn.example.com"})
+
+    async def test_single_stall_and_unchanged_address_never_touch_the_route(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            self._seed_origin(paths)
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+
+            async def probe(*_args):
+                raise AssertionError("probe must not run")
+
+            collector = self._collector(
+                paths, runtime=runtime, probe=probe, resolved=VPN_NODE["server"])
+            # Одиночная рябь порога не достигает.
+            collector._note_telegram_stall(True)
+            collector._note_telegram_stall(True)
+            self.assertFalse(collector._maybe_start_vpn_reresolve())
+            # Успешный тик обнуляет счётчик.
+            collector._note_telegram_stall(False)
+            self.assertEqual(collector._telegram_stall_ticks, 0)
+
+            collector._telegram_stall_ticks = 3
+            self.assertTrue(collector._maybe_start_vpn_reresolve())
+            await collector._vpn_repair_task
+
+            # Адрес не менялся — маршрут не гасили и узел не переписывали.
+            self.assertEqual(collector._vpn_repair_state, "failed")
+            self.assertEqual(runtime.stop_calls, 0)
+            self.assertEqual(runtime.starts, [])
+            self.assertEqual(read_json(paths.vpn_active_node), VPN_NODE)
+
+    async def test_without_a_known_origin_nothing_starts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+
+            async def probe(*_args):
+                raise AssertionError("probe must not run")
+
+            collector = self._collector(
+                paths, runtime=runtime, probe=probe, resolved="9.9.9.9")
+            collector._telegram_stall_ticks = 9
+            # Узел настроен старой версией: имени хоста рядом нет, и выдумать
+            # его нельзя — остаётся ручная замена.
+            self.assertFalse(collector._maybe_start_vpn_reresolve())
+            self.assertIsNone(collector._vpn_repair_task)
+
+    async def test_cooldown_blocks_a_second_attempt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            self._seed_origin(paths)
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+
+            async def probe(*_args):
+                return True
+
+            collector = self._collector(
+                paths, runtime=runtime, probe=probe, resolved="9.9.9.9")
+            collector._telegram_stall_ticks = 3
+            self.assertTrue(collector._maybe_start_vpn_reresolve())
+            await collector._vpn_repair_task
+            collector._telegram_stall_ticks = 3
+            # Вторая попытка внутри окна: DNS не обновляется мгновенно, а
+            # каждая попытка гасит рабочий маршрут.
+            self.assertFalse(collector._maybe_start_vpn_reresolve())
+
+    async def test_replacement_rewrites_the_origin_of_the_new_node(self):
+        """Имя хоста обязано меняться вместе с узлом.
+
+        Осталось бы прежним — авторезолв повёл бы следующую ротацию на
+        адрес чужого узла, и отказ выглядел бы как «VPN просто не работает».
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            seed_vpn_repair_protected_files(paths)
+            self._seed_origin(paths, "old.example.com")
+            fresh = copy.deepcopy(VPN_NODE)
+            fresh["server"] = "5.5.5.5"
+
+            async def fetch(_source):
+                return [{**fresh, "origin": "new.example.com"}]
+
+            async def probe(*_args):
+                return True
+
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                subscription_fetcher=fetch,
+                telegram_probe_function=probe,
+                clock=lambda: NOW,
+            )
+            await collector.replace_vpn(
+                "https://subscription.example/client?token=secret")
+            await collector._vpn_repair_task
+
+            self.assertEqual(read_json(paths.vpn_active_node), fresh)
+            self.assertEqual(
+                read_json(paths.vpn_node_origin), {"hostname": "new.example.com"})
+
+    async def test_every_chat_failing_counts_as_a_stall_through_run_once(self):
+        """Самая частая форма мёртвого маршрута — не зависание.
+
+        Пиры отваливаются каждый по своему таймауту, батч возвращается
+        штатно, и раньше такой тик считался УСПЕХОМ и обнулял счётчик:
+        авторезолв не запускался ни разу именно в целевом сценарии."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            self._seed_origin(paths)
+            gateway = FakeGateway(paths)
+            gateway.scan_failures = list(CHAT_IDS)
+            collector = collector_for(
+                paths, gateway, FakeTransport(paths, gate(digest_due=False)))
+            collector.node_resolver = lambda nodes: [
+                dict(nodes[0], server="9.9.9.9")]
+
+            async def probe(*_args):
+                return True
+
+            collector.telegram_probe_function = probe
+
+            for _ in range(collector_module.VPN_STALL_TICKS_BEFORE_RERESOLVE):
+                gateway.scan_failures = list(CHAT_IDS)
+                await collector.run_once()
+
+            self.assertIsNotNone(collector._vpn_repair_task)
+            await collector._vpn_repair_task
+            self.assertEqual(read_json(paths.vpn_active_node)["server"], "9.9.9.9")
+
+    async def test_connection_error_counts_as_a_stall_through_run_once(self):
+        """Протухший адрес, переиспользованный другим арендатором, отвечает
+        RST: Telethon поднимает ConnectionError задолго до таймаута, и тик
+        уходит в общий except. Этот путь тоже обязан взводить детектор."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            self._seed_origin(paths)
+            gateway = FakeGateway(paths)
+
+            async def dead_route(*_args, **_kwargs):
+                raise ConnectionError("Connection to Telegram failed")
+
+            gateway.snapshot_and_scan_mentions = dead_route
+            collector = collector_for(
+                paths, gateway, FakeTransport(paths, gate(digest_due=False)))
+            collector.node_resolver = lambda nodes: [
+                dict(nodes[0], server="9.9.9.9")]
+
+            async def probe(*_args):
+                return True
+
+            collector.telegram_probe_function = probe
+
+            for _ in range(collector_module.VPN_STALL_TICKS_BEFORE_RERESOLVE):
+                status = await collector.run_once()
+            self.assertEqual(status["last_error_type"], "ConnectionError")
+
+            self.assertIsNotNone(collector._vpn_repair_task)
+            await collector._vpn_repair_task
+
+    async def test_cooldown_expires_and_allows_a_second_attempt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            self._seed_origin(paths)
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            clock = [1000.0]
+
+            async def probe(*_args):
+                return True
+
+            def node_resolver(nodes):
+                return [dict(nodes[0], server="9.9.9.9")]
+
+            collector = Collector(
+                paths,
+                vpn_runtime_factory=lambda _private: runtime,
+                telegram_probe_function=probe,
+                node_resolver=node_resolver,
+                clock=lambda: NOW,
+                monotonic=lambda: clock[0],
+            )
+            collector._telegram_stall_ticks = (
+                collector_module.VPN_STALL_TICKS_BEFORE_RERESOLVE)
+            self.assertTrue(collector._maybe_start_vpn_reresolve())
+            await collector._vpn_repair_task
+
+            collector._telegram_stall_ticks = (
+                collector_module.VPN_STALL_TICKS_BEFORE_RERESOLVE)
+            self.assertFalse(collector._maybe_start_vpn_reresolve())
+            clock[0] += collector_module.VPN_RERESOLVE_COOLDOWN_S + 1
+            collector._telegram_stall_ticks = (
+                collector_module.VPN_STALL_TICKS_BEFORE_RERESOLVE)
+            # Окно истекло — следующая ротация не должна ждать человека.
+            self.assertTrue(collector._maybe_start_vpn_reresolve())
+            await collector._vpn_repair_task
+
+    async def test_attempt_that_never_reached_a_probe_keeps_its_window(self):
+        """Мёртвый маршрут растягивает тик, и авторезолв может не дождаться
+        run_lock. Списать за это получасовое окно — значит отложить лечение
+        именно из-за той поломки, которую лечим."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            self._seed_origin(paths)
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+
+            async def probe(*_args):
+                raise AssertionError("probe must not run")
+
+            collector = self._collector(
+                paths, runtime=runtime, probe=probe, resolved="9.9.9.9")
+            await collector.run_lock.acquire()
+            try:
+                with patch.object(
+                        collector_module, "VPN_REPAIR_RUN_LOCK_TIMEOUT_S", 0.01):
+                    collector._telegram_stall_ticks = (
+                        collector_module.VPN_STALL_TICKS_BEFORE_RERESOLVE)
+                    self.assertTrue(collector._maybe_start_vpn_reresolve())
+                    await collector._vpn_repair_task
+            finally:
+                collector.run_lock.release()
+
+            self.assertEqual(collector._vpn_repair_state, "failed")
+            self.assertIsNone(collector._vpn_reresolve_after_mono)
+            collector._telegram_stall_ticks = (
+                collector_module.VPN_STALL_TICKS_BEFORE_RERESOLVE)
+            self.assertTrue(collector._maybe_start_vpn_reresolve())
+            await collector._vpn_repair_task
+
+    async def test_factory_reset_removes_the_origin(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            self._seed_origin(paths)
+            self.assertIn(paths.vpn_node_origin, paths.reset_files())
 
 
 if __name__ == "__main__":

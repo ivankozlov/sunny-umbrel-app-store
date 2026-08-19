@@ -205,6 +205,15 @@ class Paths:
         return self.vpn_dir / "active-node.json"
 
     @property
+    def vpn_node_origin(self) -> Path:
+        """Имя хоста, из которого получен адрес активного узла.
+
+        Не секрет: домен провайдера, а не bearer подписки. Хранится, потому
+        что резолв затирает имя IP-литералом, и после ротации адреса взять
+        новый неоткуда — подписка на диске сознательно не сохраняется."""
+        return self.vpn_dir / "node-origin.json"
+
+    @property
     def status(self) -> Path:
         return self.runtime_dir / "status.json"
 
@@ -232,6 +241,7 @@ class Paths:
             self.openrouter_public_key,
             self.upload_public_key,
             self.vpn_active_node,
+            self.vpn_node_origin,
         )
 
     def remove_empty_vpn_dir(self) -> None:

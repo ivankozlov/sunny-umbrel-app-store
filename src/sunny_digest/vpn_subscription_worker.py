@@ -9,6 +9,7 @@ from .vpn_subscription import (
     MAX_SUBSCRIPTION_URL,
     WORKER_SCHEMA,
     _fetch_https_bytes,
+    origin_hostname,
     parse_vless_subscription,
     resolve_public_node_servers,
     resolve_public_subscription_host,
@@ -19,11 +20,18 @@ MAX_WORKER_REQUEST_BYTES = MAX_SUBSCRIPTION_URL + 256
 
 
 def _fetch_nodes(url: str, timeout_s: float):
+    """Узлы с пиннингом адреса и имена хостов, из которых он получен.
+
+    Порядок списков совпадает: `resolve_public_node_servers` сохраняет
+    порядок входа. Имя нужно родителю, чтобы пережить ротацию адреса —
+    сам резолв затирает его литералом."""
     pinned_address = resolve_public_subscription_host(url)
     payload = _fetch_https_bytes(
         url, timeout_s, MAX_SUBSCRIPTION_BYTES, pinned_address,
     )
-    return resolve_public_node_servers(parse_vless_subscription(payload))
+    parsed = parse_vless_subscription(payload)
+    origins = [origin_hostname(node) for node in parsed]
+    return resolve_public_node_servers(parsed), origins
 
 
 def main() -> int:
@@ -46,9 +54,10 @@ def main() -> int:
         ):
             return 2
         url = validate_subscription_url(value["url"])
-        nodes = _fetch_nodes(url, float(timeout_s))
+        nodes, origins = _fetch_nodes(url, float(timeout_s))
         response = json.dumps(
-            {"nodes": nodes}, sort_keys=True, separators=(",", ":"),
+            {"nodes": nodes, "origins": origins},
+            sort_keys=True, separators=(",", ":"),
         ).encode("utf-8") + b"\n"
         sys.stdout.buffer.write(response)
         sys.stdout.buffer.flush()

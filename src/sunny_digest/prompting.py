@@ -7,19 +7,49 @@ from .storage import canonical_json_bytes
 from .version import MAX_PROMPT_BYTES, PROMPT_VERSION
 
 
-DIGEST_TARGET_UTF16_UNITS = 3_400
+DIGEST_TARGET_UTF16_UNITS = 20_000
 PROMPT_PREFIX = (
-    "Create a concise Russian-language daily digest of these messages. "
-    "Preserve concrete decisions, action items, dates and links. Do not add "
-    "facts that are absent. The digest must be at most "
-    f"{DIGEST_TARGET_UTF16_UNITS} UTF-16 code units. Return exactly one JSON object "
-    "with one string field named digest. "
+    "Ты составляешь ежедневный дайджест профессиональных Telegram-чатов для "
+    "одного человека. Он не успевает читать их сам и не хочет пропустить "
+    "важное. Пиши по-русски.\n"
+    "\n"
+    "Каждое сообщение пронумеровано полем n. Ссылайся на источники ЭТИМИ "
+    "номерами — ссылки подставит код, сам ссылок не пиши.\n"
+    "\n"
+    "Что делать:\n"
+    "1. Раздели содержательные обсуждения по темам. Для каждой темы дай "
+    "суть: о чём спорили, к чему пришли, какие аргументы прозвучали, что "
+    "осталось открытым. Пиши так, чтобы читавший понял позицию сторон без "
+    "исходной переписки. Одна тема — один блок, даже если она обсуждалась "
+    "в разных местах чата.\n"
+    "2. Отдельно собери статьи, ссылки, анонсы, вакансии и прочую "
+    "фактическую информацию: что это и зачем смотреть.\n"
+    "3. Отбрось флуд, мемы, реакции, приветствия, спам и перепалки без "
+    "содержания. Лучше короткий честный дайджест, чем раздутый.\n"
+    "\n"
+    "Правила:\n"
+    "- Не выдумывай ничего, чего нет в сообщениях. Домыслы недопустимы.\n"
+    "- Не пересказывай дословно: сжимай, но сохраняй конкретику — числа, "
+    "даты, названия, решения, договорённости.\n"
+    "- Если в чате за сутки не было ничего стоящего, верни для него пустые "
+    "списки. Пустой раздел лучше выдуманного.\n"
+    f"- Общий объём — до {DIGEST_TARGET_UTF16_UNITS} UTF-16 единиц.\n"
+    "\n"
+    "Верни ровно один JSON-объект:\n"
+    '{"chats": [{"chat": "<название как во входных данных>", '
+    '"topics": [{"title": "<тема>", "summary": "<суть>", "refs": [<n>]}], '
+    '"links": [{"title": "<что это>", "note": "<зачем>", "ref": <n>}]}]}\n'
     f"Prompt version: {PROMPT_VERSION}.\n"
 )
+# Инструкция входит в бюджет КАЖДОГО чата (`prompt_size` считает её
+# вместе со строками), поэтому делящий бюджет обязан вычесть её один
+# раз и прибавить к доле каждого чата — иначе N чатов оплатят её N раз.
+PROMPT_PREFIX_BYTES = len(PROMPT_PREFIX.encode("utf-8"))
 
 
 def message_row_bytes(message: SelectedMessage, sender_label: str,
-                      chat_title: Optional[str] = None) -> bytes:
+                      chat_title: Optional[str] = None,
+                      number: Optional[int] = None) -> bytes:
     row = {
         # Numeric Telegram sender/message IDs are not needed by the model.
         # An encounter-order alias preserves conversational attribution without
@@ -28,9 +58,21 @@ def message_row_bytes(message: SelectedMessage, sender_label: str,
         "sent_at": message.sent_at.isoformat(),
         "text": message.text,
     }
+    if number is not None:
+        # Порядковый номер в этом прогоне, НЕ Telegram message_id: модель
+        # ссылается им на источник, а ссылку собирает код.
+        row["n"] = number
     if chat_title is not None:
         row["chat"] = chat_title
     return canonical_json_bytes(row)
+
+
+# Строка выпуска несёт порядковый номер `n`, но отбирающий сообщения gateway
+# сквозной нумерации не знает — он считает бюджет по одному чату. Поэтому в
+# оценке номер берётся заведомо самый длинный: недосчитанные байты вылезли бы
+# за MAX_PROMPT_BYTES уже после отбора, и весь суточный дайджест падал бы на
+# `prompt exceeds bounded input size`.
+NUMBER_BUDGET_SENTINEL = 9_999_999
 
 
 def _rows(messages: List[SelectedMessage], chat_title: Optional[str] = None) -> List[bytes]:
@@ -41,6 +83,7 @@ def _rows(messages: List[SelectedMessage], chat_title: Optional[str] = None) -> 
             labels[message.sender_id] = f"participant-{len(labels) + 1}"
         rows.append(message_row_bytes(
             message, labels[message.sender_id], chat_title,
+            NUMBER_BUDGET_SENTINEL,
         ))
     return rows
 
@@ -58,15 +101,34 @@ def render_prompt(messages: List[SelectedMessage]) -> str:
     return raw.decode("utf-8")
 
 
+def digest_sources(chats: List[DigestChat]) -> Dict[int, str]:
+    """Номер сообщения в прогоне → ссылка на него.
+
+    Нумерация сквозная по всем чатам и строится ТЕМ ЖЕ обходом, что и промпт,
+    поэтому номер, названный моделью, указывает ровно на то сообщение, которое
+    она видела. Чат без префикса (не супергруппа) ссылок не даёт — тогда пункт
+    останется без источника, а не получит чужой."""
+    sources: Dict[int, str] = {}
+    number = 0
+    for chat in chats:
+        for message in chat.messages:
+            number += 1
+            if chat.link_prefix:
+                sources[number] = f"{chat.link_prefix}/{message.message_id}"
+    return sources
+
+
 def render_digest_prompt(chats: List[DigestChat]) -> str:
     rows: List[bytes] = []
+    number = 0
     for chat in chats:
         labels: Dict[Optional[int], str] = {}
         for message in chat.messages:
+            number += 1
             if message.sender_id not in labels:
                 labels[message.sender_id] = f"participant-{len(labels) + 1}"
             rows.append(message_row_bytes(
-                message, labels[message.sender_id], chat.title,
+                message, labels[message.sender_id], chat.title, number,
             ))
     raw = PROMPT_PREFIX.encode("utf-8") + b"\n".join(rows)
     if len(raw) > MAX_PROMPT_BYTES:
@@ -94,3 +156,30 @@ def truncate_first_to_budget(message: SelectedMessage) -> SelectedMessage:
     if not best:
         raise ValueError("one Telegram message cannot fit the prompt budget")
     return SelectedMessage(message.message_id, message.sender_id, message.sent_at, best)
+
+
+# Хвост, которым выпуск честно сообщает, что его срезали. Обрезка бывает в
+# двух местах — при сборке текста (потолок дайджеста) и перед выгрузкой
+# (потолок приёмника), — и обе обязаны выглядеть для Ивана одинаково.
+DIGEST_TRUNCATION_NOTE = "\n\n[выпуск обрезан по лимиту]"
+
+
+def fit_by_lines(text: str, size_of, limit: int) -> Optional[str]:
+    """Наибольший префикс текста по строкам, влезающий в limit, с пометкой.
+
+    Режем по строкам, а не по символам: строка здесь — заголовок, абзац или
+    ссылка, и обрыв на полуслове дал бы обрубок вместо источника. Поиск
+    двоичный — размер монотонен по числу строк. None означает, что не влезла
+    даже первая строка: это отказ, а не пустой выпуск."""
+    lines = text.split("\n")
+    low, high = 1, len(lines)
+    best: Optional[str] = None
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = "\n".join(lines[:middle]).rstrip() + DIGEST_TRUNCATION_NOTE
+        if size_of(candidate) <= limit:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best

@@ -24,13 +24,27 @@ from sunny_digest.contracts import (
     validate_monitor_upload,
 )
 from sunny_digest.models import DigestChat, SelectedMessage
+from sunny_digest.storage import canonical_json_bytes
 from sunny_digest.openrouter import (
+    WORKER_SCHEMA,
     OpenRouterError,
     _blocking_digest,
     _prompt,
     create_digest,
 )
-from sunny_digest.version import MAX_DIGEST_CHARS
+from sunny_digest.prompting import (
+    DIGEST_TARGET_UTF16_UNITS,
+    DIGEST_TRUNCATION_NOTE,
+    PROMPT_PREFIX_BYTES,
+    digest_sources,
+    prompt_size,
+    render_digest_prompt,
+)
+from sunny_digest.version import (
+    MAX_DIGEST_CHARS,
+    MAX_PROMPT_BYTES,
+    PROMPT_VERSION,
+)
 
 
 SOURCE_ID = "12345678-1234-4678-9234-567812345678"
@@ -87,11 +101,19 @@ def event(chat_id=CHAT_IDS[0], message_id=11):
 
 
 class FakeResponse:
-    def __init__(self, digest: str):
+    """Ответ модели в формате v3: текст выпуска собирает код, не модель."""
+
+    def __init__(self, digest: str = "Готово", *, content=None):
+        if content is None:
+            content = {"chats": [{
+                "chat": "Чат",
+                "topics": [{"title": "Тема", "summary": digest, "refs": []}],
+                "links": [],
+            }]}
         self.raw = json.dumps({
             "choices": [{
                 "finish_reason": "stop",
-                "message": {"content": json.dumps({"digest": digest})},
+                "message": {"content": json.dumps(content)},
             }]
         }).encode("utf-8")
 
@@ -381,19 +403,29 @@ class ContractTests(unittest.TestCase):
                 generated_at=NOW + timedelta(hours=1, seconds=1),
             )
 
-    def test_openrouter_uses_same_3700_boundary(self):
-        self.assertIn("at most 3400 UTF-16 code units", _prompt([]))
+    def test_openrouter_digest_never_exceeds_the_shared_boundary(self):
+        self.assertIn(str(DIGEST_TARGET_UTF16_UNITS), _prompt([]))
+        self.assertIn(PROMPT_VERSION, _prompt([]))
+        # Тем много, каждая обрезана по отдельности, а их сумма ничем не
+        # ограничена — выпуск обязан быть срезан, а не отвергнут целиком.
+        oversized = {"chats": [{
+            "chat": "Чат",
+            "topics": [
+                {"title": f"Тема {i}", "summary": "и" * 3000, "refs": []}
+                for i in range(10)
+            ],
+            "links": [],
+        }]}
         with patch("urllib.request.OpenerDirector.open",
-                   return_value=FakeResponse("x" * MAX_DIGEST_CHARS)):
-            self.assertEqual(
-                len(_blocking_digest([], "anthropic/example", "secret")),
-                MAX_DIGEST_CHARS,
-            )
-        for invalid in ("x" * (MAX_DIGEST_CHARS + 1), "unsafe\u2066text"):
-            with patch("urllib.request.OpenerDirector.open",
-                       return_value=FakeResponse(invalid)):
-                with self.assertRaises(OpenRouterError):
-                    _blocking_digest([], "anthropic/example", "secret")
+                   return_value=FakeResponse(content=oversized)):
+            digest = _blocking_digest([], "anthropic/example", "secret")
+        self.assertLessEqual(
+            len(digest.encode("utf-16-le")) // 2, MAX_DIGEST_CHARS)
+        self.assertTrue(digest.endswith(DIGEST_TRUNCATION_NOTE.strip()))
+        with patch("urllib.request.OpenerDirector.open",
+                   return_value=FakeResponse("unsafe\u2066text")):
+            with self.assertRaises(OpenRouterError):
+                _blocking_digest([], "anthropic/example", "secret")
 
     def test_openrouter_prompt_pseudonymizes_stable_telegram_ids(self):
         rendered = _prompt([DigestChat("Первый чат", [
@@ -405,6 +437,64 @@ class ContractTests(unittest.TestCase):
         self.assertIn('"sender":"participant-2"', rendered)
         for stable_id in ("987654321", "8675309", "42424242"):
             self.assertNotIn(stable_id, rendered)
+
+
+class TestBugDigestLinks20260818(unittest.TestCase):
+    """Ссылки на сообщения собирает код, а не модель.
+
+    Модель видит только порядковые номера: стабильные Telegram-идентификаторы
+    не покидают Umbrel, а выдуманная моделью ссылка не может дойти до Ивана —
+    номер вне карты источников молча отбрасывается."""
+
+    CHATS = [
+        DigestChat("Первый чат", [
+            SelectedMessage(41, 7, NOW, "Первое"),
+            SelectedMessage(42, 8, NOW, "Второе"),
+        ], "https://t.me/c/1234567890"),
+        DigestChat("Второй чат", [
+            SelectedMessage(77, 9, NOW, "Третье"),
+        ], None),
+    ]
+
+    def test_numbering_matches_prompt_order(self):
+        rendered = _prompt(self.CHATS)
+        self.assertIn('"n":1', rendered)
+        self.assertIn('"n":3', rendered)
+        # Голыми подстроками, а не JSON-формой ключа: поле `link_prefix`
+        # теперь едет вместе с DigestChat, и «полезная» строка вида
+        # "link": "<prefix>/<id>" не должна пройти незамеченной ни в каком
+        # написании.
+        for secret in ("1234567890", "41", "42", "77"):
+            self.assertNotIn(secret, rendered)
+        self.assertEqual(digest_sources(self.CHATS), {
+            1: "https://t.me/c/1234567890/41",
+            2: "https://t.me/c/1234567890/42",
+        })
+
+    def test_refs_become_links_and_unknown_numbers_are_dropped(self):
+        content = {"chats": [{
+            "chat": "Первый чат",
+            "topics": [{"title": "Тема", "summary": "Суть", "refs": [2, 3, 99]}],
+            "links": [{"title": "Статья", "note": "зачем", "ref": 1}],
+        }]}
+        with patch("urllib.request.OpenerDirector.open",
+                   return_value=FakeResponse(content=content)):
+            digest = _blocking_digest(
+                self.CHATS, "anthropic/example", "secret")
+        self.assertIn("https://t.me/c/1234567890/42", digest)
+        self.assertIn("https://t.me/c/1234567890/41", digest)
+        # 3 — сообщение чата без префикса, 99 — вымысел модели.
+        self.assertEqual(digest.count("https://t.me/c/"), 2)
+        self.assertIn("Статья", digest)
+
+    def test_unexpected_response_shape_is_rejected(self):
+        for content in ({"digest": "старый формат"},
+                        {"chats": "не список"},
+                        {"chats": [{"chat": "Ч", "topics": [42], "links": []}]}):
+            with patch("urllib.request.OpenerDirector.open",
+                       return_value=FakeResponse(content=content)):
+                with self.assertRaises(OpenRouterError):
+                    _blocking_digest(self.CHATS, "anthropic/example", "secret")
 
 
 class TestBugOpenRouterPrivacy20260810(unittest.TestCase):
@@ -502,6 +592,93 @@ class TestBugOpusDigestBudget20260814(unittest.TestCase):
         self.assertGreaterEqual(body["max_tokens"], 16_384)
 
 
+class FakeAnsweringWorker(FakeHungWorker):
+    """Воркер, отвечающий ровно так, как настоящий: структурой, не текстом."""
+
+    def __init__(self, answer):
+        super().__init__()
+        self.raw = canonical_json_bytes({"answer": answer}) + b"\n"
+        self.sent = False
+
+    async def read(self, _limit):
+        self.started.set()
+        if self.sent:
+            return b""
+        self.sent = True
+        self.returncode = 0
+        self.stopped.set()
+        return self.raw
+
+    async def wait(self):
+        self.returncode = 0
+        return 0
+
+
+class TestBugDigestLinksProductionPath20260818(unittest.IsolatedAsyncioTestCase):
+    """Ссылки обязаны появляться на ПРОДАКШН-пути, а не только в юнит-хелпере.
+
+    Запрос уходит в killable подпроцесс (`create_digest` → `openrouter_worker`),
+    и карта «номер → сообщение» живёт только в родителе. Первая версия этой
+    миграции собирала текст внутри воркера, где карты нет: все ссылки молча
+    исчезали, а тест на `_blocking_digest` оставался зелёным."""
+
+    CHATS = [DigestChat("Рабочий чат", [
+        SelectedMessage(41, 7, NOW, "Первое"),
+        SelectedMessage(42, 8, NOW, "Второе"),
+    ], "https://t.me/c/1234567890")]
+
+    async def test_links_survive_the_worker_boundary(self):
+        answer = {"chats": [{
+            "chat": "Рабочий чат",
+            "topics": [{"title": "Тема", "summary": "Суть", "refs": [2]}],
+            "links": [{"title": "Статья", "note": "зачем", "ref": 1}],
+        }]}
+        worker = FakeAnsweringWorker(answer)
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   return_value=worker):
+            digest = await create_digest(
+                self.CHATS, "anthropic/example", "sk-or-test-secret",
+                asyncio.Event())
+        self.assertIn("https://t.me/c/1234567890/42", digest)
+        self.assertIn("https://t.me/c/1234567890/41", digest)
+        # Воркер не получает ни идентификаторов сообщений, ни префикса:
+        # ему уходит только промпт с порядковыми номерами.
+        request = json.loads(worker.stdin.data)
+        self.assertEqual(set(request), {"schema", "prompt", "model", "api_key"})
+        for secret in ("1234567890", "41", "42"):
+            self.assertNotIn(secret, request["prompt"])
+
+
+class TestBugPromptBudgetCountsNumber20260818(unittest.TestCase):
+    """Бюджет отбора обязан учитывать поле `n`.
+
+    Гейт отбирает сообщения по `prompt_size` для ОДНОГО чата, а собранный
+    промпт нумеруется сквозным `n`. Не учтённые в оценке байты вылезали за
+    MAX_PROMPT_BYTES уже после отбора — и весь суточный дайджест падал на
+    `prompt exceeds bounded input size`, каждый день заново."""
+
+    def test_saturated_selection_still_fits_the_prompt(self):
+        for chat_count, text_length in ((7, 40), (2, 120), (16, 40)):
+            budget = max(1024, PROMPT_PREFIX_BYTES + (
+                MAX_PROMPT_BYTES - PROMPT_PREFIX_BYTES) // chat_count)
+            chats, message_id = [], 1
+            for index in range(chat_count):
+                title = f"Чат {index}"
+                selected = []
+                while True:
+                    candidate = SelectedMessage(
+                        message_id, 1, NOW, "я" * text_length)
+                    if prompt_size(selected + [candidate], title) > budget:
+                        break
+                    selected.append(candidate)
+                    message_id += 1
+                chats.append(DigestChat(title, selected, None))
+            rendered = render_digest_prompt(chats)
+            self.assertLessEqual(
+                len(rendered.encode("utf-8")), MAX_PROMPT_BYTES,
+                f"{chat_count} чатов по {text_length} символов")
+
+
 class OpenRouterProcessTests(unittest.IsolatedAsyncioTestCase):
     async def test_revocation_terminates_blocking_openrouter_worker_process(self):
         worker = FakeHungWorker()
@@ -519,7 +696,7 @@ class OpenRouterProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"sk-or-test-secret", worker.stdin.data)
         self.assertEqual(
             json.loads(worker.stdin.data)["schema"],
-            "sunny.personal-chats.openrouter-worker.v2",
+            WORKER_SCHEMA,
         )
         command = " ".join(str(part) for part in spawn.call_args.args)
         self.assertNotIn("sk-or-test-secret", command)

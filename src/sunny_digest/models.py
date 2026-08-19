@@ -103,6 +103,11 @@ class FetchResult:
 class DigestChat:
     title: str
     messages: List[SelectedMessage]
+    # Префикс ссылки на сообщение этого чата (`https://t.me/c/<peer_id>`).
+    # Собирается КОДОМ и в OpenRouter не уходит: модель получает только
+    # порядковые номера сообщений, а ссылки подставляются после ответа —
+    # так стабильные Telegram-идентификаторы не покидают Umbrel.
+    link_prefix: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -38,7 +38,14 @@ MAX_SUBSCRIPTION_BYTES = 1024 * 1024
 MAX_SUBSCRIPTION_NODES = 64
 MAX_NODE_LINE = 4096
 MAX_WORKER_RESPONSE_BYTES = 128 * 1024
-WORKER_SCHEMA = "sunny.personal-chats.subscription-worker.v1"
+# v2: воркер отдаёт ещё и имя хоста каждого узла. Резолв затирает его
+# IP-литералом, а подписка на диске не хранится — без имени после
+# ротации адреса взять новый неоткуда.
+WORKER_SCHEMA = "sunny.personal-chats.subscription-worker.v2"
+# Ключ, которым имя хоста едет от воркера до записи на диск. В самом
+# узле его быть не должно: набор ключей узла сверяется строгим
+# множеством, поэтому вызывающий снимает ключ перед валидацией.
+ORIGIN_KEY = "origin"
 WORKER_TERMINATE_GRACE_S = 2.0
 MAX_YAML_NODES = 10_000
 MAX_YAML_DEPTH = 32
@@ -661,6 +668,18 @@ def parse_vless_subscription(payload: bytes) -> List[Dict[str, Any]]:
         raise ValueError("subscription payload is invalid") from None
 
 
+def origin_hostname(node: Dict[str, Any]) -> Optional[str]:
+    """Имя хоста узла до пиннинга, если адрес задан именем, а не литералом."""
+    server = node.get("server")
+    if not isinstance(server, str) or not _valid_dns_hostname(server):
+        return None
+    try:
+        ipaddress.ip_address(server)
+    except ValueError:
+        return server
+    return None
+
+
 def resolve_public_node_servers(
     nodes: List[Dict[str, Any]],
     *,
@@ -780,12 +799,16 @@ async def _bounded_worker_exchange(process: Any, request: bytes) -> bytes:
 def _decode_worker_nodes(raw: bytes) -> List[Dict[str, Any]]:
     try:
         value = json.loads(raw.decode("utf-8"))
-        if not isinstance(value, dict) or set(value) != {"nodes"}:
+        if not isinstance(value, dict) or set(value) != {"nodes", "origins"}:
             raise ValueError
         nodes = value["nodes"]
+        origins = value["origins"]
         if not isinstance(nodes, list) or not 1 <= len(nodes) <= MAX_SUBSCRIPTION_NODES:
             raise ValueError
-        for node in nodes:
+        if not isinstance(origins, list) or len(origins) != len(nodes):
+            raise ValueError
+        decoded: List[Dict[str, Any]] = []
+        for node, origin in zip(nodes, origins):
             if not isinstance(node, dict):
                 raise ValueError
             address = ipaddress.ip_address(node.get("server"))
@@ -794,7 +817,14 @@ def _decode_worker_nodes(raw: bytes) -> List[Dict[str, Any]]:
                 or node.get("server") != address.compressed
             ):
                 raise ValueError
-        return nodes
+            if origin is not None and (
+                    not isinstance(origin, str)
+                    or not _valid_dns_hostname(origin)):
+                raise ValueError
+            # Транспортный ключ: снимается вызывающим ДО валидации узла,
+            # набор ключей которого сравнивается строгим множеством.
+            decoded.append({**node, ORIGIN_KEY: origin})
+        return decoded
     except (TypeError, ValueError, UnicodeDecodeError):
         raise SubscriptionFetchError(
             "subscription worker response is invalid"
@@ -879,6 +909,9 @@ async def fetch_vless_subscription(
     except Exception:
         raise SubscriptionFetchError("subscription download failed") from None
     try:
-        return parse_vless_subscription(payload)
+        parsed = parse_vless_subscription(payload)
     except ValueError:
         raise SubscriptionFetchError("subscription response is invalid") from None
+    # Тестовый seam обязан отдавать ту же форму, что и воркер, иначе тесты
+    # проверяли бы путь, которого в проде нет.
+    return [{**node, ORIGIN_KEY: origin_hostname(node)} for node in parsed]
