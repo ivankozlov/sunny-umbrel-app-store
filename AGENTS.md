@@ -40,8 +40,9 @@ keys, or rendered runtime configuration.
   forwarding, so a root key with those options could open a port on the droplet
   to the outside. The real restriction is an sshd `Match User` block —
   `AllowTcpForwarding local`, `PermitOpen openrouter.ai:443`, no reverse,
-  stream-local or agent forwarding, `ForceCommand /bin/false` — installed by
-  `deploy/install_openrouter_tunnel.sh`, dry-run by default, validating the
+  stream-local or agent forwarding, `ForceCommand /bin/false` — installed from the Sunny
+  repository root by `deploy/install_openrouter_tunnel.sh` — a droplet-side script that is
+  NOT part of this snapshot — dry-run by default, validating the
   config with `sshd -t` before and after replacement and reloading rather than
   restarting. Key-line options duplicate that block so a lost `Match` still
   leaves no shell and no other address. The forward is raised only for the
@@ -81,8 +82,22 @@ keys, or rendered runtime configuration.
   node because no authorized session exists yet; the Telegram login is its first
   end-to-end reachability check, and locked-state repair is not a substitute for
   completing that login.
-- Changing the Telegram account, selected chats, OpenRouter key/model, or upload
-  endpoint requires factory reset. Before its first await, reset persists a
+- Changing the Telegram account, OpenRouter key/model, or upload endpoint
+  requires factory reset. The chat set is the one exception, and only forward:
+  it may be EXTENDED without a new epoch, never shrunk or reordered. The server
+  decides — `deploy/extend_chat_set.sh` adds the chat to the receiver config,
+  seeds a zero cursor in both vectors and marks it pending — and the app merely
+  picks up what the gate now announces. A compromised Umbrel therefore cannot
+  widen its own access. Accepting the chat needs one message link, because
+  `access_hash` is known only to the Telegram client and dialog enumeration
+  stays closed after lock; that is the single permitted exception, bound to a
+  durable one-shot `resolving_extension` phase entered before the network call
+  and refused unless the gate already named that exact chat_id. Activation is an
+  `extension_baseline` covering only the new chats: it continues the monitor
+  chain rather than restarting it, so cursors and history of the existing chats
+  survive. A baseline is validated against the chat set of the version it was
+  created in — checking it against today's set would invalidate history on the
+  first extension and wedge the receiver. Before its first await, reset persists a
   blocking revocation warning; it then cancels active work, attempts Telegram
   logout, and deletes the local session, credentials, and their exact atomic
   temporaries. Unconfirmed logout stays blocked until the operator confirms
@@ -138,7 +153,18 @@ keys, or rendered runtime configuration.
   cursor and detects mentions only from Telegram's native `mentioned` flag. A
   mention-bearing range is marked read only after its event batch has a durable
   receiver receipt; a no-mention range is checkpointed locally before read-ACK.
-  Read-ACK always uses the exact peer and a bounded `max_id`.
+  Read-ACK always uses the exact peer and a bounded `max_id`. A forum needs a
+  second step: `channels.readHistory` — what `send_read_acknowledge` sends — has
+  no topic field at all, so it clears the group badge while every topic keeps
+  its own unread count burning. Topics are therefore enumerated
+  (`messages.getForumTopics`, bounded by `MAX_FORUM_TOPICS`) and closed one by
+  one with `messages.readDiscussion`, exactly as official clients do. The
+  enumeration also returns the topics' latest messages: only `id` and
+  `unread_count` may be read from it, never the text — the same rule that
+  governs dialog enumeration during setup. A non-forum answers
+  `CHANNEL_FORUM_MISSING`, which is an ordinary answer rather than a failure,
+  and a topic that fails to close must not undo the peer acknowledgement:
+  otherwise one unreachable topic would make the group re-read forever.
 - The model returns structure, never a rendered message: chats, topics with
   summaries, and a separate list of links, each pointing at sources by the
   per-run ordinal `n` printed in the prompt rows. The killable worker returns
@@ -167,7 +193,8 @@ keys, or rendered runtime configuration.
 - Every OpenRouter request must set `provider.zdr=true` and
   `provider.data_collection=deny`; account/key privacy controls remain defence
   in depth and may not replace the per-request guard. Opus must use explicit
-  `max_tokens>=16384` so adaptive thinking cannot consume the usable response budget.
+  `max_tokens>=32768` so adaptive thinking cannot consume the usable response
+  budget: 16384 was nearly exhausted by it once an issue stopped fitting in one message.
 - The receiver daily window is exactly 03:00–04:45 inclusive in its authenticated
   IANA timezone, with no same-day catch-up. Sunny `chats` emits one durable
   `missing_daily_digest` per local date; the host watchdog suppresses only that
@@ -189,12 +216,13 @@ python3 -m compileall -q src tests scripts
 
 In the `umbrel/` subtree of the private source repository `ivankozlov/sunny/main`,
 `scripts/check_package.py --release` must remain red: the disabled manifest and release
-placeholder are the intentional closed-distribution Phase-A state. This does not
-describe the separate private Store `main`, which retains the historical enabled
-`v0.2.5` commit that passed the release gate. The public GHCR package is absent.
-Reopening distribution requires separate approval, a new semver/tag, a real
-independently verified multi-architecture digest, and a separate enabling commit;
-never overwrite the withdrawn `v0.2.5` tag. The publish job stays `main`-only behind
+placeholder are the intentional Phase-A state of the source tree. This does not
+describe the Store `main`, where the enabling commits live — it carries enabled
+`v0.2.8`, with the historical enabled `v0.2.5` still in its history. Distribution was
+withdrawn on 2026-08-14 and reopened on 2026-08-17; the public GHCR package now holds
+`v0.2.6`, `v0.2.7` and `v0.2.8`, while `v0.2.5` stays deleted. Every release requires
+separate approval, a new semver/tag, a real independently verified multi-architecture
+digest, and a separate enabling commit; never overwrite the withdrawn `v0.2.5` tag. The publish job stays `main`-only behind
 the protected `ghcr-release` Environment;
 privileged QEMU/BuildKit helpers remain digest-pinned.
 The manifest's `defaultShell` stays pinned to `collector`, because VPN and

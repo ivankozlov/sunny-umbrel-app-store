@@ -423,6 +423,14 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
 <p class="muted">Fingerprint: {_escape(status.get("upload_key_fingerprint") or "—")}</p>
 {_render_openrouter_key(status.get("openrouter_public_key"))}
 {activation}
+<details><summary>Добавить чат</summary>
+  <form method="post" autocomplete="off">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="extend_chats">
+    <label>Ссылка на любое сообщение из нового чата<input name="extension_message_link" type="url" inputmode="url" required autocomplete="off"></label>
+    <p class="muted">Сначала чат добавляется НА СЕРВЕРЕ (<code>extend_chat_set.sh</code>) — приложение только подхватывает объявленное. Ссылка нужна, чтобы получить доступ к группе: перечисление диалогов после выбора чатов закрыто навсегда, и это единственное исключение — одна ссылка на один объявленный сервером чат. Ссылка не сохраняется, сообщение по ней не читается. Telegram-сессия, прежние чаты, их курсоры и вся история остаются на месте; новый чат начинает читаться с текущего момента.</p>
+    <label class="check"><input type="checkbox" name="confirm_extend" value="yes" required>Добавить в набор чат, объявленный приёмником.</label>
+    <button class="secondary" type="submit">Добавить чат</button>
+  </form>
+</details>
 <details><summary>Проверить и заменить VPN-маршрут</summary>
   <form method="post" autocomplete="off">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="replace_vpn">
     <label>Новый VLESS/REALITY subscription URL<input name="vpn_subscription_url" type="password" inputmode="url" required autocomplete="new-password"></label>
@@ -621,6 +629,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise PermissionError("VPN replacement was not confirmed")
                 result = self.app.ipc.request(
                     "replace_vpn", _one(form, "vpn_subscription_url"))
+            elif action == "extend_chats":
+                if _one(form, "confirm_extend") != "yes":
+                    raise PermissionError("chat extension was not confirmed")
+                result = self.app.ipc.request(
+                    "extend_chats", _one(form, "extension_message_link"))
             elif action == "renew_consent":
                 if _one(form, "confirm_renew") != "yes":
                     raise PermissionError("consent renewal was not confirmed")

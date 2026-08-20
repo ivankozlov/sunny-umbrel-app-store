@@ -260,7 +260,14 @@ def validate_gate(value: Dict[str, Any], expected_chat_ids: Optional[Sequence[in
     if monitor_ids != digest_ids:
         raise ValueError("monitor and digest gates bind different chats")
     if expected_chat_ids is not None and monitor_ids != list(expected_chat_ids):
-        raise ValueError("gate chat set does not match locked settings")
+        # Приёмник — источник истины по набору чатов, и он может объявить
+        # РАСШИРЕНИЕ: свои чаты плюс новые. Это не рассинхрон, а приглашение
+        # добавить чат; всё остальное по-прежнему отказ. Уменьшение набора
+        # отказом и остаётся: снять чат расширением нельзя.
+        expected = list(expected_chat_ids)
+        added = [row for row in monitor_ids if row not in set(expected)]
+        if not added or [row for row in monitor_ids if row in set(expected)] != expected:
+            raise ValueError("gate chat set does not match locked settings")
     return value
 
 
@@ -354,6 +361,8 @@ def build_monitor_upload(
         raise ValueError("monitor kind disagrees with baseline_required")
     if kind == "baseline" and [row["chat_id"] for row in ranges] != list(remote):
         raise ValueError("baseline must cover every locked chat")
+    if kind == "extension_baseline" and not ranges:
+        raise ValueError("extension baseline must cover at least one chat")
     for row in ranges:
         if remote.get(row["chat_id"]) != row["from_message_id_exclusive"]:
             raise ValueError("monitor range does not start at receiver cursor")
@@ -375,7 +384,7 @@ def validate_monitor_upload(value: Dict[str, Any]) -> Dict[str, Any]:
     elif not isinstance(previous, str) or not _HEX64.fullmatch(previous):
         raise ValueError("monitor previous_sha256 is invalid")
     kind = value["kind"]
-    if kind not in ("baseline", "mentions"):
+    if kind not in ("baseline", "mentions", "extension_baseline"):
         raise ValueError("monitor kind is invalid")
     parse_wire_utc(value["generated_at"], "generated_at")
     if value["collector_version"] != COLLECTOR_VERSION:
@@ -390,6 +399,14 @@ def validate_monitor_upload(value: Dict[str, Any]) -> Dict[str, Any]:
     if kind == "baseline":
         if sequence != 1 or value["events"]:
             raise ValueError("baseline must be sequence one with no events")
+    elif kind == "extension_baseline":
+        # Расширение продолжает цепочку, а не начинает её: чат добавляется к
+        # работающему набору, и курсоры остальных обязаны уцелеть.
+        if sequence == 1 or value["events"]:
+            raise ValueError(
+                "extension baseline continues the chain and carries no events")
+        if any(row["from_message_id_exclusive"] != 0 for row in ranges):
+            raise ValueError("extension baseline starts every new chat at zero")
     else:
         if sequence == 1 or len(ranges) != 1 or not 1 <= len(value["events"]) <= MAX_MENTION_EVENTS:
             raise ValueError("mentions upload shape is invalid")

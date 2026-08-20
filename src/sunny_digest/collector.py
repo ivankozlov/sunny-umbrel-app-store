@@ -33,6 +33,7 @@ from .prompting import PROMPT_PREFIX_BYTES, fit_by_lines
 from .openrouter_tunnel import OpenRouterTunnel, generate_openrouter_key
 from .settings import (
     MAX_CONSENT_DAYS,
+    validate_locked_chats,
     CONSENT_SCOPE,
     consent_active,
     load_credentials,
@@ -155,6 +156,30 @@ def _load_dialog_candidates(paths: Paths) -> tuple[str, List[DialogCandidate]]:
     if len({row.chat_id for row in candidates}) != len(candidates):
         raise ValueError("dialog candidates are invalid")
     return selection_id, candidates
+
+
+def _extended_cursor_rows(rows, chat_id: int, fresh: Dict[str, Any],
+                          order: List[int]) -> List[Dict[str, Any]]:
+    """Вставить запись нового чата, сохранив порядок и не тронув остальные.
+
+    Новый chat_id почти никогда не оказывается в конце: порядок — по
+    возрастанию, а он отрицательный. Поэтому векторы пересобираются по
+    заданному порядку, а не дописываются с хвоста."""
+    existing = {row["chat_id"]: row for row in rows}
+    existing[chat_id] = fresh
+    return [existing[value] for value in order]
+
+
+def _gate_cursor(gate: Dict[str, Any], chat_id: int) -> Optional[int]:
+    """Курсор чата в gate приёмника, либо None, если чата там нет.
+
+    Имя намеренно не `remote_cursor`: так уже называется локальная переменная
+    в `_run_monitor`, и совпадение сделало бы модульную функцию невидимой
+    внутри всего метода."""
+    for row in gate["monitor"]["cursors"]:
+        if row["chat_id"] == chat_id:
+            return row["through_message_id"]
+    return None
 
 
 class Collector:
@@ -697,11 +722,21 @@ class Collector:
             self._vpn_repair_state = "fetching"
             self._vpn_repair_attempted = 0
             self._vpn_repair_error_type = None
-            task = asyncio.create_task(
+            # Accepted status is persisted BEFORE the task exists: a local
+            # status/heartbeat write failure makes the IPC call fail, and a
+            # caller that got an error must not discover later that the route
+            # was replaced anyway by a task nobody acknowledged.
+            try:
+                accepted = self._write_status(
+                    last_result="vpn_repairing", last_error_type=None)
+            except BaseException:
+                self._vpn_repair_state = "idle"
+                self._vpn_repair_attempted = 0
+                self._vpn_repair_error_type = None
+                raise
+            self._vpn_repair_task = asyncio.create_task(
                 self._run_vpn_repair(subscription_url, epoch))
-            self._vpn_repair_task = task
-            return self._write_status(
-                last_result="vpn_repairing", last_error_type=None)
+            return accepted
 
     async def _run_vpn_repair(
         self, subscription_url: str, epoch: asyncio.Event,
@@ -1263,6 +1298,126 @@ class Collector:
             self._setup_deadline_mono = None
             return self._write_status(last_result="chat_locked", last_error_type=None)
 
+    async def extend_chats(self, link: Any) -> Dict[str, Any]:
+        """Принять чат, который приёмник добавил к набору.
+
+        Порядок именно такой: сначала расширение объявляет СЕРВЕР
+        (`extend_chat_set.sh`), и только потом приложение подхватывает. Так
+        взломанный Umbrel не может расширить себе доступ сам — набор чатов
+        остаётся тем, что решает владелец сервера.
+
+        Приложению нужна ссылка на любое сообщение из нового чата: `access_hash`
+        знает только Telegram-клиент, а перечисление диалогов после lock
+        закрыто навсегда. Это единственное исключение: одна ссылка, один
+        объявленный сервером чат, durable-фаза до сетевого вызова — и лишь
+        когда gate уже назвал этот chat_id."""
+        async with self.state_lock:
+            epoch = self._capture_epoch()
+            settings = load_settings(self.paths)
+            if not settings["chat_locked"] or not self.paths.chat_locked.exists():
+                raise RuntimeError("chat extension requires locked chats")
+            if not consent_active(settings, self.clock()):
+                raise RuntimeError("consent is expired")
+            if not isinstance(link, str) or not 1 <= len(link) <= 2048:
+                raise ValueError("Telegram message link is invalid")
+            known = [row["chat_id"] for row in settings["chats"]]
+            if len(known) >= MAX_SELECTED_CHATS:
+                raise RuntimeError("chat set is already at its contractual limit")
+            credentials = load_credentials(self.paths)
+            session_text = self._session_text()
+            if not session_text:
+                raise RuntimeError("Telegram session is unavailable")
+            source_id = settings["source_id"]
+
+        transport = self.transport_factory(self.paths, dict(settings["upload"]))
+        gate, _ = await self._fresh_gate(transport, source_id, known, self.revoked)
+        announced = [
+            row["chat_id"] for row in gate["monitor"]["cursors"]
+            if row["chat_id"] not in set(known)
+        ]
+        if not announced:
+            raise RuntimeError(
+                "receiver has not announced a new chat; run extend_chat_set.sh first")
+
+        async with self.state_lock:
+            self._require_current_epoch(epoch)
+            # Фаза фиксируется ДО сетевого вызова: прерванная попытка не должна
+            # тихо повторить резолв ещё раз.
+            settings = load_settings(self.paths)
+            settings["phase"] = "resolving_extension"
+            atomic_write_json(self.paths.settings, settings)
+
+        try:
+            candidates = await self._bounded_external(
+                self._gateway(credentials).resolve_message_links(
+                    session_text, [link]),
+                TELEGRAM_DIALOG_TIMEOUT_S,
+            )
+        finally:
+            async with self.state_lock:
+                settings = load_settings(self.paths)
+                settings["phase"] = "chat_locked"
+                atomic_write_json(self.paths.settings, settings)
+
+        self._require_current_epoch(epoch)
+        if len(candidates) != 1:
+            raise RuntimeError("Telegram did not resolve the message link")
+        candidate = candidates[0]
+        if candidate.chat_id not in set(announced):
+            # Ссылка ведёт не туда, что объявил сервер: молча подставить свой
+            # чат нельзя — это и был бы обход контроля владельца сервера.
+            raise RuntimeError("resolved chat is not the one the receiver announced")
+
+        async with self.state_lock:
+            self._require_current_epoch(epoch)
+            settings = load_settings(self.paths)
+            chats = list(settings["chats"])
+            chats.append({
+                "chat_id": candidate.chat_id,
+                "title": candidate.title,
+                "peer": candidate.peer.as_dict(),
+                "initial_message_id": 0,
+            })
+            chats.sort(key=lambda row: row["chat_id"])
+            settings["chats"] = validate_locked_chats(chats)
+            atomic_write_json(self.paths.settings, settings)
+            watch = read_json(self.paths.watch_state, max_bytes=256 * 1024)
+            watch["monitor_cursors"] = _extended_cursor_rows(
+                watch["monitor_cursors"], candidate.chat_id,
+                {"chat_id": candidate.chat_id, "through_message_id": 0},
+                [row["chat_id"] for row in settings["chats"]])
+            watch["chats"] = _extended_cursor_rows(
+                watch["chats"], candidate.chat_id,
+                {"chat_id": candidate.chat_id, "scan_through_message_id": 0,
+                 "read_pending_through_message_id": 0,
+                 "read_acked_through_message_id": 0},
+                [row["chat_id"] for row in settings["chats"]])
+            watch["pending_extension_chat_ids"] = sorted(
+                set(watch.get("pending_extension_chat_ids") or [])
+                | {candidate.chat_id})
+            atomic_write_json(self.paths.watch_state, watch)
+            # Чекпойнт дайджеста сверяется с набором строгим равенством и
+            # переписывается только после УСПЕШНОГО выпуска. Не дополнив его
+            # здесь, мы получили бы «digest checkpoint chat set is invalid» на
+            # первой же строке `_run_digest` — то есть дайджест навсегда.
+            if self.paths.acknowledged.exists():
+                acknowledged = read_json(
+                    self.paths.acknowledged, max_bytes=256 * 1024)
+                rows = acknowledged.get("cursors")
+                if isinstance(rows, list):
+                    acknowledged["cursors"] = _extended_cursor_rows(
+                        rows, candidate.chat_id,
+                        {"chat_id": candidate.chat_id, "through_message_id": 0},
+                        [row["chat_id"] for row in settings["chats"]])
+                    atomic_write_json(self.paths.acknowledged, acknowledged)
+
+        triggered = self.trigger_run()
+        return self._write_status(
+            last_result="chat_extension_accepted", last_error_type=None,
+            chats=[row["title"] for row in settings["chats"]],
+            run_triggered=triggered,
+        )
+
     async def activate_monitoring(self) -> Dict[str, Any]:
         async with self.state_lock:
             self._capture_epoch()
@@ -1498,10 +1653,24 @@ class Collector:
 
     def _load_watch_state(self, source_id: str, chat_ids: List[int]) -> Dict[str, Any]:
         value = read_json(self.paths.watch_state, max_bytes=64 * 1024)
-        if set(value) != {
-                "schema", "source_id", "phase", "monitor_sequence",
-                "monitor_content_sha256", "monitor_cursors", "chats"}:
+        required = {
+            "schema", "source_id", "phase", "monitor_sequence",
+            "monitor_content_sha256", "monitor_cursors", "chats"}
+        # Метка ожидающих активации чатов появляется только на время
+        # расширения и снимается вместе с принятым extension baseline,
+        # поэтому она необязательна — но набор полей остаётся замкнутым.
+        if not required <= set(value) or set(value) - required - {
+                "pending_extension_chat_ids"}:
             raise ValueError("watch state has unexpected fields")
+        awaiting = value.get("pending_extension_chat_ids")
+        if awaiting is not None:
+            known = {row["chat_id"] for row in value["chats"]
+                     if isinstance(row, dict)}
+            if (not isinstance(awaiting, list)
+                    or len(awaiting) != len(set(awaiting))
+                    or any(type(row) is not int for row in awaiting)
+                    or not set(awaiting) <= known):
+                raise ValueError("watch pending extension is invalid")
         if (value["schema"] != WATCH_STATE_SCHEMA or value["source_id"] != source_id
                 or value["phase"] not in (
                     "activation_requested", "baseline_read_pending", "active")):
@@ -1604,6 +1773,22 @@ class Collector:
         state["monitor_content_sha256"] = payload["content_sha256"]
         state["monitor_cursors"] = self._cursor_rows(remote)
         state["chats"] = [local[chat_id] for chat_id in sorted(local)]
+        if payload["kind"] == "extension_baseline":
+            # Метка снимается ЗДЕСЬ, где payload применяется, а не в ветке
+            # отправки: тот же payload доезжает и вторым путём — из
+            # `monitor_pending` после обрыва между выгрузкой и записью
+            # состояния. Снимая метку только на счастливом пути, мы делали
+            # обычную аварию невосстановимой: следующий тик снова считал чат
+            # ожидающим и падал на несовпадении курсора, навсегда.
+            accepted = {row["chat_id"] for row in payload["ranges"]}
+            remaining = [
+                value for value in (state.get("pending_extension_chat_ids") or [])
+                if value not in accepted
+            ]
+            if remaining:
+                state["pending_extension_chat_ids"] = remaining
+            else:
+                state.pop("pending_extension_chat_ids", None)
         return state
 
     @staticmethod
@@ -1749,7 +1934,18 @@ class Collector:
         if pending_raw is not None:
             pending = json.loads(pending_raw.decode("utf-8"))
             allowed.add(self._position_after_monitor_payload(state, pending))
-        if self._monitor_position(gate["monitor"]) not in allowed:
+        # Приёмник мог объявить расширение: у него появился курсор чата,
+        # которого локально ещё нет. Это не откат и не прыжок цепочки —
+        # sequence и хеш при этом те же, отличается только состав курсоров.
+        # Сверять состав вслепую значило бы ронять КАЖДЫЙ тик в окне между
+        # `extend_chat_set.sh` и принятием чата, унося с собой и дайджест.
+        known_ids = {row["chat_id"] for row in state["monitor_cursors"]}
+        announced = self._monitor_position(gate["monitor"])
+        settled = (
+            announced[0], announced[1],
+            tuple(row for row in announced[2] if row[0] in known_ids),
+        )
+        if announced not in allowed and settled not in allowed:
             raise RuntimeError("receiver monitor chain rolled back or jumped")
         if pending_raw is not None:
             state = await self._handle_monitor_pending(
@@ -1824,6 +2020,64 @@ class Collector:
 
         if state["phase"] != "active" or gate["monitor"]["baseline_required"]:
             raise RuntimeError("local and remote baseline state disagree")
+
+        # Новизна чата ХРАНИТСЯ явно, а не выводится из нулевых курсоров:
+        # у чата, где на момент baseline не было ни одного сообщения, курсор
+        # тоже ноль — и он бесконечно получал бы чужой extension_baseline,
+        # хотя к расширению отношения не имеет.
+        awaiting = set(state.get("pending_extension_chat_ids") or [])
+        fresh_chats = [row for row in chats if row["chat_id"] in awaiting]
+        if fresh_chats:
+            # Чат принят расширением и ещё не активирован: приёмник ждёт от нас
+            # extension baseline. Он продолжает цепочку monitor, поэтому
+            # курсоры остальных чатов не двигаются, а история не начинается
+            # заново — ради этого расширение и делалось.
+            await self._assert_active(
+                revoked, source_id, chat_ids,
+                self._generated_at(gate, gate_received_mono),
+            )
+            tops = await self._bounded_external(
+                gateway.snapshot_tops(session, [
+                    (row["chat_id"], PeerSpec.from_dict(row["peer"]))
+                    for row in fresh_chats
+                ]),
+                TELEGRAM_FETCH_TIMEOUT_S,
+            )
+            payload = build_monitor_upload(
+                source_id=source_id, gate=gate, kind="extension_baseline",
+                ranges=[
+                    {"chat_id": row["chat_id"], "from_message_id_exclusive": 0,
+                     "through_message_id": tops[row["chat_id"]]}
+                    for row in fresh_chats
+                ],
+                events=[],
+                generated_at=self._generated_at(gate, gate_received_mono),
+            )
+            pending = canonical_monitor_bytes(payload)
+            if len(pending) > gate["monitor"]["max_upload_bytes"]:
+                raise RuntimeError(
+                    "extension baseline exceeds receiver max_upload_bytes")
+            async with self.state_lock:
+                self._assert_active_locked(
+                    revoked, source_id, chat_ids,
+                    self._generated_at(gate, gate_received_mono),
+                )
+                atomic_write_bytes(self.paths.monitor_pending, pending, 0o600)
+            await transport.upload_monitor(pending, revoked)
+            async with self.state_lock:
+                self._assert_active_locked(
+                    revoked, source_id, chat_ids,
+                    self._generated_at(gate, gate_received_mono),
+                )
+                state = self._load_watch_state(source_id, chat_ids)
+                state = self._apply_monitor_payload(state, payload)
+                atomic_write_json(self.paths.watch_state, state)
+                safe_unlink(self.paths.monitor_pending)
+            # Дальше сканировать в этом же тике нельзя: набор изменился, и
+            # следующий шаг обязан идти от свежего authenticated gate.
+            fresh_gate, fresh_mono = await self._fresh_gate(
+                transport, source_id, chat_ids, revoked)
+            return fresh_gate, fresh_mono, 0, 0
 
         selected = []
         for row in chats:
@@ -2036,7 +2290,15 @@ class Collector:
             else:
                 raise RuntimeError("pending digest is not linked to local checkpoint")
         remote = self._digest_position(gate["digest"])
-        if remote not in allowed:
+        # Та же поправка, что и у монитора: в переходном окне у приёмника уже
+        # есть курсор чата, которого локально ещё нет. Состав курсоров при
+        # этом отличается, а sequence и хеш — нет; ронять из-за расширения
+        # ДАЙДЖЕСТ, который к нему отношения не имеет, нельзя.
+        settled_remote = (
+            remote[0], remote[1],
+            tuple(row for row in remote[2] if row[0] in set(chat_ids)),
+        )
+        if remote not in allowed and settled_remote not in allowed:
             raise RuntimeError("receiver digest chain rolled back or jumped")
         if stale_local_pending:
             async with self.state_lock:
@@ -2094,6 +2356,14 @@ class Collector:
                 and now_mono - self._last_attempt[1] < 300):
             return "digest_cooldown", 0
         self._last_attempt = (sequence, now_mono)
+        # Ключ канала рождается на каждой попытке выпуска, а не только там,
+        # где нашлись сообщения: сутки без сообщений — законный выпуск, и на
+        # свежем экземпляре публичный ключ иначе не появлялся бы в интерфейсе
+        # до первого разговорного дня, а на DO его добавляли бы руками.
+        # В общем префиксе run_once генерация стоять по-прежнему не может:
+        # отказ ssh-keygen (например, ENOSPC) уносил бы с собой и monitor,
+        # хотя канал — забота исключительно digest.
+        await self._ensure_openrouter_key(source_id)
 
         cutoff = parse_utc(gate["server_time"], "server_time")
         first = acknowledged is None and sequence == 1
@@ -2160,11 +2430,6 @@ class Collector:
             # сторожить и переподнимать. Падение туннеля роняет попытку —
             # DIRECT fallback'а нет намеренно, иначе запрос ушёл бы мимо DO и
             # молча упёрся в фильтр, как это было до 18.08.
-            # Ключ нужен только здесь. В общем префиксе run_once его генерация
-            # роняла бы весь тик: отказ ssh-keygen (например, ENOSPC) уносил бы
-            # с собой и monitor, хотя канал — забота исключительно digest.
-            # Инвариант «ошибка digest не блокирует monitor» держится этим.
-            await self._ensure_openrouter_key(source_id)
             tunnel = self.tunnel_factory(self.paths, settings["upload"])
             await tunnel.start()
             try:

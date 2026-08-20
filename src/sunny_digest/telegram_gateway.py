@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import base64
 import binascii
 import hashlib
@@ -47,6 +48,10 @@ _MEDIA_TIMESTAMP = re.compile(
 _BASE64URL = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
 PEER_OPERATION_TIMEOUT_S = 30.0
 PEER_OPERATION_CONCURRENCY = 4
+# Потолок топиков за один проход. Форум с сотнями топиков не должен
+# растягивать peer-unit: непрочитанное в остальных закроется на
+# следующих тиках, а дедлайн важнее полноты одного прохода.
+MAX_FORUM_TOPICS = 100
 
 
 async def _gather_peer_tasks(tasks):
@@ -260,6 +265,9 @@ class TelethonGateway:
         }
         if proxy != expected_proxy:
             raise ValueError("Telegram requires the app-scoped SOCKS proxy")
+        # Часы peer-unit: подменяются в тестах, поэтому дедлайн проверяем
+        # именно ими, а не time.monotonic напрямую.
+        self.monotonic = time.monotonic
         self.api_id = api_id
         self.api_hash = api_hash
         self.proxy = dict(expected_proxy)
@@ -282,6 +290,19 @@ class TelethonGateway:
             system_version="umbrelOS",
             app_version=APP_VERSION,
         )
+
+    def _forum_modules(self):
+        """Форумные вызовы живут в `messages`, а НЕ в `channels`.
+
+        В layer 227 их перенесли, и почти все примеры в сети ссылаются на
+        `channels.GetForumTopicsRequest`, которого в Telethon 1.44 нет вовсе —
+        такой импорт падает на ровном месте."""
+        from telethon.tl.functions.messages import (
+            GetForumTopicsRequest,
+            ReadDiscussionRequest,
+        )
+        from telethon.tl.types import ForumTopic
+        return GetForumTopicsRequest, ReadDiscussionRequest, ForumTopic
 
     def _peer_dialog_modules(self):
         from telethon.tl.functions.messages import GetPeerDialogsRequest
@@ -622,6 +643,54 @@ class TelethonGateway:
         if failed or succeeded != [peer.telegram_chat_id()]:
             raise RuntimeError("Telegram read acknowledgement failed")
 
+    async def _acknowledge_forum_topics(
+            self, client, peer: PeerSpec, through_message_id: int) -> None:
+        """Пометить прочитанными топики форума.
+
+        `send_read_acknowledge` уходит в `channels.readHistory`, у которого нет
+        поля топика: у форума он гасит общий счётчик, а бейджи топиков остаются
+        гореть неделями. Официальные клиенты закрывают топик отдельным
+        `messages.readDiscussion` на каждый — так же делаем и мы.
+
+        Перечисление возвращает и последние сообщения топиков; берём из ответа
+        ТОЛЬКО метаданные (`id`, `unread_count`), тексты не читаем и не храним —
+        то же ограничение, что и у enumeration диалогов при настройке.
+
+        Не форум — `CHANNEL_FORUM_MISSING`, и это штатный ответ, а не сбой."""
+        if peer.kind != "channel":
+            return
+        GetForumTopicsRequest, ReadDiscussionRequest, ForumTopic = (
+            self._forum_modules())
+        input_peer = self._input_peer(peer)
+        try:
+            topics = await client(GetForumTopicsRequest(
+                peer=input_peer, offset_date=None, offset_id=0, offset_topic=0,
+                limit=MAX_FORUM_TOPICS,
+            ))
+        except Exception:
+            # Обычная супергруппа отвечает CHANNEL_FORUM_MISSING; отличать её от
+            # сетевого сбоя здесь нечем и незачем — пометка peer уже прошла.
+            return
+        rows = getattr(topics, "topics", None) or []
+        for row in rows[:MAX_FORUM_TOPICS]:
+            # ForumTopicDeleted несёт только id — у него нет ни unread_count,
+            # ни чего-либо ещё, и read по нему бессмыслен.
+            if not isinstance(row, ForumTopic):
+                continue
+            if int(getattr(row, "unread_count", 0) or 0) <= 0:
+                continue
+            topic_id = int(row.id)
+            try:
+                await client(ReadDiscussionRequest(
+                    peer=input_peer, msg_id=topic_id,
+                    read_max_id=through_message_id,
+                ))
+            except Exception:
+                # Каждый топик отвечает за себя: закрытый или удалённый даёт
+                # MSG_ID_INVALID, и обрывать на нём весь обход значило бы
+                # оставить все последующие топики непрочитанными навсегда.
+                continue
+
     async def acknowledge_reads(
             self, session_text: str,
             acknowledgements: Sequence[Tuple[int, PeerSpec, int]],
@@ -646,6 +715,11 @@ class TelethonGateway:
                     chat_id: int, peer: PeerSpec, through_message_id: int,
             ) -> Tuple[int, bool]:
                 async with semaphore:
+                    # ОДИН дедлайн на весь peer-unit, а не по одному на шаг:
+                    # два независимых таймаута удваивали бюджет чата, и
+                    # шестнадцать чатов переставали укладываться в агрегатный
+                    # лимит вызывающего.
+                    deadline = self.monotonic() + PEER_OPERATION_TIMEOUT_S
                     try:
                         await asyncio.wait_for(
                             client.send_read_acknowledge(
@@ -654,9 +728,23 @@ class TelethonGateway:
                             ),
                             timeout=PEER_OPERATION_TIMEOUT_S,
                         )
-                        return chat_id, True
                     except Exception:
                         return chat_id, False
+                    remaining = deadline - self.monotonic()
+                    if remaining > 0:
+                        try:
+                            # Топики — вторым шагом, в остатке того же бюджета:
+                            # их отказ не отменяет уже состоявшуюся пометку
+                            # peer, иначе один недоступный топик заставил бы
+                            # перечитывать всю группу заново на каждом тике.
+                            await asyncio.wait_for(
+                                self._acknowledge_forum_topics(
+                                    client, peer, through_message_id),
+                                timeout=remaining,
+                            )
+                        except Exception:
+                            pass
+                    return chat_id, True
 
             tasks = [
                 asyncio.create_task(acknowledge_one(chat_id, peer, through_message_id))

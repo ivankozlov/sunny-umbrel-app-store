@@ -149,7 +149,8 @@ def load_settings(paths: Paths) -> Dict[str, Any]:
         raise ValueError("settings schema is invalid")
     if value.get("phase") not in (
             "configured", "code_sent", "password_required", "authenticated",
-            "resolving_links", "dialogs_listed", "chat_locked"):
+            "resolving_links", "dialogs_listed", "chat_locked",
+            "resolving_extension"):
         raise ValueError("settings phase is invalid")
     if not isinstance(value.get("chat_locked"), bool):
         raise ValueError("settings chat_locked is invalid")
@@ -177,7 +178,11 @@ def load_settings(paths: Paths) -> Dict[str, Any]:
     if value["chat_locked"] != paths.chat_locked.exists():
         raise ValueError("settings lock marker mismatch")
     if value["chat_locked"]:
-        if value["phase"] != "chat_locked":
+        # `resolving_extension` — одноразовая фаза принятия чата, объявленного
+        # приёмником. Она durable и живёт ВНУТРИ locked-состояния: не пустив её
+        # сюда, мы делали settings.json нечитаемым сразу после записи, и
+        # приложение переставало работать целиком.
+        if value["phase"] not in ("chat_locked", "resolving_extension"):
             raise ValueError("locked settings phase is invalid")
         validate_locked_chats(value["chats"])
         try:

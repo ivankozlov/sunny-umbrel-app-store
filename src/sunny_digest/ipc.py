@@ -32,6 +32,11 @@ async def dispatch(collector: Collector, request: Dict[str, Any]) -> Dict[str, A
         if not isinstance(data, str):
             raise ValueError("replace_vpn data must be a string")
         return await collector.replace_vpn(data)
+    if command == "extend_chats":
+        data = request["data"]
+        if not isinstance(data, str):
+            raise ValueError("extend_chats data must be a string")
+        return await collector.extend_chats(data)
     if command == "send_code":
         return await collector.send_code(request["data"])
     if command == "submit_code":

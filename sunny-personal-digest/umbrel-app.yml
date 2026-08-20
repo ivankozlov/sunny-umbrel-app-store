@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Chats
-version: "0.2.8"
+version: "0.2.9"
 tagline: Mentions, read receipts, and one digest for selected chats
 description: >-
   Resolves message links for only the explicitly selected Telegram groups,
@@ -18,13 +18,13 @@ description: >-
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  Rewrites the daily digest: the model now returns structured topics and a
-  separate list of links instead of a rendered message, and the app assembles
-  the text and the message links locally, so stable Telegram message IDs still
-  never reach OpenRouter. Small talk is filtered out, an issue may span several
-  Telegram messages, and an over-long issue is trimmed with a visible note
-  rather than lost. The collector wire protocol remains 0.2.1.
-
+  Group chats with forum topics are now marked read topic by topic: a single
+  read call has no topic field, so their unread badges used to keep burning for
+  days even though the messages were already in the digest. The selected chat
+  set can also be extended without a factory reset — the server adds the chat,
+  the app picks it up from one message link and activates it, and the Telegram
+  session, keys and the existing chats' history and cursors all survive. The
+  collector wire protocol remains 0.2.1.
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store
 dependencies: []

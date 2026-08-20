@@ -15,20 +15,22 @@ The app/package/image ID remains `sunny-personal-digest` for release continuity;
 the v0.2 product name is **Sunny Personal Chats**. v0.2 is a breaking credential
 generation and does not migrate the unpublished v0.1 pilot state.
 
-The physical Umbrel runs `0.2.5`: seven exact peers, the receiver generation,
-durable baseline, session, and active monitoring state survived the update and a
-subsequent reboot. The locked-state VPN replacement authorized Telegram through the
+The last recorded state of the physical Umbrel (2026-08-14) is `0.2.5`: seven exact
+peers, the receiver generation, durable baseline, session, and active monitoring state
+survived the update and a subsequent reboot. Whether the device has been updated since
+the distribution reopened is not recorded here. The locked-state VPN replacement authorized Telegram through the
 first tested route; pending uploads and peer errors were both zero after reboot. The
 first real 03:00–04:45 daily after that replacement has not yet been observed. Wire
 `COLLECTOR_VERSION` remains `0.2.1`.
 
-The Store repository is now private and the public GHCR package has been deleted.
-The installed app starts from its local image cache. Do not use Umbrel **Update**,
-uninstall/reinstall, or Docker image pruning until the snapshot has been restored into
-runtime-usable local Docker or an explicitly approved private registry and the real
-recreate/pull path has been verified. The `umbrel/` subtree of private source repository
-`ivankozlov/sunny/main` deliberately remains a disabled, placeholder-pinned Phase-A
-candidate; the separate private Store `main` retains the historical enabled release.
+The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
+restored on 2026-08-17; `0.2.6`, `0.2.7` and `0.2.8` have public multi-arch images.
+**Update** and uninstall/reinstall therefore have a public source again. Docker image
+pruning is still unsafe while the device may be running `0.2.5` from its local cache:
+that one image is absent from both GHCR and the offline snapshot. The real recreate/pull
+path on the device has never been exercised. The `umbrel/` subtree of private source
+repository `ivankozlov/sunny/main` deliberately remains a disabled, placeholder-pinned
+Phase-A candidate; the enabling commit lives only in the Store repository.
 
 ## Product contract
 
@@ -247,22 +249,22 @@ Open `http://127.0.0.1:18080/` and authenticate as `sunny` / `test-only`.
 Use the fixture phases to inspect login, message-link confirmation, locked, and
 activation screens.
 
-## Two-phase GitHub/GHCR release (only if explicitly reopened)
+## Two-phase GitHub/GHCR release
 
 Anonymous umbrelOS install/update requires both a public Store repository and a
-public `ghcr.io/ivankozlov/sunny-personal-digest` image. Those surfaces were closed
-on 2026-08-14: the Store is private and the public GHCR package is absent. Do not
-silently republish either one.
+public `ghcr.io/ivankozlov/sunny-personal-digest` image. Both surfaces were closed on
+2026-08-14 and reopened on 2026-08-17 by an explicit owner decision; `v0.2.6`,
+`v0.2.7` and `v0.2.8` were published and enabled from there. Reopening stays an
+explicit, per-release decision — never republish silently.
 
-The enabled `0.2.5` release previously followed this exact sequence: disabled source
-first, the protected `Publish image` workflow with `bootstrap_empty_package=false`,
-independent public OCI verification for `linux/amd64` and `linux/arm64`, and only then
-the exact digest pin plus `disabled: false`. Its enabled Store commit and OCI index are
-preserved in the offline recovery snapshot described below. The `umbrel/` subtree of
-the private source repository `ivankozlov/sunny/main` still carries `disabled: true`
-and the release placeholder intentionally; the separate private Store `main` retains
-the historical enabled commit. Any future republication must use a new semver/tag and
-repeat the full sequence.
+Every release follows this exact sequence, as `0.2.5` did and `0.2.6`–`0.2.8` did
+after it: disabled source first, the protected `Publish image` workflow with
+`bootstrap_empty_package=false`, independent public OCI verification for
+`linux/amd64` and `linux/arm64`, and only then the exact digest pin plus
+`disabled: false`. The `umbrel/` subtree of the private source repository
+`ivankozlov/sunny/main` intentionally keeps `disabled: true` and the release
+placeholder; the enabling commit lives only in the Store repository. Any further
+release must use a new semver/tag and repeat the full sequence.
 Wire `COLLECTOR_VERSION` deliberately stays `0.2.1` until an explicit chain migration.
 Run `python3 scripts/check_package.py --release` before every enabling commit.
 
@@ -270,14 +272,18 @@ Never overwrite a version tag, use a mutable tag without its digest, or enable t
 app before both the repository and image are available through the explicitly approved
 distribution path.
 
-## Offline recovery after public withdrawal
+## Offline recovery snapshot
 
-The verified owner snapshot is
-`~/Downloads/Sunny-recovery-2026-08-14` on the development Mac. It contains git
-bundles/source snapshots, the enabled Store commit
-`fed43bacfdb82ebb5bccc17036314db6ce0b2d85`, and multi-architecture OCI index
-`sha256:b7a68169b37e884ed2b1cd0d17e24b4278fe1c9119ba2bd36268d6759631cea7`.
-Run `shasum -a 256 -c SHA256SUMS` inside that directory before recovery.
+The verified owner snapshot is kept in the owner's off-site backup storage, outside
+this repository. It contains git bundles/source snapshots and the enabled Store commit
+`fed43bacfdb82ebb5bccc17036314db6ce0b2d85`. Its multi-architecture OCI archive
+(`sha256:b7a68169b37e884ed2b1cd0d17e24b4278fe1c9119ba2bd36268d6759631cea7`) was removed
+on 2026-08-19, once public images for the current versions were available again.
+Verify the remaining files against `SHA256SUMS` inside that directory before recovery.
+
+The `v0.2.5` image itself is gone from both GHCR and the snapshot. Do not prune Docker
+images on an Umbrel that still runs `v0.2.5` from its local cache — update it to a
+version that is present in the registry first.
 
 The snapshot deliberately contains no Umbrel `data/private`, Telegram StringSession,
 credentials, or runtime state. Losing app-data therefore requires fresh Telegram

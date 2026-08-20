@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import sunny_digest.telegram_gateway as gateway_module
 from sunny_digest.models import DigestChat, PeerSpec
 from sunny_digest.prompting import prompt_size, render_digest_prompt
 from sunny_digest.mihomo import MIHOMO_SOCKS_HOST, MIHOMO_SOCKS_PORT
@@ -1034,3 +1035,168 @@ class TestBugTrustedLookback20260810(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeForumTopic:
+    """Минимальный ForumTopic: код читает только id и unread_count."""
+
+    def __init__(self, topic_id, unread_count):
+        self.id = topic_id
+        self.unread_count = unread_count
+
+
+class FakeDeletedTopic:
+    def __init__(self, topic_id):
+        self.id = topic_id
+
+
+class ForumClient(FakeClient):
+    def __init__(self, topics, *, list_error=None, read_error_on=None):
+        super().__init__([], upper_id=None)
+        self.topics = topics
+        self.list_error = list_error
+        self.read_error_on = read_error_on
+        self.topic_reads = []
+        self.topic_list_calls = 0
+
+    async def __call__(self, request):
+        name = type(request).__name__
+        if name == "GetForumTopicsRequest":
+            self.topic_list_calls += 1
+            if self.list_error is not None:
+                raise self.list_error
+            return SimpleNamespace(topics=self.topics)
+        if name == "ReadDiscussionRequest":
+            if request.msg_id == self.read_error_on:
+                raise RuntimeError("topic read failed")
+            self.topic_reads.append((request.peer, request.msg_id, request.read_max_id))
+            return True
+        return await super().__call__(request)
+
+
+class ForumGateway(GatewayUnderTest):
+    """Подменяет только импорт форумных типов: остальной путь продакшновый."""
+
+    def _forum_modules(self):
+        class GetForumTopicsRequest:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class ReadDiscussionRequest:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        return GetForumTopicsRequest, ReadDiscussionRequest, FakeForumTopic
+
+
+class TestBugForumTopicsStayUnread20260820(unittest.IsolatedAsyncioTestCase):
+    """Форумные топики не помечались прочитанными.
+
+    `send_read_acknowledge` уходит в `channels.readHistory`, у которого нет
+    поля топика: общий счётчик группы гаснет, а бейджи топиков горят днями —
+    ровно это Иван и увидел 20.08. Официальные клиенты закрывают топик
+    отдельным `messages.readDiscussion`, по одному на каждый.
+    """
+
+    PEER = PeerSpec("channel", 100123, 998877)
+
+    async def test_unread_topics_are_acknowledged_one_by_one(self):
+        client = ForumClient([
+            FakeForumTopic(1, unread_count=5),      # General
+            FakeForumTopic(77, unread_count=1),
+            FakeForumTopic(88, unread_count=0),     # читать нечего
+            FakeDeletedTopic(99),                   # ForumTopicDeleted
+        ])
+        gateway = ForumGateway(client)
+
+        succeeded, failed = await gateway.acknowledge_reads(
+            "session", [(CHAT_ID, self.PEER, 4242)])
+
+        self.assertEqual((succeeded, failed), ([CHAT_ID], []))
+        # Пометка peer осталась на месте, топики добавились сверх неё.
+        self.assertEqual(len(client.read_ack_calls), 1)
+        self.assertEqual(client.topic_reads, [
+            ("exact-input-peer", 1, 4242),
+            ("exact-input-peer", 77, 4242),
+        ])
+
+    async def test_ordinary_supergroup_is_not_broken_by_the_forum_probe(self):
+        """Не форум отвечает CHANNEL_FORUM_MISSING — это штатный ответ."""
+        client = ForumClient([], list_error=RuntimeError("CHANNEL_FORUM_MISSING"))
+        gateway = ForumGateway(client)
+
+        succeeded, failed = await gateway.acknowledge_reads(
+            "session", [(CHAT_ID, self.PEER, 100)])
+
+        self.assertEqual((succeeded, failed), ([CHAT_ID], []))
+        self.assertEqual(client.topic_reads, [])
+        self.assertEqual(len(client.read_ack_calls), 1)
+
+    async def test_failing_topic_does_not_undo_the_peer_acknowledgement(self):
+        """Иначе один недоступный топик заставлял бы перечитывать всю группу
+        заново на каждом тике: чат никогда не считался бы подтверждённым."""
+        client = ForumClient([
+            FakeForumTopic(1, unread_count=2),
+            FakeForumTopic(55, unread_count=2),
+        ], read_error_on=1)
+        gateway = ForumGateway(client)
+
+        succeeded, failed = await gateway.acknowledge_reads(
+            "session", [(CHAT_ID, self.PEER, 7)])
+
+        self.assertEqual((succeeded, failed), ([CHAT_ID], []))
+        self.assertEqual(len(client.read_ack_calls), 1)
+
+    async def test_one_failing_topic_does_not_skip_the_rest(self):
+        """Раньше исключение на N-м топике отменяло все последующие: закрытый
+        или удалённый топик оставлял бы остальные непрочитанными навсегда."""
+        client = ForumClient([
+            FakeForumTopic(1, unread_count=2),
+            FakeForumTopic(55, unread_count=2),
+            FakeForumTopic(77, unread_count=2),
+        ], read_error_on=55)
+        gateway = ForumGateway(client)
+
+        await gateway.acknowledge_reads("session", [(CHAT_ID, self.PEER, 9)])
+
+        self.assertEqual([row[1] for row in client.topic_reads], [1, 77])
+
+    async def test_peer_unit_keeps_a_single_budget(self):
+        """Два независимых таймаута удваивали бюджет чата, и шестнадцать
+        чатов переставали укладываться в агрегатный лимит вызывающего."""
+        client = ForumClient([FakeForumTopic(1, unread_count=1)])
+        gateway = ForumGateway(client)
+        ticks = iter([1000.0, 1000.0 + gateway_module.PEER_OPERATION_TIMEOUT_S])
+        gateway.monotonic = lambda: next(ticks)
+
+        succeeded, failed = await gateway.acknowledge_reads(
+            "session", [(CHAT_ID, self.PEER, 9)])
+
+        # Бюджет исчерпан пометкой peer — топики в этот тик не трогаем, но
+        # сам чат подтверждён, и остаток закроется следующим тиком.
+        self.assertEqual((succeeded, failed), ([CHAT_ID], []))
+        self.assertEqual(client.topic_reads, [])
+
+    async def test_topic_count_is_bounded(self):
+        client = ForumClient([
+            FakeForumTopic(index, unread_count=1)
+            for index in range(1, gateway_module.MAX_FORUM_TOPICS + 50)
+        ])
+        gateway = ForumGateway(client)
+
+        await gateway.acknowledge_reads("session", [(CHAT_ID, self.PEER, 9)])
+
+        self.assertEqual(
+            len(client.topic_reads), gateway_module.MAX_FORUM_TOPICS)
+
+    async def test_legacy_group_never_asks_about_topics(self):
+        """У basic group топиков не бывает — лишний запрос был бы и мусором,
+        и расширением набора вызовов к Telegram без причины."""
+        client = ForumClient([FakeForumTopic(1, unread_count=3)])
+        gateway = ForumGateway(client)
+
+        await gateway.acknowledge_reads(
+            "session", [(-321, PeerSpec("chat", 321, None), 5)])
+
+        self.assertEqual(client.topic_list_calls, 0)
+        self.assertEqual(client.topic_reads, [])

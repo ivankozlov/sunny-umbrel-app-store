@@ -193,7 +193,7 @@ def gate(*, baseline_required=False, monitor_sequence=2,
             "cursors": [
                 {"chat_id": chat_id,
                  "through_message_id": monitor_cursors[chat_id]}
-                for chat_id in CHAT_IDS
+                for chat_id in monitor_cursors
             ],
             "max_upload_bytes": 32768,
         },
@@ -208,7 +208,7 @@ def gate(*, baseline_required=False, monitor_sequence=2,
             "cursors": [
                 {"chat_id": chat_id,
                  "through_message_id": digest_cursors[chat_id]}
-                for chat_id in CHAT_IDS
+                for chat_id in digest_cursors
             ],
             "max_upload_bytes": 32768,
         },
@@ -225,11 +225,15 @@ class FakeTransport:
         self.digest_uploads = []
         self.lose_monitor_ack = False
         self.lose_digest_ack = False
+        # Набор чатов расширяем: после расширения приложение законно шлёт
+        # больше идентификаторов, чем было при установке.
+        self.expected_chat_ids = list(CHAT_IDS)
 
     async def gate(self, source_id, chat_ids, revoked):
         self.trace.append("status")
         self.gate_calls += 1
-        if source_id != SOURCE_ID or chat_ids != CHAT_IDS or revoked.is_set():
+        if (source_id != SOURCE_ID or chat_ids != self.expected_chat_ids
+                or revoked.is_set()):
             raise AssertionError("invalid status binding")
         return copy.deepcopy(self.value)
 
@@ -308,6 +312,7 @@ class FakeGateway:
             for chat_id, title, peer in zip(CHAT_IDS, TITLES, PEERS)
         ]
         self.resolve_calls = []
+        self.expected_chat_ids = list(CHAT_IDS)
         self.send_code_calls = 0
         self.logout_calls = 0
 
@@ -326,17 +331,23 @@ class FakeGateway:
         return dict(self.tops)
 
     def assert_exact_selected(self, selected):
-        if [row[0] for row in selected] != CHAT_IDS:
+        # Сторож ловит выход ЗА набор. Подмножество законно: extension
+        # baseline снимает срез только по добавленным чатам, а не по всем.
+        chosen = [row[0] for row in selected]
+        if (not set(chosen) <= set(self.expected_chat_ids)
+                or chosen != sorted(chosen, key=self.expected_chat_ids.index)
+                or len(set(chosen)) != len(chosen)):
             raise AssertionError("collector escaped locked chat set")
 
     async def snapshot_and_scan_mentions(self, _session, source_id, selected):
         self.trace.append("scan_batch")
         self.aggregate_scan_calls += 1
-        if source_id != SOURCE_ID or [row[0] for row in selected] != CHAT_IDS:
+        if (source_id != SOURCE_ID
+                or [row[0] for row in selected] != self.expected_chat_ids):
             raise AssertionError("invalid aggregate scan binding")
         available = {}
         starts = {row[0]: row[3] for row in selected}
-        for chat_id in CHAT_IDS:
+        for chat_id in self.expected_chat_ids:
             if chat_id in self.scan_failures:
                 continue
             configured = self.scans[chat_id]
@@ -1153,6 +1164,78 @@ class TestBugLiveVPNRepair20260814(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(runtime.starts[-1], VPN_NODE)
             status = await collector.public_status()
             self.assertEqual(status["vpn_repair_attempted"], 8)
+
+
+class TestBugVPNRepairStatusFault20260819(unittest.IsolatedAsyncioTestCase):
+    """Принятая замена маршрута обязана быть записана ДО spawn'а задачи.
+
+    Residual ревью 2026-08-14: task создавался раньше `_write_status()`, и при
+    локальном отказе записи status/heartbeat IPC возвращал ошибку, а фоновая
+    задача продолжала работу и могла заменить маршрут. Проверяем оба файла
+    записи: отказ любого из них оставляет маршрут нетронутым."""
+
+    async def test_status_write_failure_leaves_no_background_repair(self):
+        for target in ("status", "heartbeat"):
+            with self.subTest(target=target):
+                with tempfile.TemporaryDirectory() as temporary:
+                    paths = make_paths(Path(temporary))
+                    seed_locked(paths, watch_phase="active")
+                    old_node_bytes = paths.vpn_active_node.read_bytes()
+                    fetched = []
+
+                    async def fetch(source):
+                        fetched.append(source)
+                        return [copy.deepcopy(VPN_NODE)]
+
+                    async def probe(*_args):
+                        return True
+
+                    runtime = FakeVPNRuntime(paths.private_dir)
+                    runtime.ready = True
+                    collector = Collector(
+                        paths,
+                        vpn_runtime_factory=lambda _private: runtime,
+                        subscription_fetcher=fetch,
+                        telegram_probe_function=probe,
+                        clock=lambda: NOW,
+                    )
+                    real_json = collector_module.atomic_write_json
+                    real_bytes = collector_module.atomic_write_bytes
+
+                    def fail_json(path, value, mode=0o600):
+                        if target == "status" and path == paths.status:
+                            raise OSError("simulated status write failure")
+                        real_json(path, value, mode)
+
+                    def fail_bytes(path, value, mode=0o600):
+                        if target == "heartbeat" and path == paths.heartbeat:
+                            raise OSError("simulated heartbeat write failure")
+                        real_bytes(path, value, mode)
+
+                    with patch.object(
+                        collector_module, "atomic_write_json",
+                        side_effect=fail_json,
+                    ), patch.object(
+                        collector_module, "atomic_write_bytes",
+                        side_effect=fail_bytes,
+                    ):
+                        with self.assertRaises(OSError):
+                            await collector.replace_vpn(
+                                "https://subscription.example/status-fault")
+                    # Задача, если бы её всё-таки создали, успела бы сходить
+                    # за подпиской и поднять узел за эти витки цикла.
+                    for _ in range(5):
+                        await asyncio.sleep(0)
+
+                    self.assertIsNone(collector._vpn_repair_task)
+                    self.assertEqual(fetched, [])
+                    self.assertEqual(runtime.starts, [])
+                    self.assertEqual(
+                        paths.vpn_active_node.read_bytes(), old_node_bytes)
+                    status = await collector.public_status()
+                    self.assertFalse(status["vpn_repairing"])
+                    self.assertEqual(status["vpn_repair_state"], "idle")
+                    self.assertIsNone(status["vpn_repair_error_type"])
 
 
 class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
@@ -2571,6 +2654,41 @@ class TestResetWipesTunnelKey20260818(unittest.IsolatedAsyncioTestCase):
 
 
 
+class TestBugOpenRouterKeyOnEmptyDay20260819(unittest.IsolatedAsyncioTestCase):
+    """Ключ канала обязан родиться на первой же попытке выпуска.
+
+    Генерация стояла в ветке `else:` после `if total == 0`, поэтому на свежем
+    экземпляре, у которого первые сутки прошли без сообщений, публичный ключ
+    не появлялся в интерфейсе вовсе, и на DO его добавляли руками."""
+
+    async def test_day_without_messages_still_generates_the_channel_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            self.assertFalse(paths.openrouter_key.exists())
+            gateway = FakeGateway(paths)
+            gateway.fetches = {
+                chat_id: FetchResult(BASELINE_TOPS[chat_id], [])
+                for chat_id in CHAT_IDS
+            }
+            transport = FakeTransport(paths, gate(digest_due=True))
+            collector = collector_for(paths, gateway, transport)
+            tunnels_before = len(FakeTunnel.instances)
+
+            result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            self.assertEqual(
+                transport.digest_uploads[-1]["total_message_count"], 0)
+            self.assertEqual(transport.digest_uploads[-1]["digest"], "")
+            self.assertTrue(paths.openrouter_key.exists())
+            self.assertIn(
+                "sunny-openrouter", result["openrouter_public_key"])
+            # Канал при этом не поднимался: запроса к модели на пустых сутках
+            # нет, и платить за ssh-сессию не за что.
+            self.assertEqual(len(FakeTunnel.instances), tunnels_before)
+
+
 class TestBugVPNAddressRotation20260819(unittest.IsolatedAsyncioTestCase):
     """Ротация Primary IP не должна убивать Telegram до утра.
 
@@ -2873,3 +2991,307 @@ class TestBugVPNAddressRotation20260819(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+NEW_CHAT_ID = -1003334567890
+NEW_PEER = PeerSpec("channel", 3334567890, 555444)
+
+
+class TestChatSetExtension20260820(unittest.IsolatedAsyncioTestCase):
+    """Приложение подхватывает чат, добавленный на приёмнике.
+
+    Порядок именно такой: расширение объявляет сервер, приложение только
+    принимает. Иначе взломанный Umbrel мог бы расширить себе доступ сам, а
+    набор чатов — это то, что решает владелец сервера.
+    """
+
+    def _extended_gate(self):
+        cursors = {chat_id: BASELINE_TOPS[chat_id] for chat_id in CHAT_IDS}
+        cursors[NEW_CHAT_ID] = 0
+        ordered = sorted(cursors)
+        value = gate(monitor_cursors={key: cursors[key] for key in ordered},
+                     digest_cursors={key: 0 for key in ordered})
+        return value
+
+    async def test_extension_baseline_is_sent_for_the_new_chat_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+
+            # Сервер объявил новый чат, приложение уже приняло его в settings.
+            settings = read_json(paths.settings)
+            settings["chats"] = sorted(
+                settings["chats"] + [{
+                    "chat_id": NEW_CHAT_ID,
+                    "title": "Добавленный чат",
+                    "peer": NEW_PEER.as_dict(),
+                    "initial_message_id": 0,
+                }],
+                key=lambda row: row["chat_id"])
+            atomic_write_json(paths.settings, settings)
+            watch = read_json(paths.watch_state)
+            order = [row["chat_id"] for row in settings["chats"]]
+            watch["monitor_cursors"] = collector_module._extended_cursor_rows(
+                watch["monitor_cursors"], NEW_CHAT_ID,
+                {"chat_id": NEW_CHAT_ID, "through_message_id": 0}, order)
+            watch["chats"] = collector_module._extended_cursor_rows(
+                watch["chats"], NEW_CHAT_ID,
+                {"chat_id": NEW_CHAT_ID, "scan_through_message_id": 0,
+                 "read_pending_through_message_id": 0,
+                 "read_acked_through_message_id": 0}, order)
+            watch["pending_extension_chat_ids"] = [NEW_CHAT_ID]
+            atomic_write_json(paths.watch_state, watch)
+
+            gateway = FakeGateway(paths)
+            gateway.tops = {**BASELINE_TOPS, NEW_CHAT_ID: 4242}
+            gateway.assert_exact_selected = lambda selected: None
+            transport = FakeTransport(paths, self._extended_gate())
+            transport.expected_chat_ids = order
+            await collector_for(paths, gateway, transport).run_once()
+
+            uploads = [row for row in transport.monitor_uploads
+                       if row["kind"] == "extension_baseline"]
+            self.assertEqual(len(uploads), 1)
+            payload = uploads[0]
+            # Только новый чат, от нуля, и цепочка продолжается.
+            self.assertEqual(
+                payload["ranges"],
+                [{"chat_id": NEW_CHAT_ID, "from_message_id_exclusive": 0,
+                  "through_message_id": 4242}])
+            self.assertGreater(payload["sequence"], 1)
+            self.assertIsNotNone(payload["previous_sha256"])
+            self.assertEqual(payload["events"], [])
+
+    async def test_settled_chats_never_get_a_second_extension(self):
+        """Курсор работающего чата не должен обнуляться расширением."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            transport = FakeTransport(paths, gate(digest_due=False))
+
+            await collector_for(paths, gateway, transport).run_once()
+
+            self.assertEqual(
+                [row for row in transport.monitor_uploads
+                 if row["kind"] == "extension_baseline"], [])
+
+    async def test_extend_chats_accepts_only_the_announced_chat(self):
+        """Продовый путь целиком: без него фаза `resolving_extension` уходила
+        в settings.json, которого load_settings не принимает, и приложение
+        переставало работать вообще — ревью нашло это на реальном прогоне."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            gateway.dialogs = [DialogCandidate(
+                NEW_CHAT_ID, "Добавленный чат", NEW_PEER)]
+            transport = FakeTransport(paths, self._extended_gate())
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = collector_for(paths, gateway, transport, runtime=runtime)
+
+            status = await collector.extend_chats("https://t.me/c/3334567890/12")
+
+            self.assertEqual(status["last_result"], "chat_extension_accepted")
+            settings = read_json(paths.settings)
+            # Фаза откатилась, файл читается — иначе приложение мертво.
+            self.assertEqual(settings["phase"], "chat_locked")
+            collector_module.load_settings(paths)
+            order = [row["chat_id"] for row in settings["chats"]]
+            self.assertEqual(order, sorted(order))
+            self.assertIn(NEW_CHAT_ID, order)
+            watch = read_json(paths.watch_state)
+            self.assertEqual(
+                [row["chat_id"] for row in watch["monitor_cursors"]], order)
+            self.assertEqual([row["chat_id"] for row in watch["chats"]], order)
+
+    async def test_extend_chats_refuses_a_chat_the_receiver_never_announced(self):
+        """Иначе приложение добавляло бы себе доступ само — ровно то, ради
+        чего расширение начинается на сервере."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            gateway.dialogs = [DialogCandidate(
+                -1009999999999, "Чужой чат", PeerSpec("channel", 9999999999, 1))]
+            transport = FakeTransport(paths, self._extended_gate())
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = collector_for(paths, gateway, transport, runtime=runtime)
+
+            with self.assertRaises(RuntimeError):
+                await collector.extend_chats("https://t.me/c/9999999999/1")
+
+            settings = read_json(paths.settings)
+            self.assertEqual(settings["phase"], "chat_locked")
+            self.assertNotIn(
+                -1009999999999, [row["chat_id"] for row in settings["chats"]])
+
+    async def test_extend_chats_refuses_when_the_gate_announced_nothing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            transport = FakeTransport(paths, gate(digest_due=False))
+            collector = collector_for(paths, FakeGateway(paths), transport)
+
+            with self.assertRaisesRegex(RuntimeError, "has not announced"):
+                await collector.extend_chats("https://t.me/c/3334567890/12")
+            self.assertEqual(read_json(paths.settings)["phase"], "chat_locked")
+
+    async def test_chat_without_messages_never_looks_like_an_extension(self):
+        """Пустая группа даёт нулевой курсор и локально, и у приёмника.
+
+        Пока «новизна» выводилась из нулей, такой чат бесконечно получал бы
+        чужой extension_baseline и валил монитор — к расширению он отношения
+        не имеет."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            watch = read_json(paths.watch_state)
+            empty_id = CHAT_IDS[0]
+            for row in watch["chats"]:
+                if row["chat_id"] == empty_id:
+                    row["scan_through_message_id"] = 0
+            for row in watch["monitor_cursors"]:
+                if row["chat_id"] == empty_id:
+                    row["through_message_id"] = 0
+            atomic_write_json(paths.watch_state, watch)
+
+            cursors = dict(BASELINE_TOPS)
+            cursors[empty_id] = 0
+            transport = FakeTransport(paths, gate(monitor_cursors=cursors))
+            await collector_for(paths, FakeGateway(paths), transport).run_once()
+
+            self.assertEqual(
+                [row for row in transport.monitor_uploads
+                 if row["kind"] == "extension_baseline"], [])
+
+    async def test_extension_repairs_the_digest_checkpoint(self):
+        """Чекпойнт дайджеста сверяется с набором строгим равенством и
+        переписывается только после успешного выпуска. Не дополнив его при
+        расширении, мы теряли бы дайджест навсегда."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            atomic_write_json(paths.acknowledged, {
+                "schema": "sunny.personal-chats.digest-ack.v1",
+                "digest_date": "2026-08-03",
+                "cursors": [
+                    {"chat_id": chat_id, "through_message_id": 10}
+                    for chat_id in CHAT_IDS
+                ],
+            })
+            gateway = FakeGateway(paths)
+            gateway.dialogs = [DialogCandidate(
+                NEW_CHAT_ID, "Добавленный чат", NEW_PEER)]
+            runtime = FakeVPNRuntime(paths.private_dir)
+            runtime.ready = True
+            collector = collector_for(
+                paths, gateway, FakeTransport(paths, self._extended_gate()),
+                runtime=runtime)
+
+            await collector.extend_chats("https://t.me/c/3334567890/12")
+
+            acknowledged = read_json(paths.acknowledged)
+            order = [row["chat_id"] for row in read_json(paths.settings)["chats"]]
+            self.assertEqual(
+                [row["chat_id"] for row in acknowledged["cursors"]], order)
+            self.assertEqual(
+                next(row["through_message_id"] for row in acknowledged["cursors"]
+                     if row["chat_id"] == NEW_CHAT_ID), 0)
+
+    async def test_tick_survives_the_window_before_the_chat_is_accepted(self):
+        """Окно между `extend_chat_set.sh` и принятием чата в приложении.
+
+        Приёмник уже объявил новый курсор, локально чата ещё нет. Сверка
+        позиции цепочки сравнивает КОРТЕЖ курсоров, поэтому вслепую она
+        роняла каждый тик — вместе с дайджестом, который к расширению
+        отношения не имеет."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            # settings и watch-state ещё СТАРЫЕ: приложение не приняло чат.
+            transport = FakeTransport(paths, self._extended_gate())
+            status = await collector_for(
+                paths, FakeGateway(paths), transport).run_once()
+
+            self.assertNotEqual(status["last_result"], "error")
+            self.assertIsNone(status["last_error_type"])
+            # Никакого extension baseline: чат ещё не принят приложением.
+            self.assertEqual(
+                [row for row in transport.monitor_uploads
+                 if row["kind"] == "extension_baseline"], [])
+
+    async def test_real_chain_jump_is_still_refused(self):
+        """Послабление не должно проглотить настоящий откат цепочки — ради
+        него проверка и писалась."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            jumped = gate(monitor_sequence=99, monitor_previous="c" * 64)
+            status = await collector_for(
+                paths, FakeGateway(paths),
+                FakeTransport(paths, jumped)).run_once()
+
+            self.assertEqual(status["last_result"], "error")
+            self.assertEqual(status["last_error_type"], "RuntimeError")
+
+    async def test_extension_survives_a_lost_upload_acknowledgement(self):
+        """Обрыв между выгрузкой extension baseline и записью состояния.
+
+        Это штатная авария, ради которой существует `monitor_pending`.
+        Пока метку снимала только ветка отправки, восстановление ломалось
+        навсегда: следующий тик снова считал чат ожидающим и падал на
+        несовпадении курсора — то есть исправление делало аварию фатальной."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            settings = read_json(paths.settings)
+            settings["chats"] = sorted(
+                settings["chats"] + [{
+                    "chat_id": NEW_CHAT_ID, "title": "Добавленный чат",
+                    "peer": NEW_PEER.as_dict(), "initial_message_id": 0,
+                }], key=lambda row: row["chat_id"])
+            atomic_write_json(paths.settings, settings)
+            order = [row["chat_id"] for row in settings["chats"]]
+            watch = read_json(paths.watch_state)
+            watch["monitor_cursors"] = collector_module._extended_cursor_rows(
+                watch["monitor_cursors"], NEW_CHAT_ID,
+                {"chat_id": NEW_CHAT_ID, "through_message_id": 0}, order)
+            watch["chats"] = collector_module._extended_cursor_rows(
+                watch["chats"], NEW_CHAT_ID,
+                {"chat_id": NEW_CHAT_ID, "scan_through_message_id": 0,
+                 "read_pending_through_message_id": 0,
+                 "read_acked_through_message_id": 0}, order)
+            watch["pending_extension_chat_ids"] = [NEW_CHAT_ID]
+            atomic_write_json(paths.watch_state, watch)
+
+            gateway = FakeGateway(paths)
+            gateway.tops = {**BASELINE_TOPS, NEW_CHAT_ID: 4242}
+            gateway.expected_chat_ids = order
+            gateway.scans[NEW_CHAT_ID] = MentionScanResult(4242, [])
+            transport = FakeTransport(paths, self._extended_gate())
+            transport.expected_chat_ids = order
+            transport.lose_monitor_ack = True
+            collector = collector_for(paths, gateway, transport)
+
+            first = await collector.run_once()
+            self.assertEqual(first["last_result"], "error")
+
+            # Приёмник расширение принял, квитанция потеряна — второй тик
+            # обязан довести дело до конца, а не встать навсегда.
+            accepted = {**BASELINE_TOPS, NEW_CHAT_ID: 4242}
+            transport.value = gate(
+                monitor_sequence=3, monitor_previous=transport.monitor_uploads[-1][
+                    "content_sha256"],
+                monitor_cursors={key: accepted[key] for key in order},
+                digest_cursors={key: 0 for key in order})
+            second = await collector.run_once()
+
+            self.assertNotEqual(second["last_result"], "error")
+            watch = read_json(paths.watch_state)
+            self.assertNotIn("pending_extension_chat_ids", watch)
+            self.assertEqual(
+                len([row for row in transport.monitor_uploads
+                     if row["kind"] == "extension_baseline"]), 1)
