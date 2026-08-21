@@ -1,6 +1,6 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: true
+disabled: false
 category: automation
 name: Sunny Personal Chats
 version: "0.2.10"
