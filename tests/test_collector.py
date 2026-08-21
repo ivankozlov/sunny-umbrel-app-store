@@ -1076,8 +1076,15 @@ class TestBugLiveVPNRepair20260814(unittest.IsolatedAsyncioTestCase):
                 return [candidate]
 
             async def probe(*_args):
-                await asyncio.sleep(0.12)
                 return True
+
+            # Verify the two deadline boundaries directly: wall-clock sleeps
+            # made this release gate depend on GitHub runner load.
+            wait_timeouts = []
+
+            async def wait_for(awaitable, *, timeout):
+                wait_timeouts.append(timeout)
+                return await awaitable
 
             runtime = FakeVPNRuntime(paths.private_dir)
             runtime.ready = True
@@ -1089,18 +1096,34 @@ class TestBugLiveVPNRepair20260814(unittest.IsolatedAsyncioTestCase):
                 clock=lambda: NOW,
             )
             await collector.run_lock.acquire()
-            with (
-                patch.object(
-                    collector_module, "VPN_REPAIR_RUN_LOCK_TIMEOUT_S", 0.2),
-                patch.object(
-                    collector_module, "VPN_REPAIR_TEST_TIMEOUT_S", 0.2),
-            ):
-                await collector.replace_vpn(
-                    "https://subscription.example/separate-budgets")
-                task = collector._vpn_repair_task
-                await asyncio.sleep(0.12)
-                collector.run_lock.release()
-                await task
+            lock_held = True
+            try:
+                with (
+                    patch.object(collector_module.asyncio, "wait_for", wait_for),
+                    patch.object(
+                        collector_module, "VPN_REPAIR_RUN_LOCK_TIMEOUT_S", 1.0),
+                    patch.object(
+                        collector_module, "VPN_REPAIR_TEST_TIMEOUT_S", 2.0),
+                ):
+                    await collector.replace_vpn(
+                        "https://subscription.example/separate-budgets")
+                    task = collector._vpn_repair_task
+                    for _ in range(10):
+                        await asyncio.sleep(0)
+                        if len(wait_timeouts) >= 2:
+                            break
+                    self.assertEqual(wait_timeouts, [
+                        collector_module.VPN_SUBSCRIPTION_TIMEOUT_S, 1.0,
+                    ])
+                    collector.run_lock.release()
+                    lock_held = False
+                    await task
+            finally:
+                if lock_held:
+                    collector.run_lock.release()
+            self.assertEqual(wait_timeouts, [
+                collector_module.VPN_SUBSCRIPTION_TIMEOUT_S, 1.0, 2.0,
+            ])
             self.assertEqual(read_json(paths.vpn_active_node), candidate)
             status = await collector.public_status()
             self.assertEqual(status["last_result"], "vpn_repaired")
