@@ -623,15 +623,23 @@ class TestBugDigestLinksProductionPath20260818(unittest.IsolatedAsyncioTestCase)
     исчезали, а тест на `_blocking_digest` оставался зелёным."""
 
     CHATS = [DigestChat("Рабочий чат", [
-        SelectedMessage(41, 7, NOW, "Первое"),
-        SelectedMessage(42, 8, NOW, "Второе"),
+        SelectedMessage(41, 7, NOW, "Первое", "Алиса"),
+        SelectedMessage(42, 8, NOW, "Второе", "Боб"),
     ], "https://t.me/c/1234567890")]
 
     async def test_links_survive_the_worker_boundary(self):
         answer = {"chats": [{
             "chat": "Рабочий чат",
-            "topics": [{"title": "Тема", "summary": "Суть", "refs": [2]}],
-            "links": [{"title": "Статья", "note": "зачем", "ref": 1}],
+            "topics": [{
+                "title": "Тема participant-2",
+                "summary": "participant-1 предложила решение",
+                "refs": [2],
+            }],
+            "links": [{
+                "title": "Статья participant-1",
+                "note": "participant-2 советует прочитать",
+                "ref": 1,
+            }],
         }]}
         worker = FakeAnsweringWorker(answer)
         with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
@@ -647,6 +655,35 @@ class TestBugDigestLinksProductionPath20260818(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(set(request), {"schema", "prompt", "model", "api_key"})
         for secret in ("1234567890", "41", "42"):
             self.assertNotIn(secret, request["prompt"])
+        for name in ("Алиса", "Боб"):
+            self.assertIn(name, digest)
+            self.assertNotIn(name, request["prompt"])
+        self.assertNotIn("participant-1", digest)
+        self.assertNotIn("participant-2", digest)
+
+    async def test_ambiguous_or_unknown_sender_stays_pseudonymous(self):
+        chats = [DigestChat("Рабочий чат", [
+            SelectedMessage(41, 7, NOW, "Первое", "Алиса"),
+            SelectedMessage(42, 7, NOW, "Второе", "Боб"),
+            SelectedMessage(43, 8, NOW, "Третье"),
+        ])]
+        answer = {"chats": [{
+            "chat": "Рабочий чат",
+            "topics": [{
+                "title": "Тема",
+                "summary": "participant-1 и participant-2 обсудили вопрос",
+                "refs": [],
+            }],
+            "links": [],
+        }]}
+        worker = FakeAnsweringWorker(answer)
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   return_value=worker):
+            digest = await create_digest(
+                chats, "anthropic/example", "sk-or-test-secret",
+                asyncio.Event())
+        self.assertIn("participant-1", digest)
+        self.assertIn("participant-2", digest)
 
 
 class TestBugPromptBudgetCountsNumber20260818(unittest.TestCase):

@@ -2,7 +2,7 @@ FROM docker.io/metacubex/mihomo:v1.19.29@sha256:e1d7dadaa9368a52d420d65007e0e0d8
 
 FROM python:3.12.13-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
 
-ARG APP_VERSION=0.2.9
+ARG APP_VERSION=0.2.10
 LABEL org.opencontainers.image.source="https://github.com/ivankozlov/sunny-umbrel-app-store" \
       org.opencontainers.image.version="${APP_VERSION}" \
       org.opencontainers.image.licenses="MIT AND GPL-3.0-only"

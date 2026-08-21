@@ -75,14 +75,21 @@ def message_row_bytes(message: SelectedMessage, sender_label: str,
 NUMBER_BUDGET_SENTINEL = 9_999_999
 
 
-def _rows(messages: List[SelectedMessage], chat_title: Optional[str] = None) -> List[bytes]:
+def _sender_labels(messages: List[SelectedMessage]) -> List[str]:
     labels: Dict[Optional[int], str] = {}
-    rows = []
+    result = []
     for message in messages:
         if message.sender_id not in labels:
             labels[message.sender_id] = f"participant-{len(labels) + 1}"
+        result.append(labels[message.sender_id])
+    return result
+
+
+def _rows(messages: List[SelectedMessage], chat_title: Optional[str] = None) -> List[bytes]:
+    rows = []
+    for message, sender_label in zip(messages, _sender_labels(messages)):
         rows.append(message_row_bytes(
-            message, labels[message.sender_id], chat_title,
+            message, sender_label, chat_title,
             NUMBER_BUDGET_SENTINEL,
         ))
     return rows
@@ -118,17 +125,46 @@ def digest_sources(chats: List[DigestChat]) -> Dict[int, str]:
     return sources
 
 
+def digest_sender_names(chats: List[DigestChat]) -> Dict[str, Dict[str, str]]:
+    """Название чата → однозначные participant-N → display name.
+
+    Алиасы строятся тем же обходом, что и промпт. Неизвестное имя, смена
+    display name внутри окна или одинаковые названия разных чатов оставляют
+    псевдоним как есть: неверная атрибуция хуже менее красивого текста.
+    """
+    by_title: Dict[str, Dict[str, str]] = {}
+    ambiguous_titles = set()
+    for chat in chats:
+        candidates: Dict[str, set[str]] = {}
+        for message, sender_label in zip(
+                chat.messages, _sender_labels(chat.messages)):
+            if message.sender_name:
+                candidates.setdefault(sender_label, set()).add(
+                    message.sender_name)
+        names = {
+            label: next(iter(values))
+            for label, values in candidates.items()
+            if len(values) == 1
+        }
+        previous = by_title.get(chat.title)
+        if previous is not None and previous != names:
+            ambiguous_titles.add(chat.title)
+        else:
+            by_title[chat.title] = names
+    for title in ambiguous_titles:
+        by_title.pop(title, None)
+    return by_title
+
+
 def render_digest_prompt(chats: List[DigestChat]) -> str:
     rows: List[bytes] = []
     number = 0
     for chat in chats:
-        labels: Dict[Optional[int], str] = {}
-        for message in chat.messages:
+        for message, sender_label in zip(
+                chat.messages, _sender_labels(chat.messages)):
             number += 1
-            if message.sender_id not in labels:
-                labels[message.sender_id] = f"participant-{len(labels) + 1}"
             rows.append(message_row_bytes(
-                message, labels[message.sender_id], chat.title, number,
+                message, sender_label, chat.title, number,
             ))
     raw = PROMPT_PREFIX.encode("utf-8") + b"\n".join(rows)
     if len(raw) > MAX_PROMPT_BYTES:
@@ -147,7 +183,8 @@ def truncate_first_to_budget(message: SelectedMessage) -> SelectedMessage:
         middle = (low + high) // 2
         candidate_text = message.text[:middle].rstrip() + suffix
         candidate = SelectedMessage(
-            message.message_id, message.sender_id, message.sent_at, candidate_text)
+            message.message_id, message.sender_id, message.sent_at,
+            candidate_text, message.sender_name)
         if prompt_size([candidate]) <= MAX_PROMPT_BYTES:
             best = candidate_text
             low = middle + 1
@@ -155,7 +192,9 @@ def truncate_first_to_budget(message: SelectedMessage) -> SelectedMessage:
             high = middle - 1
     if not best:
         raise ValueError("one Telegram message cannot fit the prompt budget")
-    return SelectedMessage(message.message_id, message.sender_id, message.sent_at, best)
+    return SelectedMessage(
+        message.message_id, message.sender_id, message.sent_at, best,
+        message.sender_name)
 
 
 # Хвост, которым выпуск честно сообщает, что его срезали. Обрезка бывает в

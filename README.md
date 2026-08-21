@@ -1,7 +1,8 @@
 # Sunny Personal Chats for Umbrel
 
 Umbrel package for a narrowly scoped Telegram user-session client. It was released
-through a Community App Store, but public distribution was withdrawn on 2026-08-14.
+through a Community App Store; public distribution was withdrawn on 2026-08-14 and
+restored on 2026-08-17.
 It watches 1–16 immutable groups/supergroups, clears read state about once a
 minute, forwards bounded native-mention events to Sunny, and creates one combined
 daily digest through OpenRouter.
@@ -15,20 +16,19 @@ The app/package/image ID remains `sunny-personal-digest` for release continuity;
 the v0.2 product name is **Sunny Personal Chats**. v0.2 is a breaking credential
 generation and does not migrate the unpublished v0.1 pilot state.
 
-The last recorded state of the physical Umbrel (2026-08-14) is `0.2.5`: seven exact
+The last recorded state of the physical Umbrel (2026-08-20) is `0.2.9`: eight exact
 peers, the receiver generation, durable baseline, session, and active monitoring state
-survived the update and a subsequent reboot. Whether the device has been updated since
-the distribution reopened is not recorded here. The locked-state VPN replacement authorized Telegram through the
-first tested route; pending uploads and peer errors were both zero after reboot. The
-first real 03:00–04:45 daily after that replacement has not yet been observed. Wire
-`COLLECTOR_VERSION` remains `0.2.1`.
+survived the updates and the first chat-set extension. The first structured production
+daily was accepted on 2026-08-20 in two parts with no duplicate. The first nightly issue
+after the extension, forum-topic read acknowledgements for the added chat, and a real
+native-mention event still need observation. Wire `COLLECTOR_VERSION` remains `0.2.1`.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
-restored on 2026-08-17; `0.2.6`, `0.2.7` and `0.2.8` have public multi-arch images.
-**Update** and uninstall/reinstall therefore have a public source again. Docker image
-pruning is still unsafe while the device may be running `0.2.5` from its local cache:
-that one image is absent from both GHCR and the offline snapshot. The real recreate/pull
-path on the device has never been exercised. The `umbrel/` subtree of private source
+restored on 2026-08-17; `0.2.6` through `0.2.9` have public multi-arch images.
+**Update** and uninstall/reinstall therefore have a public source again. The device now
+runs public `0.2.9`, but Docker image pruning remains out of bounds: the real recreate/pull
+path has never been exercised, and a future distribution closure would remove the public
+source again. The `umbrel/` subtree of private source
 repository `ivankozlov/sunny/main` deliberately remains a disabled, placeholder-pinned
 Phase-A candidate; the enabling commit lives only in the Store repository.
 
@@ -165,9 +165,9 @@ Telegram, acknowledge that action in the UI, and provision a fresh credential ep
    allowlist as far as practical.
 4. Obtain the DO Ed25519 SSH host-key line through an independent trusted channel.
    Never bootstrap trust with `ssh-keyscan` on the Umbrel.
-5. If public distribution is explicitly reopened, complete the repository/image
-   release gate below with a new immutable version. There is currently no anonymous
-   Community App Store install or GHCR pull path.
+5. For every explicitly approved public release, complete the repository/image release
+   gate below with a new immutable version. Published versions currently have an
+   anonymous Community App Store and GHCR pull path.
 6. Install **Sunny Personal Chats** only from that verified source. The additional
    username is `sunny`; Umbrel displays the deterministic app password.
 7. Enter Telegram/VPN/OpenRouter/SSH settings and consent. VPN-source validation,
@@ -253,11 +253,11 @@ activation screens.
 
 Anonymous umbrelOS install/update requires both a public Store repository and a
 public `ghcr.io/ivankozlov/sunny-personal-digest` image. Both surfaces were closed on
-2026-08-14 and reopened on 2026-08-17 by an explicit owner decision; `v0.2.6`,
-`v0.2.7` and `v0.2.8` were published and enabled from there. Reopening stays an
+2026-08-14 and reopened on 2026-08-17 by an explicit owner decision; `v0.2.6`
+through `v0.2.9` were published and enabled from there. Reopening stays an
 explicit, per-release decision — never republish silently.
 
-Every release follows this exact sequence, as `0.2.5` did and `0.2.6`–`0.2.8` did
+Every release follows this exact sequence, as `0.2.5` did and `0.2.6`–`0.2.9` did
 after it: disabled source first, the protected `Publish image` workflow with
 `bootstrap_empty_package=false`, independent public OCI verification for
 `linux/amd64` and `linux/arm64`, and only then the exact digest pin plus
@@ -302,16 +302,18 @@ receiver receipt before read disappearance, delivery to the Sunny topic **Чат
 duplicate after retry, independent monitor/digest health, and then the first combined
 daily digest.
 
-Production has completed setup, receiver rotation, activation, and the mention path
-with seven peers. The first daily, while `0.2.3` was installed on
+Production has completed setup, receiver rotation, activation, and one chat-set
+extension, and now has eight peers. The first daily, while `0.2.3` was installed on
 2026-08-14, exposed monitor-timeout starvation before any digest upload; `0.2.4`
 shipped that isolation fix and the matching watchdog suppression. The next live run
 exposed a separate failure before peer access:
 the persisted route reset Telegram initialization. `0.2.5` was then installed; the
 replacement subscription passed authorization on the first tested route, preserved
-lock/session/baseline/checkpoints and active monitoring, and survived a reboot. The
-remaining live gate is the next real 03:00–04:45 daily. There is deliberately no
-manual same-day backfill.
+lock/session/baseline/checkpoints and active monitoring, and survived a reboot. The first
+structured daily was accepted on 2026-08-20 in two parts without duplicates. After the
+extension, observe the first nightly issue with the eighth chat and its forum-topic read
+acknowledgements; a real native-mention event is also still untested. There is deliberately
+no manual same-day backfill.
 
 ## Incident response
 

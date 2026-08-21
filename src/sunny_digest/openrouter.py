@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import http.client
 import socket
@@ -13,7 +14,12 @@ from typing import Any, Dict, List, Optional
 from .contracts import validate_digest_text
 from .openrouter_tunnel import TUNNEL_HOST, TUNNEL_PORT
 from .models import DigestChat
-from .prompting import digest_sources, fit_by_lines, render_digest_prompt
+from .prompting import (
+    digest_sender_names,
+    digest_sources,
+    fit_by_lines,
+    render_digest_prompt,
+)
 from .storage import canonical_json_bytes
 from .version import MAX_DIGEST_CHARS
 
@@ -40,6 +46,7 @@ MAX_WORKER_REQUEST_BYTES = 128 * 1024
 # поэтому message_id и peer_id не попадают даже в подпроцесс.
 WORKER_SCHEMA = "sunny.personal-chats.openrouter-worker.v3"
 WORKER_TERMINATE_GRACE_S = 2.0
+_SENDER_ALIAS = re.compile(r"(?<![\w-])participant-[1-9][0-9]*(?![\w-])")
 
 
 class OpenRouterError(RuntimeError):
@@ -113,7 +120,18 @@ def _link(sources: Dict[int, str], ref: Any) -> Optional[str]:
     return sources.get(ref)
 
 
-def render_digest(parsed: Any, sources: Dict[int, str]) -> str:
+def _restore_sender_names(value: Any, names: Dict[str, str]) -> Any:
+    if not isinstance(value, str) or not names:
+        return value
+    return _SENDER_ALIAS.sub(
+        lambda match: names.get(match.group(0), match.group(0)), value)
+
+
+def render_digest(
+    parsed: Any,
+    sources: Dict[int, str],
+    sender_names: Optional[Dict[str, Dict[str, str]]] = None,
+) -> str:
     """Собрать текст выпуска из структурированного ответа.
 
     Ссылки подставляет КОД по порядковым номерам: модель их не пишет и
@@ -132,6 +150,7 @@ def render_digest(parsed: Any, sources: Dict[int, str]) -> str:
         if not isinstance(chat, dict) or set(chat) - {"chat", "topics", "links"}:
             raise OpenRouterError("OpenRouter digest chat is invalid")
         title = _clean(chat.get("chat", ""), 160)
+        names = (sender_names or {}).get(title, {})
         topics = chat.get("topics") or []
         links = chat.get("links") or []
         if not isinstance(topics, list) or not isinstance(links, list):
@@ -141,8 +160,11 @@ def render_digest(parsed: Any, sources: Dict[int, str]) -> str:
         for topic in topics:
             if not isinstance(topic, dict):
                 raise OpenRouterError("OpenRouter digest topic is invalid")
-            lines.append(f"▸ {_clean(topic.get('title', ''), 200)}")
-            summary = _clean(topic.get("summary", ""), 4000)
+            topic_title = _clean(
+                _restore_sender_names(topic.get("title", ""), names), 200)
+            lines.append(f"▸ {topic_title}")
+            summary = _clean(
+                _restore_sender_names(topic.get("summary", ""), names), 4000)
             if summary:
                 lines.append(summary)
             refs = topic.get("refs") or []
@@ -157,8 +179,10 @@ def render_digest(parsed: Any, sources: Dict[int, str]) -> str:
         for row in links:
             if not isinstance(row, dict):
                 raise OpenRouterError("OpenRouter digest link is invalid")
-            note = _clean(row.get("note", ""), 400)
-            entry = _clean(row.get("title", ""), 200)
+            note = _clean(
+                _restore_sender_names(row.get("note", ""), names), 400)
+            entry = _clean(
+                _restore_sender_names(row.get("title", ""), names), 200)
             link_lines.append(f"• {entry}" + (f" — {note}" if note else ""))
             ref = row.get("ref")
             link = _link(sources, ref)
@@ -262,7 +286,8 @@ def blocking_fetch_answer(prompt: str, model: str, api_key: str) -> Any:
 
 
 def _render_and_validate(parsed: Any, chats: List[DigestChat]) -> str:
-    digest = render_digest(parsed, digest_sources(chats))
+    digest = render_digest(
+        parsed, digest_sources(chats), digest_sender_names(chats))
     try:
         validate_digest_text(digest, allow_empty=False)
     except ValueError as exc:

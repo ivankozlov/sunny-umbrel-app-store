@@ -91,6 +91,9 @@ class SelectedMessage:
     sender_id: Optional[int]
     sent_at: datetime
     text: str
+    # Локальное display name из уже полученного Telegram message. В промпт
+    # не входит и нужно только родителю для замены participant-N после LLM.
+    sender_name: Optional[str] = None
 
 
 @dataclass(frozen=True)

@@ -52,6 +52,7 @@ PEER_OPERATION_CONCURRENCY = 4
 # растягивать peer-unit: непрочитанное в остальных закроется на
 # следующих тиках, а дедлайн важнее полноты одного прохода.
 MAX_FORUM_TOPICS = 100
+UNKNOWN_SENDER = "Неизвестный отправитель"
 
 
 async def _gather_peer_tasks(tasks):
@@ -201,7 +202,8 @@ def _truncate_first_to_budget(message: SelectedMessage,
         middle = (low + high) // 2
         candidate_text = message.text[:middle].rstrip() + suffix
         candidate = SelectedMessage(
-            message.message_id, message.sender_id, message.sent_at, candidate_text)
+            message.message_id, message.sender_id, message.sent_at,
+            candidate_text, message.sender_name)
         if prompt_size([candidate], chat_title) <= max_prompt_bytes:
             best = candidate_text
             low = middle + 1
@@ -209,7 +211,9 @@ def _truncate_first_to_budget(message: SelectedMessage,
             high = middle - 1
     if not best:
         raise ValueError("one Telegram message cannot fit the prompt budget")
-    return SelectedMessage(message.message_id, message.sender_id, message.sent_at, best)
+    return SelectedMessage(
+        message.message_id, message.sender_id, message.sent_at, best,
+        message.sender_name)
 
 
 def _clean_text(value: Any, *, max_utf16_units: Optional[int] = None) -> str:
@@ -250,7 +254,7 @@ def _sender_display(message: Any) -> str:
             display = f"@{username}" if username else ""
         if display:
             return _clean_text(display, max_utf16_units=160)
-    return "Неизвестный отправитель"
+    return UNKNOWN_SENDER
 
 
 class TelethonGateway:
@@ -838,11 +842,15 @@ class TelethonGateway:
                     # download method is ever called.
                     through = max(through, message_id)
                     continue
+                sender_name = _sender_display(message)
                 candidate = SelectedMessage(
                     message_id=message_id,
                     sender_id=int(message.sender_id) if message.sender_id is not None else None,
                     sent_at=sent_at,
                     text=text,
+                    sender_name=(
+                        sender_name if sender_name != UNKNOWN_SENDER else None
+                    ),
                 )
                 if prompt_size(selected + [candidate], chat_title) > max_prompt_bytes:
                     if selected:

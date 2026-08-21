@@ -402,6 +402,22 @@ class TelegramFetchTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertNotIn("offset_date", client.iter_calls[0][1])
 
+    async def test_fetch_keeps_sanitized_sender_name_for_local_rendering(self):
+        sender = SimpleNamespace(
+            first_name=" Алиса\n", last_name="Иванова\u202e",
+            title=None, username="alice",
+        )
+        client = FakeClient([
+            message(1, sender=sender),
+            message(2, sender=None),
+        ], upper_id=2)
+        result = await GatewayUnderTest(client).fetch(
+            "session", PeerSpec("channel", 100123, 998877), CHAT_ID,
+            0, CUTOFF,
+        )
+        self.assertEqual(result.messages[0].sender_name, "Алиса Иванова")
+        self.assertIsNone(result.messages[1].sender_name)
+
     async def test_messages_after_cutoff_are_not_viewed(self):
         client = FakeClient([message(i) for i in range(1, 8)], upper_id=5)
         gateway = GatewayUnderTest(client)
@@ -446,13 +462,18 @@ class TelegramFetchTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(prompt_size(second.messages), MAX_PROMPT_BYTES)
 
     async def test_one_oversized_row_is_deterministically_truncated(self):
-        client = FakeClient([message(1, text="я" * 100_000)], upper_id=1)
+        sender = SimpleNamespace(
+            first_name="Алиса", last_name=None, title=None, username="alice")
+        client = FakeClient([
+            message(1, text="я" * 100_000, sender=sender)
+        ], upper_id=1)
         gateway = GatewayUnderTest(client)
         result = await gateway.fetch(
             "session", PeerSpec("channel", 100123, 998877), CHAT_ID, 0, CUTOFF)
         self.assertEqual(result.through_message_id, 1)
         self.assertEqual(len(result.messages), 1)
         self.assertTrue(result.messages[0].text.endswith("[обрезано]"))
+        self.assertEqual(result.messages[0].sender_name, "Алиса")
         self.assertLessEqual(prompt_size(result.messages), MAX_PROMPT_BYTES)
 
     async def test_per_chat_prompt_budget_stops_before_omitted_text(self):

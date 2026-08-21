@@ -1,10 +1,11 @@
 # Sunny Personal Chats — contributor rules
 
-This directory is the source snapshot used for the private
-`ivankozlov/sunny-umbrel-app-store` repository. Public distribution was withdrawn
-on 2026-08-14 and must not be reopened without explicit approval. The directory
-must contain no production credentials, Telegram sessions, chat content, receiver
-keys, or rendered runtime configuration.
+This directory is the source snapshot kept in the private `ivankozlov/sunny`
+repository and copied to the public `ivankozlov/sunny-umbrel-app-store` only for
+explicitly approved releases. Public distribution was withdrawn on 2026-08-14 and
+reopened on 2026-08-17; every further release still requires separate approval.
+The directory must contain no production credentials, Telegram sessions, chat
+content, receiver keys, or rendered runtime configuration.
 
 ## Security invariants
 
@@ -218,9 +219,9 @@ In the `umbrel/` subtree of the private source repository `ivankozlov/sunny/main
 `scripts/check_package.py --release` must remain red: the disabled manifest and release
 placeholder are the intentional Phase-A state of the source tree. This does not
 describe the Store `main`, where the enabling commits live — it carries enabled
-`v0.2.8`, with the historical enabled `v0.2.5` still in its history. Distribution was
+`v0.2.9`, with the historical enabled `v0.2.5` still in its history. Distribution was
 withdrawn on 2026-08-14 and reopened on 2026-08-17; the public GHCR package now holds
-`v0.2.6`, `v0.2.7` and `v0.2.8`, while `v0.2.5` stays deleted. Every release requires
+`v0.2.6` through `v0.2.9`, while `v0.2.5` stays deleted. Every release requires
 separate approval, a new semver/tag, a real independently verified multi-architecture
 digest, and a separate enabling commit; never overwrite the withdrawn `v0.2.5` tag. The publish job stays `main`-only behind
 the protected `ghcr-release` Environment;
