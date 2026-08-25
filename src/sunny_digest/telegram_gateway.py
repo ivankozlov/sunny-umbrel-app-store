@@ -7,7 +7,7 @@ import binascii
 import hashlib
 import re
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
@@ -22,7 +22,6 @@ from .models import (
 from .prompting import prompt_size
 from .version import (
     APP_VERSION,
-    DEFAULT_LOOKBACK_HOURS,
     MAX_MENTION_EVENTS,
     MAX_MENTION_SNIPPET_UTF16,
     MAX_PROMPT_BYTES,
@@ -760,24 +759,31 @@ class TelethonGateway:
         finally:
             await _disconnect_client(client)
 
-    async def bootstrap_cursor(self, session_text: str, peer: PeerSpec,
-                               now: datetime) -> int:
+    async def boundary_cursor(self, session_text: str, peer: PeerSpec,
+                              not_before: datetime) -> int:
+        """Последнее сообщение чата СТРОГО до нижней границы выпуска.
+
+        Граница приходит снаружи и считается от времени приёмника: сам
+        по себе этот вызов ничего не знает ни про ретроспективу, ни про
+        то, первый это выпуск или сотый.
+        """
         _, utils, _, _, _, _, _ = self._modules()
         client = self._client(session_text)
         await client.connect()
         try:
-            cutoff = now.astimezone(timezone.utc) - timedelta(hours=DEFAULT_LOOKBACK_HOURS)
-            messages = await client.get_messages(self._input_peer(peer), limit=1, offset_date=cutoff)
+            boundary = not_before.astimezone(timezone.utc)
+            messages = await client.get_messages(
+                self._input_peer(peer), limit=1, offset_date=boundary)
             if not messages:
                 return 0
             actual_chat_id = int(utils.get_peer_id(messages[0].peer_id))
             if actual_chat_id != peer.telegram_chat_id():
-                raise RuntimeError("Telegram bootstrap cursor came from an unexpected peer")
+                raise RuntimeError("Telegram boundary cursor came from an unexpected peer")
             sent_at = messages[0].date
             if sent_at.tzinfo is None:
                 sent_at = sent_at.replace(tzinfo=timezone.utc)
-            if sent_at.astimezone(timezone.utc) >= cutoff:
-                raise RuntimeError("Telegram bootstrap cursor is not before the lookback boundary")
+            if sent_at.astimezone(timezone.utc) >= boundary:
+                raise RuntimeError("Telegram boundary cursor is not before the lookback boundary")
             return max(0, int(messages[0].id))
         finally:
             await client.disconnect()
@@ -855,7 +861,11 @@ class TelethonGateway:
                 if prompt_size(selected + [candidate], chat_title) > max_prompt_bytes:
                     if selected:
                         # Do not advance across text omitted from the bounded
-                        # prompt; a later due run resumes from this message.
+                        # prompt; a later due run resumes from this message —
+                        # for as long as the tail stays younger than that run's
+                        # lower boundary. A tail that outlives the window is
+                        # skipped instead, and the issue says so out loud
+                        # (`digest_skip_note`).
                         break
                     candidate = _truncate_first_to_budget(
                         candidate, max_prompt_bytes, chat_title)

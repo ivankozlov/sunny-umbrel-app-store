@@ -366,15 +366,22 @@ class TestBugTelegramMessageLinks20260811(unittest.IsolatedAsyncioTestCase):
 
 
 class TelegramFetchTests(unittest.IsolatedAsyncioTestCase):
-    async def test_bootstrap_cursor_is_exact_peer_and_strictly_before_boundary(self):
+    async def test_boundary_cursor_is_exact_peer_and_strictly_before_boundary(self):
         client = FakeClient([], upper_id=5)
         gateway = GatewayUnderTest(client)
-        now = CUTOFF.replace(second=1) + timedelta(hours=72)
+        boundary = CUTOFF.replace(second=1)
         self.assertEqual(
-            await gateway.bootstrap_cursor(
-                "session", PeerSpec("channel", 100123, 998877), now),
+            await gateway.boundary_cursor(
+                "session", PeerSpec("channel", 100123, 998877), boundary),
             5,
         )
+        # Граница приходит снаружи и уходит в запрос как есть: вычитать
+        # ретроспективу здесь больше нечего — её считает выпуск.
+        self.assertEqual(
+            client.get_calls[0][1], {"limit": 1, "offset_date": boundary})
+        with self.assertRaisesRegex(RuntimeError, "not before the lookback boundary"):
+            await gateway.boundary_cursor(
+                "session", PeerSpec("channel", 100123, 998877), CUTOFF)
         client.upper_id = 6
         original = client.get_messages
 
@@ -385,8 +392,8 @@ class TelegramFetchTests(unittest.IsolatedAsyncioTestCase):
 
         client.get_messages = wrong_peer
         with self.assertRaisesRegex(RuntimeError, "unexpected peer"):
-            await gateway.bootstrap_cursor(
-                "session", PeerSpec("channel", 100123, 998877), now)
+            await gateway.boundary_cursor(
+                "session", PeerSpec("channel", 100123, 998877), boundary)
 
     async def test_cursor_zero_uses_explicit_cutoff_id_window(self):
         client = FakeClient([message(i) for i in range(1, 8)], upper_id=5)

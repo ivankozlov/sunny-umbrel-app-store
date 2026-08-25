@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Chats
-version: "0.2.10"
+version: "0.2.11"
 tagline: Mentions, read receipts, and one digest for selected chats
 description: >-
   Resolves message links for only the explicitly selected Telegram groups,
@@ -18,11 +18,12 @@ description: >-
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  Daily digests now show Telegram display names instead of participant-1 style
-  aliases when the sender is known unambiguously. Names are restored locally
-  only after the OpenRouter response, so the model still receives pseudonyms
-  and no additional Telegram identity data. Unknown or ambiguous senders stay
-  pseudonymous. The collector wire protocol remains 0.2.1.
+  Fixes a chat added by extension being read from the very beginning of its
+  history: for five days the daily digest retold years-old conversations while
+  that chat's fresh messages never appeared. Every issue now derives each
+  chat's lower time boundary from the authenticated receiver clock — 72 hours,
+  stretched over days missed between issues — and pulls the chat's cursor up to
+  it without ever moving it back. The collector wire protocol remains 0.2.1.
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store
 dependencies: []

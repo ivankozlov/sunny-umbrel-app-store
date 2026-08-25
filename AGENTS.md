@@ -122,6 +122,10 @@ content, receiver keys, or rendered runtime configuration.
   display name, link and a sanitized snippet of at most 300 UTF-16 units. The
   exact pending event is retained until receiver acknowledgement; no media is
   downloaded and stable sender IDs never leave Umbrel.
+- Daily sender display names stay in the parent process only: OpenRouter and the
+  killable worker receive per-chat `participant-N` aliases. The parent restores a
+  name only for an unambiguous known alias in that chat; unknown or ambiguous aliases
+  remain pseudonymous in the delivered digest.
 - Accepted monitor and digest sequence/hash/cursor state is checkpointed locally
   before pending bytes are deleted. Receiver rollback or chain jumps must fail
   before Telegram access. The two streams remain independent so a failed daily
@@ -147,9 +151,19 @@ content, receiver keys, or rendered runtime configuration.
   explicit first activation snapshots the
   exact current heads, durably uploads a content-free baseline, and only after its
   receiver receipt clears existing unread state. Historical mentions are never
-  exported. The first authenticated daily due gate independently derives the
-  72-hour lower boundary per chat from receiver `server_time`, with an exact
-  per-row time filter before any text reaches OpenRouter.
+  exported. EVERY authenticated daily due gate independently derives the lower
+  boundary per chat from receiver `server_time` — 72 hours, stretched over the days
+  missed since the last accepted issue — with an exact per-row time filter before any
+  text reaches OpenRouter. The per-chat cursor is pulled up to that boundary and never
+  moves back. While only the first issue (`sequence == 1`) did that, a chat added by
+  extension arrived with a zero cursor mid-chain and was read from the beginning of its
+  history: on 21–25.08.2026 five consecutive issues retold 2023 conversations, advancing
+  by one prompt budget a day, while that chat's fresh messages never reached the issue.
+  Pulling the cursor up has a flip side: a LIVE chat can lose a tail that missed the prompt
+  budget and then outlived the window, and the wire shows nothing (the range is declared from
+  the receiver's cursor). Such a skip must be announced in the issue itself — a
+  `[пропущено старше окна выпуска]` header placed FIRST, because trimming always eats the
+  tail. A chat still at cursor zero gets no warning: what it skips is its own prior history.
 - After activation, the watcher scans every message ID after its own frozen
   cursor and detects mentions only from Telegram's native `mentioned` flag. A
   mention-bearing range is marked read only after its event batch has a durable
@@ -219,9 +233,9 @@ In the `umbrel/` subtree of the private source repository `ivankozlov/sunny/main
 `scripts/check_package.py --release` must remain red: the disabled manifest and release
 placeholder are the intentional Phase-A state of the source tree. This does not
 describe the Store `main`, where the enabling commits live — it carries enabled
-`v0.2.9`, with the historical enabled `v0.2.5` still in its history. Distribution was
+`v0.2.10`, with the historical enabled `v0.2.5` still in its history. Distribution was
 withdrawn on 2026-08-14 and reopened on 2026-08-17; the public GHCR package now holds
-`v0.2.6` through `v0.2.9`, while `v0.2.5` stays deleted. Every release requires
+`v0.2.6` through `v0.2.10`, while `v0.2.5` stays deleted. Every release requires
 separate approval, a new semver/tag, a real independently verified multi-architecture
 digest, and a separate enabling commit; never overwrite the withdrawn `v0.2.5` tag. The publish job stays `main`-only behind
 the protected `ghcr-release` Environment;

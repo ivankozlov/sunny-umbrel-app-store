@@ -39,7 +39,7 @@ from sunny_digest.settings import (
     load_credentials,
 )
 from sunny_digest.contracts import supergroup_link_prefix
-from sunny_digest.prompting import DIGEST_TRUNCATION_NOTE
+from sunny_digest.prompting import DIGEST_SKIP_NOTE_HEAD, DIGEST_TRUNCATION_NOTE
 from sunny_digest.storage import (
     Paths,
     atomic_write_bytes,
@@ -300,8 +300,8 @@ class FakeGateway:
         self.snapshot_calls = 0
         self.aggregate_scan_calls = 0
         self.read_batches = []
-        self.bootstrap_calls = []
-        self.bootstrap = {chat_id: 0 for chat_id in CHAT_IDS}
+        self.boundary_calls = []
+        self.boundary = {chat_id: 0 for chat_id in CHAT_IDS}
         self.fetch_calls = []
         self.fetches = {
             chat_id: FetchResult(1, [SelectedMessage(1, 7, NOW, f"text-{chat_id}")])
@@ -364,10 +364,10 @@ class FakeGateway:
         succeeded = [row[0] for row in targets if row[0] not in self.read_failures]
         return succeeded, list(self.read_failures)
 
-    async def bootstrap_cursor(self, _session, peer, cutoff):
+    async def boundary_cursor(self, _session, peer, not_before):
         chat_id = peer.telegram_chat_id()
-        self.bootstrap_calls.append((chat_id, cutoff))
-        return self.bootstrap[chat_id]
+        self.boundary_calls.append((chat_id, not_before))
+        return self.boundary[chat_id]
 
     async def fetch(self, _session, peer, chat_id, start, cutoff,
                     not_before_at=None, max_prompt_bytes=None, chat_title=None):
@@ -1722,7 +1722,7 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             uuid.UUID(result["selection_id"])
             self.assertEqual(gateway.snapshot_calls, 0)
             self.assertEqual(gateway.aggregate_scan_calls, 0)
-            self.assertEqual(gateway.bootstrap_calls, [])
+            self.assertEqual(gateway.boundary_calls, [])
             self.assertEqual(gateway.fetch_calls, [])
             persisted = paths.dialog_candidates.read_bytes() + paths.settings.read_bytes()
             self.assertNotIn(b"https://t.me/", persisted)
@@ -2101,7 +2101,7 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             paths = make_paths(Path(temporary))
             seed_locked(paths, watch_phase="active")
             gateway = FakeGateway(paths)
-            gateway.bootstrap = {CHAT_IDS[0]: 100, CHAT_IDS[1]: 200}
+            gateway.boundary = {CHAT_IDS[0]: 100, CHAT_IDS[1]: 200}
             gateway.fetches = {
                 CHAT_IDS[0]: FetchResult(101, [SelectedMessage(101, 7, NOW, "A")]),
                 CHAT_IDS[1]: FetchResult(202, [SelectedMessage(201, 8, NOW, "B")]),
@@ -2318,7 +2318,7 @@ class TestBugMonitorDigestStarvation20260814(
             self.assertEqual(result["last_result"], "watched_not_due")
             self.assertEqual(result["last_error_type"], "TimeoutError")
             self.assertEqual(digest_calls, [])
-            self.assertEqual(gateway.bootstrap_calls, [])
+            self.assertEqual(gateway.boundary_calls, [])
             self.assertEqual(gateway.fetch_calls, [])
             self.assertEqual(transport.digest_uploads, [])
 
@@ -2350,7 +2350,7 @@ class TestBugMonitorDigestStarvation20260814(
             self.assertEqual(result["last_error_type"], "RuntimeError")
             self.assertEqual(result["failed_chat_count"], len(CHAT_IDS))
             self.assertEqual(digest_calls, [])
-            self.assertEqual(gateway.bootstrap_calls, [])
+            self.assertEqual(gateway.boundary_calls, [])
             self.assertEqual(gateway.fetch_calls, [])
             self.assertEqual(transport.digest_uploads, [])
 
@@ -3318,3 +3318,161 @@ class TestChatSetExtension20260820(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 len([row for row in transport.monitor_uploads
                      if row["kind"] == "extension_baseline"]), 1)
+
+
+def seed_digest_ack(paths: Paths, *, digest_date: str, cursors,
+                    sequence: int = 1, content_sha256: str = "c" * 64):
+    atomic_write_json(paths.acknowledged, {
+        "schema": collector_module.DIGEST_ACKNOWLEDGED_SCHEMA,
+        "source_id": SOURCE_ID,
+        "sequence": sequence,
+        "content_sha256": content_sha256,
+        "digest_date": digest_date,
+        "cursors": [
+            {"chat_id": chat_id, "through_message_id": cursors[chat_id]}
+            for chat_id in CHAT_IDS
+        ],
+    })
+
+
+class TestBugDigestExtendedChat20260825(unittest.IsolatedAsyncioTestCase):
+    """Выпуск пересказывал историю чата с самого начала.
+
+    Инцидент 21–25.08.2026 («Петровский остров»): чат, добавленный
+    расширением, приходит с нулевым курсором посреди живой цепочки. Нижнюю
+    временную границу выводил только ПЕРВЫЙ выпуск (`sequence == 1`), поэтому
+    такой чат вычитывался от начала истории: пять суточных выпусков подряд
+    пересказывали переписку 2023 года, продвигая курсор на бюджет промпта в
+    сутки (0 → 454 при вершине чата 8398). Свежие сообщения этого чата в
+    выпуск при этом не попадали вовсе.
+
+    Тестов на ВТОРОЙ и последующие выпуски в наборе не было ни одного — все
+    проверяли `sequence == 1`, где баг не воспроизводится.
+    """
+
+    def _second_issue(self, digest_cursors):
+        return gate(
+            digest_due=True, digest_sequence=2, digest_previous="c" * 64,
+            digest_cursors=digest_cursors,
+        )
+
+    async def test_zero_cursor_mid_chain_starts_at_the_window_not_at_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            cursors = {CHAT_IDS[0]: 900, CHAT_IDS[1]: 0}
+            seed_digest_ack(paths, digest_date="2026-08-03", cursors=cursors)
+            gateway = FakeGateway(paths)
+            gateway.boundary = {CHAT_IDS[0]: 880, CHAT_IDS[1]: 8300}
+            gateway.fetches = {
+                CHAT_IDS[0]: FetchResult(912, [SelectedMessage(905, 7, NOW, "A")]),
+                CHAT_IDS[1]: FetchResult(8320, [SelectedMessage(8310, 8, NOW, "B")]),
+            }
+            transport = FakeTransport(paths, self._second_issue(cursors))
+
+            result = await collector_for(paths, gateway, transport).run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            # Чтение начинается с границы окна, а не с нуля.
+            self.assertEqual(
+                [call["start"] for call in gateway.fetch_calls], [900, 8300])
+            self.assertTrue(all(call["not_before"] == NOW - timedelta(hours=72)
+                                for call in gateway.fetch_calls))
+            self.assertEqual(
+                [call[1] for call in gateway.boundary_calls],
+                [NOW - timedelta(hours=72)] * len(CHAT_IDS))
+            # А в цепочку по-прежнему уезжает курсор, объявленный приёмником:
+            # прыжок вперёд не имеет права выглядеть как разрыв цепочки.
+            payload = transport.digest_uploads[0]
+            self.assertEqual(
+                [row["from_message_id_exclusive"] for row in payload["chat_ranges"]],
+                [900, 0])
+            self.assertEqual(
+                [row["through_message_id"] for row in payload["chat_ranges"]],
+                [912, 8320])
+
+    async def test_missed_days_stretch_the_window_instead_of_dropping_them(self):
+        """Приложение простаивало 13–16.08.2026 на протухшем адресе узла.
+
+        Жёсткая ретроспектива тихо срезала бы переписку тех суток, поэтому
+        окно растягивается ровно на пропущенные дни.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            cursors = {CHAT_IDS[0]: 900, CHAT_IDS[1]: 700}
+            seed_digest_ack(paths, digest_date="2026-07-31", cursors=cursors)
+            gateway = FakeGateway(paths)
+            gateway.boundary = {CHAT_IDS[0]: 0, CHAT_IDS[1]: 0}
+            gateway.fetches = {
+                CHAT_IDS[0]: FetchResult(912, [SelectedMessage(905, 7, NOW, "A")]),
+                CHAT_IDS[1]: FetchResult(712, [SelectedMessage(705, 8, NOW, "B")]),
+            }
+            transport = FakeTransport(paths, self._second_issue(cursors))
+
+            result = await collector_for(paths, gateway, transport).run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            expected = NOW - timedelta(hours=72) - timedelta(days=3)
+            self.assertTrue(all(call["not_before"] == expected
+                                for call in gateway.fetch_calls))
+            self.assertEqual(
+                [call[1] for call in gateway.boundary_calls],
+                [expected] * len(CHAT_IDS))
+
+    async def test_skipped_tail_of_a_live_chat_is_announced_in_the_issue(self):
+        """Подтяжка курсора к границе может съесть непрочитанный хвост.
+
+        `fetch` обрывается на бюджете промпта и оставляет остаток суток
+        следующему выпуску. Если тот остаток переживёт окно, курсор через
+        него перепрыгнет: в wire это не видно вовсе (диапазон объявляется от
+        курсора приёмника), в статусе тоже. Поэтому выпуск обязан сказать о
+        пропаже вслух — тихий скип и есть худший из отказов.
+
+        У чата, впервые вошедшего в набор (`start == 0`), пропущенное — это
+        его прежняя история, и предупреждать не о чем.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            cursors = {CHAT_IDS[0]: 900, CHAT_IDS[1]: 0}
+            seed_digest_ack(paths, digest_date="2026-08-03", cursors=cursors)
+            gateway = FakeGateway(paths)
+            # Первый чат живой и отстал, второй только вошёл в набор.
+            gateway.boundary = {CHAT_IDS[0]: 1500, CHAT_IDS[1]: 8300}
+            gateway.fetches = {
+                CHAT_IDS[0]: FetchResult(1600, [SelectedMessage(1550, 7, NOW, "A")]),
+                CHAT_IDS[1]: FetchResult(8320, [SelectedMessage(8310, 8, NOW, "B")]),
+            }
+            transport = FakeTransport(paths, self._second_issue(cursors))
+
+            result = await collector_for(paths, gateway, transport).run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            self.assertEqual(
+                [call["start"] for call in gateway.fetch_calls], [1500, 8300])
+            text = transport.digest_uploads[0]["digest"]
+            self.assertTrue(text.startswith(DIGEST_SKIP_NOTE_HEAD), text[:120])
+            self.assertIn(f"{TITLES[0]}: сообщения 901–1500", text)
+            # Про чат, вошедший в набор этим выпуском, предупреждения нет.
+            self.assertNotIn(TITLES[1], text.split("\n\n")[0])
+            self.assertIn("Общий дайджест", text)
+
+    async def test_first_issue_of_a_chat_announces_nothing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            cursors = {CHAT_IDS[0]: 900, CHAT_IDS[1]: 0}
+            seed_digest_ack(paths, digest_date="2026-08-03", cursors=cursors)
+            gateway = FakeGateway(paths)
+            gateway.boundary = {CHAT_IDS[0]: 880, CHAT_IDS[1]: 8300}
+            gateway.fetches = {
+                CHAT_IDS[0]: FetchResult(912, [SelectedMessage(905, 7, NOW, "A")]),
+                CHAT_IDS[1]: FetchResult(8320, [SelectedMessage(8310, 8, NOW, "B")]),
+            }
+            transport = FakeTransport(paths, self._second_issue(cursors))
+
+            await collector_for(paths, gateway, transport).run_once()
+
+            self.assertEqual(
+                transport.digest_uploads[0]["digest"], "Общий дайджест")

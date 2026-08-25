@@ -29,7 +29,12 @@ from .mihomo import (
     render_mihomo_config,
 )
 from .openrouter import create_digest
-from .prompting import PROMPT_PREFIX_BYTES, fit_by_lines
+from .prompting import (
+    PROMPT_PREFIX_BYTES,
+    digest_skip_note,
+    fit_by_lines,
+    prepend_digest_note,
+)
 from .openrouter_tunnel import OpenRouterTunnel, generate_openrouter_key
 from .settings import (
     MAX_CONSENT_DAYS,
@@ -57,6 +62,7 @@ from .telegram_gateway import TelethonGateway, parse_message_link
 from .telegram_probe import probe_telegram_session
 from .version import (
     DEFAULT_LOOKBACK_HOURS,
+    MAX_DIGEST_CHARS,
     MAX_PROMPT_BYTES,
     MAX_SELECTED_CHATS,
     MAX_UPLOAD_BYTES,
@@ -2257,6 +2263,25 @@ class Collector:
                   for row in payload["chat_ranges"]),
         )
 
+    @staticmethod
+    def _digest_lookback(
+        gate: Dict[str, Any], acknowledged: Optional[Dict[str, Any]],
+    ) -> timedelta:
+        """Насколько глубоко назад смотрит выпуск.
+
+        Обычно — ровно ретроспектива дайджеста. Но приложение может
+        простоять несколько суток (13–16.08.2026 так и было: протухший
+        адрес узла), и тогда окно растягивается на пропущенные дни:
+        суточный выпуск обязан покрыть всё, что накопилось с прошлого,
+        иначе тишина в Telegram превратилась бы в потерю переписки.
+        """
+        lookback = timedelta(hours=DEFAULT_LOOKBACK_HOURS)
+        if acknowledged is None:
+            return lookback
+        missed = (date.fromisoformat(gate["digest"]["digest_date"])
+                  - date.fromisoformat(acknowledged["digest_date"])).days - 1
+        return lookback + timedelta(days=max(0, missed))
+
     async def _run_digest(
         self, gate: Dict[str, Any], gate_received_mono: float, transport: Any,
         gateway: Any, settings: Dict[str, Any], credentials: Dict[str, Any],
@@ -2366,31 +2391,43 @@ class Collector:
         await self._ensure_openrouter_key(source_id)
 
         cutoff = parse_utc(gate["server_time"], "server_time")
-        first = acknowledged is None and sequence == 1
+        not_before = cutoff - self._digest_lookback(gate, acknowledged)
         per_chat_budget = max(1024, PROMPT_PREFIX_BYTES + (
             MAX_PROMPT_BYTES - PROMPT_PREFIX_BYTES) // len(chats))
         digest_chats: List[DigestChat] = []
         ranges: List[Dict[str, int]] = []
+        skipped: List[tuple] = []
         for chat, cursor in zip(chats, gate["digest"]["cursors"]):
             peer = PeerSpec.from_dict(chat["peer"])
             start = cursor["through_message_id"]
-            effective = start
-            not_before: Optional[datetime] = None
-            if first:
-                not_before = cutoff - timedelta(hours=DEFAULT_LOOKBACK_HOURS)
-                await self._assert_active(
-                    revoked, source_id, chat_ids,
-                    self._generated_at(gate, gate_received_mono),
-                )
-                trusted_cursor = await self._bounded_external(
-                    gateway.bootstrap_cursor(session, peer, cutoff),
-                    TELEGRAM_FETCH_TIMEOUT_S,
-                )
-                await self._assert_active(
-                    revoked, source_id, chat_ids,
-                    self._generated_at(gate, gate_received_mono),
-                )
-                effective = max(start, trusted_cursor)
+            await self._assert_active(
+                revoked, source_id, chat_ids,
+                self._generated_at(gate, gate_received_mono),
+            )
+            # Граница выводится на КАЖДОМ выпуске и для КАЖДОГО чата, а не
+            # только на первом. Чат, добавленный расширением, приходит с
+            # нулевым курсором посреди живой цепочки — и пока это делалось
+            # лишь при sequence=1, он вычитывался с самого начала истории:
+            # 21–25.08.2026 суточный выпуск изо дня в день пересказывал
+            # переписку 2023 года, продвигаясь на бюджет промпта в сутки
+            # (инцидент «Петровский остров», курсор 0 → 454 при вершине 8398).
+            boundary_cursor = await self._bounded_external(
+                gateway.boundary_cursor(session, peer, not_before),
+                TELEGRAM_FETCH_TIMEOUT_S,
+            )
+            await self._assert_active(
+                revoked, source_id, chat_ids,
+                self._generated_at(gate, gate_received_mono),
+            )
+            effective = max(start, boundary_cursor)
+            if start and effective > start:
+                # Живой чат, у которого хвост пережил окно: чаще всего он не
+                # влез в бюджет промпта и провисел дольше ретроспективы.
+                # Такой пропуск обязан быть виден Ивану — молча его глотать
+                # нельзя. У чата, впервые вошедшего в набор (`start == 0`),
+                # пропущенное — это его прежняя история, и предупреждать не о
+                # чем.
+                skipped.append((chat["title"], start + 1, effective))
             await self._assert_active(
                 revoked, source_id, chat_ids,
                 self._generated_at(gate, gate_received_mono),
@@ -2443,6 +2480,9 @@ class Collector:
                 tunnel.ensure_alive()
             finally:
                 await tunnel.stop()
+        if skipped:
+            digest = prepend_digest_note(
+                digest, digest_skip_note(skipped), MAX_DIGEST_CHARS)
         await self._assert_active(
             revoked, source_id, chat_ids,
             self._generated_at(gate, gate_received_mono),

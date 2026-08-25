@@ -203,6 +203,42 @@ def truncate_first_to_budget(message: SelectedMessage) -> SelectedMessage:
 DIGEST_TRUNCATION_NOTE = "\n\n[выпуск обрезан по лимиту]"
 
 
+# Пропуск, о котором выпуск обязан сказать вслух. Курсор чата подтягивается к
+# нижней границе выпуска, и хвост старше неё в текст не попадает. У чата,
+# впервые вошедшего в набор, это его прежняя история — так и задумано. Но у
+# живого чата тем же способом может исчезнуть переписка, не влезшая в бюджет
+# промпта и провисевшая дольше окна, а тихий скип и есть тот отказ, который
+# потом ищут неделями: в wire пропуск не виден вовсе (диапазон объявляется от
+# курсора приёмника), в статусе его тоже нет.
+DIGEST_SKIP_NOTE_HEAD = "[пропущено старше окна выпуска]"
+
+
+def _utf16_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def digest_skip_note(rows: List[tuple]) -> str:
+    """Строка предупреждения о хвосте, который выпуск не стал читать."""
+    lines = [DIGEST_SKIP_NOTE_HEAD]
+    for title, first, last in rows:
+        lines.append(f"{title}: сообщения {first}–{last}")
+    return "\n".join(lines)
+
+
+def prepend_digest_note(digest: str, note: str, limit: int) -> str:
+    """Поставить предупреждение ПЕРЕД выпуском, уложившись в потолок.
+
+    Впереди — потому что срезается всегда хвост: предупреждение о пропаже
+    не имеет права исчезнуть раньше самого выпуска."""
+    text = f"{note}\n\n{digest}" if digest else note
+    if _utf16_units(text) <= limit:
+        return text
+    fitted = fit_by_lines(text, _utf16_units, limit)
+    if fitted is None:
+        raise ValueError("digest skip note does not fit")
+    return fitted
+
+
 def fit_by_lines(text: str, size_of, limit: int) -> Optional[str]:
     """Наибольший префикс текста по строкам, влезающий в limit, с пометкой.
 

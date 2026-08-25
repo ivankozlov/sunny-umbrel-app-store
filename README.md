@@ -16,18 +16,20 @@ The app/package/image ID remains `sunny-personal-digest` for release continuity;
 the v0.2 product name is **Sunny Personal Chats**. v0.2 is a breaking credential
 generation and does not migrate the unpublished v0.1 pilot state.
 
-The last recorded state of the physical Umbrel (2026-08-20) is `0.2.9`: eight exact
+The last recorded state of the physical Umbrel (2026-08-21) is `0.2.10`: eight exact
 peers, the receiver generation, durable baseline, session, and active monitoring state
-survived the updates and the first chat-set extension. The first structured production
-daily was accepted on 2026-08-20 in two parts with no duplicate. The first nightly issue
-after the extension, forum-topic read acknowledgements for the added chat, and a real
-native-mention event still need observation. Wire `COLLECTOR_VERSION` remains `0.2.1`.
+survived the updates and the first chat-set extension. The first nightly issue after the
+extension was accepted on 2026-08-21 with all eight chat ranges and delivered in three
+parts without error. The first `0.2.10` daily with locally restored sender names,
+forum-topic read acknowledgements for the added chat, and a real native-mention event
+still need observation. Wire `COLLECTOR_VERSION` remains `0.2.1`.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
-restored on 2026-08-17; `0.2.6` through `0.2.9` have public multi-arch images.
+restored on 2026-08-17; `0.2.6` through `0.2.10` have public multi-arch images.
 **Update** and uninstall/reinstall therefore have a public source again. The device now
-runs public `0.2.9`, but Docker image pruning remains out of bounds: the real recreate/pull
-path has never been exercised, and a future distribution closure would remove the public
+runs public `0.2.10`; its update from `0.2.9` exercised the real recreate/pull path and
+preserved state. Docker image pruning remains out of bounds without a separate destructive
+approval and a concrete need, and a future distribution closure could remove the public
 source again. The `umbrel/` subtree of private source
 repository `ivankozlov/sunny/main` deliberately remains a disabled, placeholder-pinned
 Phase-A candidate; the enabling commit lives only in the Store repository.
@@ -58,7 +60,10 @@ Phase-A candidate; the enabling commit lives only in the Store repository.
   post-activation mention is still forwarded if another Telegram client read it
   before the next poll.
 - One daily OpenRouter call produces one combined Russian digest for all selected
-  chats. The monitor and digest hash/cursor chains are independent, so an LLM or
+  chats. OpenRouter and the killable worker see only per-chat `participant-N` aliases;
+  the parent keeps sanitized display names in memory and locally restores only an
+  unambiguous known alias in the final text. Unknown or ambiguous aliases stay
+  pseudonymous. The monitor and digest hash/cursor chains are independent, so an LLM or
   daily failure cannot stop frequent read handling. The receiver accepts a daily
   only from 03:00 through 04:45 in the configured IANA timezone; there is no
   same-day catch-up after that window.
@@ -102,9 +107,14 @@ specific chats. Containment is enforced locally and fails closed:
 - only an aggregate `TimeoutError` from an already-active monitor may continue to the
   independent digest path, and only after a fresh authenticated gate. Baseline,
   receiver-chain, pending conflicts, and cancellation remain fail-closed;
-- the first daily run derives each 72-hour lower boundary from authenticated
-  receiver `server_time`, not the Umbrel wall clock. Later runs continue independent
-  digest cursors without dropping accumulated backlog;
+- every daily run derives each chat's lower boundary from authenticated receiver
+  `server_time`, not the Umbrel wall clock: 72 hours, stretched over the days missed
+  since the last accepted issue. A chat's cursor is pulled up to that boundary and never
+  moves back, so a chat added by extension — a zero cursor mid-chain — starts at the
+  window instead of replaying its own history from the beginning;
+- when that pull skips unread messages of a live chat, the issue says so in its first
+  lines: the wire declares the range from the receiver's cursor and hides the gap
+  entirely, so the text is the only honest channel;
 - raw daily chat text exists only in collector memory and the ZDR OpenRouter
   request. Every request sets `provider.zdr=true` and
   `provider.data_collection=deny`; Opus uses an explicit `max_tokens=16384` budget;
@@ -254,10 +264,10 @@ activation screens.
 Anonymous umbrelOS install/update requires both a public Store repository and a
 public `ghcr.io/ivankozlov/sunny-personal-digest` image. Both surfaces were closed on
 2026-08-14 and reopened on 2026-08-17 by an explicit owner decision; `v0.2.6`
-through `v0.2.9` were published and enabled from there. Reopening stays an
+through `v0.2.10` were published and enabled from there. Reopening stays an
 explicit, per-release decision — never republish silently.
 
-Every release follows this exact sequence, as `0.2.5` did and `0.2.6`–`0.2.9` did
+Every release follows this exact sequence, as `0.2.5` did and `0.2.6`–`0.2.10` did
 after it: disabled source first, the protected `Publish image` workflow with
 `bootstrap_empty_package=false`, independent public OCI verification for
 `linux/amd64` and `linux/arm64`, and only then the exact digest pin plus
@@ -310,10 +320,13 @@ exposed a separate failure before peer access:
 the persisted route reset Telegram initialization. `0.2.5` was then installed; the
 replacement subscription passed authorization on the first tested route, preserved
 lock/session/baseline/checkpoints and active monitoring, and survived a reboot. The first
-structured daily was accepted on 2026-08-20 in two parts without duplicates. After the
-extension, observe the first nightly issue with the eighth chat and its forum-topic read
-acknowledgements; a real native-mention event is also still untested. There is deliberately
-no manual same-day backfill.
+structured daily was accepted on 2026-08-20 in two parts without duplicates. The first
+post-extension daily was accepted on 2026-08-21 with all eight chat ranges and delivered
+in three parts without errors. The physical device was then updated from `0.2.9` to
+`0.2.10`; receiver activity continued and the durable state remained aligned. Observe the
+next nightly issue for local sender-name restoration, the added chat's forum-topic read
+acknowledgements, and a real native-mention event. There is deliberately no manual
+same-day backfill.
 
 ## Incident response
 
