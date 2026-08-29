@@ -16,18 +16,21 @@ The app/package/image ID remains `sunny-personal-digest` for release continuity;
 the v0.2 product name is **Sunny Personal Chats**. v0.2 is a breaking credential
 generation and does not migrate the unpublished v0.1 pilot state.
 
-The last recorded state of the physical Umbrel (2026-08-21) is `0.2.10`: eight exact
+The last recorded state of the physical Umbrel (2026-08-25) is `0.2.11`: eight exact
 peers, the receiver generation, durable baseline, session, and active monitoring state
 survived the updates and the first chat-set extension. The first nightly issue after the
 extension was accepted on 2026-08-21 with all eight chat ranges and delivered in three
-parts without error. The first `0.2.10` daily with locally restored sender names,
-forum-topic read acknowledgements for the added chat, and a real native-mention event
-still need observation. Wire `COLLECTOR_VERSION` remains `0.2.1`.
+parts without error. The first `0.2.11` daily was accepted on 2026-08-26 in two parts
+and visibly reported the old-tail skip for the extended chat. Local sender-name
+restoration, forum-topic read acknowledgements for the added chat, and a real
+native-mention event still need observation. Public `0.2.12` is ready in the Store,
+but the owner has not yet updated the physical device. Wire `COLLECTOR_VERSION` remains
+`0.2.1`.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
-restored on 2026-08-17; `0.2.6` through `0.2.10` have public multi-arch images.
+restored on 2026-08-17; `0.2.6` through `0.2.12` have public multi-arch images.
 **Update** and uninstall/reinstall therefore have a public source again. The device now
-runs public `0.2.10`; its update from `0.2.9` exercised the real recreate/pull path and
+runs public `0.2.11`; its update from `0.2.9` to `0.2.10` exercised the real recreate/pull path and
 preserved state. Docker image pruning remains out of bounds without a separate destructive
 approval and a concrete need, and a future distribution closure could remove the public
 source again. The `umbrel/` subtree of private source
@@ -266,10 +269,10 @@ activation screens.
 Anonymous umbrelOS install/update requires both a public Store repository and a
 public `ghcr.io/ivankozlov/sunny-personal-digest` image. Both surfaces were closed on
 2026-08-14 and reopened on 2026-08-17 by an explicit owner decision; `v0.2.6`
-through `v0.2.10` were published and enabled from there. Reopening stays an
+through `v0.2.12` were published and enabled from there. Reopening stays an
 explicit, per-release decision — never republish silently.
 
-Every release follows this exact sequence, as `0.2.5` did and `0.2.6`–`0.2.10` did
+Every release follows this exact sequence, as `0.2.5` did and `0.2.6`–`0.2.12` did
 after it: disabled source first, the protected `Publish image` workflow with
 `bootstrap_empty_package=false`, independent public OCI verification for
 `linux/amd64` and `linux/arm64`, and only then the exact digest pin plus
@@ -324,11 +327,13 @@ replacement subscription passed authorization on the first tested route, preserv
 lock/session/baseline/checkpoints and active monitoring, and survived a reboot. The first
 structured daily was accepted on 2026-08-20 in two parts without duplicates. The first
 post-extension daily was accepted on 2026-08-21 with all eight chat ranges and delivered
-in three parts without errors. The physical device was then updated from `0.2.9` to
-`0.2.10`; receiver activity continued and the durable state remained aligned. Observe the
-next nightly issue for local sender-name restoration, the added chat's forum-topic read
-acknowledgements, and a real native-mention event. There is deliberately no manual
-same-day backfill.
+in three parts without errors. The physical device was then updated from `0.2.9` through
+`0.2.11`; receiver activity continued and the durable state remained aligned. Its first
+`0.2.11` daily was accepted on 2026-08-26 in two parts and visibly reported the extended
+chat's skipped old tail. Public `0.2.12` adds sanitized numeric OpenRouter usage/cost to
+each non-empty daily artifact and is enabled in the Store, but remains pending an
+owner-operated device update. Observe the next nightly issue after that update for the
+first usage-bearing artifact; there is deliberately no manual same-day backfill.
 
 ## Incident response
 

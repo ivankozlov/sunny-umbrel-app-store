@@ -233,9 +233,9 @@ In the `umbrel/` subtree of the private source repository `ivankozlov/sunny/main
 `scripts/check_package.py --release` must remain red: the disabled manifest and release
 placeholder are the intentional Phase-A state of the source tree. This does not
 describe the Store `main`, where the enabling commits live — it carries enabled
-`v0.2.10`, with the historical enabled `v0.2.5` still in its history. Distribution was
+`v0.2.12`, with the historical enabled `v0.2.5` still in its history. Distribution was
 withdrawn on 2026-08-14 and reopened on 2026-08-17; the public GHCR package now holds
-`v0.2.6` through `v0.2.10`, while `v0.2.5` stays deleted. Every release requires
+`v0.2.6` through `v0.2.12`, while `v0.2.5` stays deleted. Every release requires
 separate approval, a new semver/tag, a real independently verified multi-architecture
 digest, and a separate enabling commit; never overwrite the withdrawn `v0.2.5` tag. The publish job stays `main`-only behind
 the protected `ghcr-release` Environment;
