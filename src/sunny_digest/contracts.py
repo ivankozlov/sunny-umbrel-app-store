@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -43,6 +44,11 @@ DIGEST_UPLOAD_KEYS = (
     "total_message_count", "empty", "digest", "model", "prompt_version",
     "collector_version", "content_sha256",
 )
+LLM_USAGE_KEYS = (
+    "prompt_tokens", "completion_tokens", "reasoning_tokens", "cost",
+    "upstream_cost",
+)
+_MISSING = object()
 GATE_KEYS = ("schema", "ok", "server_time", "timezone", "monitor", "digest")
 MONITOR_GATE_KEYS = (
     "baseline_required", "next_sequence", "previous_sha256", "cursors",
@@ -445,6 +451,26 @@ def validate_digest_text(value: Any, *, allow_empty: bool) -> str:
     )
 
 
+def validate_llm_usage(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("llm_usage is invalid")
+    _exact_keys(value, LLM_USAGE_KEYS, "llm_usage")
+    checked: Dict[str, Any] = {}
+    for name in ("prompt_tokens", "completion_tokens", "reasoning_tokens"):
+        raw = value[name]
+        if raw is not None and (type(raw) is not int or raw < 0):
+            raise ValueError(f"llm_usage {name} is invalid")
+        checked[name] = raw
+    for name in ("cost", "upstream_cost"):
+        raw = value[name]
+        if (raw is not None
+                and (isinstance(raw, bool) or not isinstance(raw, (int, float))
+                     or not math.isfinite(float(raw)) or float(raw) < 0)):
+            raise ValueError(f"llm_usage {name} is invalid")
+        checked[name] = float(raw) if raw is not None else None
+    return checked
+
+
 def _validate_digest_range(row: Any) -> Dict[str, int]:
     if not isinstance(row, dict):
         raise ValueError("digest range is invalid")
@@ -461,7 +487,7 @@ def _validate_digest_range(row: Any) -> Dict[str, int]:
 def build_digest_upload(
     *, source_id: str, gate: Dict[str, Any],
     chat_ranges: Sequence[Dict[str, int]], digest: str, model: str,
-    generated_at: datetime,
+    generated_at: datetime, llm_usage: Any = _MISSING,
 ) -> Dict[str, Any]:
     validate_gate(dict(gate))
     digest_gate = gate["digest"]
@@ -485,6 +511,10 @@ def build_digest_upload(
         "prompt_version": PROMPT_VERSION,
         "collector_version": COLLECTOR_VERSION,
     }
+    if llm_usage is not _MISSING:
+        if message_count == 0 or llm_usage is None:
+            raise ValueError("llm_usage requires a non-empty digest input")
+        payload["llm_usage"] = validate_llm_usage(llm_usage)
     payload["content_sha256"] = content_hash(payload)
     validate_digest_upload(payload)
     expected = digest_gate["cursors"]
@@ -497,7 +527,10 @@ def build_digest_upload(
 
 
 def validate_digest_upload(value: Dict[str, Any]) -> Dict[str, Any]:
-    _exact_keys(value, DIGEST_UPLOAD_KEYS, "digest upload")
+    fields = set(value)
+    expected = set(DIGEST_UPLOAD_KEYS)
+    if fields not in (expected, expected | {"llm_usage"}):
+        raise ValueError("digest upload has unexpected fields")
     if value["schema"] != DIGEST_UPLOAD_SCHEMA:
         raise ValueError("digest upload schema is invalid")
     _source_id(value["source_id"])
@@ -527,6 +560,10 @@ def validate_digest_upload(value: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("digest aggregate message_count mismatch")
     if type(value["empty"]) is not bool or value["empty"] != (total == 0):
         raise ValueError("digest empty flag disagrees with count")
+    if "llm_usage" in value:
+        if total == 0:
+            raise ValueError("empty digest must not contain llm_usage")
+        validate_llm_usage(value["llm_usage"])
     if (value["digest"] == "") != value["empty"]:
         raise ValueError("digest text disagrees with empty flag")
     validate_digest_text(value["digest"], allow_empty=value["empty"])
@@ -542,7 +579,7 @@ def validate_digest_upload(value: Dict[str, Any]) -> Dict[str, Any]:
             value["content_sha256"]):
         raise ValueError("digest content_sha256 is invalid")
     expected_hash = content_hash({
-        key: value[key] for key in DIGEST_UPLOAD_KEYS if key != "content_sha256"
+        key: item for key, item in value.items() if key != "content_sha256"
     })
     if value["content_sha256"] != expected_hash:
         raise ValueError("digest content_sha256 mismatch")

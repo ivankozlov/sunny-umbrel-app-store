@@ -2459,6 +2459,7 @@ class Collector:
                 ))
 
         total = sum(row["message_count"] for row in ranges)
+        llm_usage = None
         if total == 0:
             digest = ""
         else:
@@ -2470,13 +2471,15 @@ class Collector:
             tunnel = self.tunnel_factory(self.paths, settings["upload"])
             await tunnel.start()
             try:
-                digest = await self._bounded_external(
+                digest_result = await self._bounded_external(
                     self.digest_function(
                         digest_chats, settings["openrouter_model"],
                         credentials["openrouter_api_key"], revoked,
                     ),
                     OPENROUTER_TIMEOUT_S,
                 )
+                digest = str(digest_result)
+                llm_usage = getattr(digest_result, "llm_usage", None)
                 tunnel.ensure_alive()
             finally:
                 await tunnel.stop()
@@ -2487,10 +2490,13 @@ class Collector:
             revoked, source_id, chat_ids,
             self._generated_at(gate, gate_received_mono),
         )
+        usage_kwargs = ({"llm_usage": llm_usage}
+                        if llm_usage is not None else {})
         payload = build_digest_upload(
             source_id=source_id, gate=gate, chat_ranges=ranges, digest=digest,
             model=settings["openrouter_model"],
             generated_at=self._generated_at(gate, gate_received_mono),
+            **usage_kwargs,
         )
         pending = canonical_digest_bytes(payload)
         limit = gate["digest"]["max_upload_bytes"]
@@ -2506,11 +2512,13 @@ class Collector:
                     source_id=source_id, gate=gate, chat_ranges=ranges,
                     digest=text, model=settings["openrouter_model"],
                     generated_at=self._generated_at(gate, gate_received_mono),
+                    **usage_kwargs,
                 ))))
             payload = build_digest_upload(
                 source_id=source_id, gate=gate, chat_ranges=ranges,
                 digest=digest, model=settings["openrouter_model"],
                 generated_at=self._generated_at(gate, gate_received_mono),
+                **usage_kwargs,
             )
             pending = canonical_digest_bytes(payload)
         async with self.state_lock:

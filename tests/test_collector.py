@@ -2144,6 +2144,41 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(transport.digest_uploads, [])
             self.assertFalse(paths.acknowledged.exists())
 
+    async def test_daily_digest_upload_carries_only_sanitized_llm_usage(self):
+        class MeteredDigest(str):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            gateway.fetches = {
+                CHAT_IDS[0]: FetchResult(
+                    101, [SelectedMessage(101, 7, NOW, "A")]),
+                CHAT_IDS[1]: FetchResult(
+                    201, [SelectedMessage(201, 8, NOW, "B")]),
+            }
+            transport = FakeTransport(paths, gate(digest_due=True))
+            collector = collector_for(paths, gateway, transport)
+            usage = {
+                "prompt_tokens": 1200,
+                "completion_tokens": 340,
+                "reasoning_tokens": 210,
+                "cost": 0.73,
+                "upstream_cost": 0.70,
+            }
+
+            async def metered(*_args):
+                result = MeteredDigest("Общий дайджест")
+                result.llm_usage = usage
+                return result
+
+            collector.digest_function = metered
+            result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            self.assertEqual(transport.digest_uploads[0]["llm_usage"], usage)
+
     async def test_crash_after_digest_checkpoint_before_pending_unlink_recovers(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = make_paths(Path(temporary))

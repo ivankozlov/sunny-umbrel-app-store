@@ -63,8 +63,10 @@ Phase-A candidate; the enabling commit lives only in the Store repository.
   chats. OpenRouter and the killable worker see only per-chat `participant-N` aliases;
   the parent keeps sanitized display names in memory and locally restores only an
   unambiguous known alias in the final text. Unknown or ambiguous aliases stay
-  pseudonymous. The monitor and digest hash/cursor chains are independent, so an LLM or
-  daily failure cannot stop frequent read handling. The receiver accepts a daily
+  pseudonymous. The accepted digest carries only numeric OpenRouter usage/cost fields
+  into Sunny's LLM ledger; provider response data and request IDs are not forwarded.
+  The monitor and digest hash/cursor chains are independent, so an LLM or daily failure
+  cannot stop frequent read handling. The receiver accepts a daily
   only from 03:00 through 04:45 in the configured IANA timezone; there is no
   same-day catch-up after that window.
 
@@ -117,7 +119,7 @@ specific chats. Containment is enforced locally and fails closed:
   entirely, so the text is the only honest channel;
 - raw daily chat text exists only in collector memory and the ZDR OpenRouter
   request. Every request sets `provider.zdr=true` and
-  `provider.data_collection=deny`; Opus uses an explicit `max_tokens=16384` budget;
+  `provider.data_collection=deny`; Opus uses an explicit `max_tokens=32768` budget;
 - bounded mention events are an explicit privacy exception: they are durable on
   Umbrel while pending, in DO receiver/inbox/backups, and in Sunny's Telegram
   outbox. Locked runtime health/status never contains titles, snippets, digest

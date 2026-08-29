@@ -30,6 +30,7 @@ from sunny_digest.openrouter import (
     OpenRouterError,
     _blocking_digest,
     _prompt,
+    blocking_fetch_response,
     create_digest,
 )
 from sunny_digest.prompting import (
@@ -103,19 +104,22 @@ def event(chat_id=CHAT_IDS[0], message_id=11):
 class FakeResponse:
     """Ответ модели в формате v3: текст выпуска собирает код, не модель."""
 
-    def __init__(self, digest: str = "Готово", *, content=None):
+    def __init__(self, digest: str = "Готово", *, content=None, usage=None):
         if content is None:
             content = {"chats": [{
                 "chat": "Чат",
                 "topics": [{"title": "Тема", "summary": digest, "refs": []}],
                 "links": [],
             }]}
-        self.raw = json.dumps({
+        body = {
             "choices": [{
                 "finish_reason": "stop",
                 "message": {"content": json.dumps(content)},
             }]
-        }).encode("utf-8")
+        }
+        if usage is not None:
+            body["usage"] = usage
+        self.raw = json.dumps(body).encode("utf-8")
 
     def __enter__(self):
         return self
@@ -365,6 +369,56 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "aggregate"):
             validate_digest_upload(invalid)
 
+    def test_digest_usage_is_optional_hashed_and_strict(self):
+        ranges = [
+            {"chat_id": chat_id, "from_message_id_exclusive": 0,
+             "through_message_id": 1, "message_count": 1}
+            for chat_id in CHAT_IDS
+        ]
+        usage = {
+            "prompt_tokens": 1200,
+            "completion_tokens": 340,
+            "reasoning_tokens": 210,
+            "cost": 0.73,
+            "upstream_cost": 0.70,
+        }
+        payload = build_digest_upload(
+            source_id=SOURCE_ID, gate=gate(), chat_ranges=ranges,
+            digest="Общий дайджест", model="anthropic/example",
+            generated_at=NOW, llm_usage=usage,
+        )
+        self.assertEqual(payload["llm_usage"], usage)
+        self.assertEqual(validate_digest_upload(payload), payload)
+        broken = dict(payload)
+        broken["llm_usage"] = {**usage, "cost": -1}
+        broken["content_sha256"] = content_hash({
+            key: value for key, value in broken.items()
+            if key != "content_sha256"
+        })
+        with self.assertRaisesRegex(ValueError, "llm_usage cost"):
+            validate_digest_upload(broken)
+
+    def test_openrouter_usage_is_sanitized_without_response_content(self):
+        provider_usage = {
+            "prompt_tokens": 1200,
+            "completion_tokens": 340,
+            "completion_tokens_details": {"reasoning_tokens": 210},
+            "cost": 0.73,
+            "cost_details": {"upstream_inference_cost": 0.70},
+            "provider_specific_secret": "must-not-cross-worker-boundary",
+        }
+        with patch("urllib.request.OpenerDirector.open", return_value=FakeResponse(
+                content={"chats": []}, usage=provider_usage)):
+            response = blocking_fetch_response(
+                "bounded prompt", "anthropic/example", "secret")
+        self.assertEqual(response["usage"], {
+            "prompt_tokens": 1200,
+            "completion_tokens": 340,
+            "reasoning_tokens": 210,
+            "cost": 0.73,
+            "upstream_cost": 0.70,
+        })
+
     def test_digest_boundary_counts_telegram_utf16_units(self):
         ranges = [
             {"chat_id": chat_id, "from_message_id_exclusive": 0,
@@ -595,9 +649,12 @@ class TestBugOpusDigestBudget20260814(unittest.TestCase):
 class FakeAnsweringWorker(FakeHungWorker):
     """Воркер, отвечающий ровно так, как настоящий: структурой, не текстом."""
 
-    def __init__(self, answer):
+    def __init__(self, answer, usage=None):
         super().__init__()
-        self.raw = canonical_json_bytes({"answer": answer}) + b"\n"
+        response = {"answer": answer}
+        if usage is not None:
+            response["usage"] = usage
+        self.raw = canonical_json_bytes(response) + b"\n"
         self.sent = False
 
     async def read(self, _limit):
@@ -684,6 +741,27 @@ class TestBugDigestLinksProductionPath20260818(unittest.IsolatedAsyncioTestCase)
                 asyncio.Event())
         self.assertIn("participant-1", digest)
         self.assertIn("participant-2", digest)
+
+    async def test_usage_survives_the_killable_worker_boundary(self):
+        usage = {
+            "prompt_tokens": 1200,
+            "completion_tokens": 340,
+            "reasoning_tokens": 210,
+            "cost": 0.73,
+            "upstream_cost": 0.70,
+        }
+        answer = {"chats": [{
+            "chat": "Рабочий чат",
+            "topics": [{"title": "Тема", "summary": "Суть", "refs": []}],
+            "links": [],
+        }]}
+        worker = FakeAnsweringWorker(answer, usage)
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   return_value=worker):
+            digest = await create_digest(
+                self.CHATS, "anthropic/example", "sk-or-test-secret",
+                asyncio.Event())
+        self.assertEqual(digest.llm_usage, usage)
 
 
 class TestBugPromptBudgetCountsNumber20260818(unittest.TestCase):

@@ -6,7 +6,7 @@ import sys
 from .openrouter import (
     MAX_WORKER_REQUEST_BYTES,
     WORKER_SCHEMA,
-    blocking_fetch_answer,
+    blocking_fetch_response,
 )
 from .storage import canonical_json_bytes
 
@@ -30,9 +30,9 @@ def main() -> int:
                 or not isinstance(model, str) or not 1 <= len(model) <= 160
                 or not isinstance(api_key, str) or not 16 <= len(api_key) <= 512):
             return 2
-        answer = blocking_fetch_answer(prompt, model, api_key)
+        response = blocking_fetch_response(prompt, model, api_key)
         sys.stdout.buffer.write(
-            canonical_json_bytes({"answer": answer}) + b"\n")
+            canonical_json_bytes(response) + b"\n")
         sys.stdout.buffer.flush()
         return 0
     except BaseException:

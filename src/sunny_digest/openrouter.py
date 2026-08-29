@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import sys
 import http.client
@@ -11,7 +12,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from .contracts import validate_digest_text
+from .contracts import validate_digest_text, validate_llm_usage
 from .openrouter_tunnel import TUNNEL_HOST, TUNNEL_PORT
 from .models import DigestChat
 from .prompting import (
@@ -51,6 +52,17 @@ _SENDER_ALIAS = re.compile(r"(?<![\w-])participant-[1-9][0-9]*(?![\w-])")
 
 class OpenRouterError(RuntimeError):
     pass
+
+
+class DigestText(str):
+    """Текст выпуска с обезличенной provider-телеметрией одного вызова."""
+
+    llm_usage: Dict[str, Any]
+
+    def __new__(cls, value: str, llm_usage: Dict[str, Any]):
+        instance = super().__new__(cls, value)
+        instance.llm_usage = llm_usage
+        return instance
 
 
 class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
@@ -226,8 +238,37 @@ def _prompt(chats: List[DigestChat]) -> str:
         raise OpenRouterError("prompt exceeds bounded input size") from exc
 
 
-def blocking_fetch_answer(prompt: str, model: str, api_key: str) -> Any:
-    """Запрос к OpenRouter и разбор JSON-ответа модели. Текст НЕ собирает."""
+def _usage_summary(value: Any) -> Dict[str, Any]:
+    usage = value if isinstance(value, dict) else {}
+    details = usage.get("completion_tokens_details")
+    if not isinstance(details, dict):
+        details = {}
+    cost_details = usage.get("cost_details")
+    if not isinstance(cost_details, dict):
+        cost_details = {}
+
+    def tokens(raw: Any) -> Optional[int]:
+        return raw if type(raw) is int and raw >= 0 else None
+
+    def cost(raw: Any) -> Optional[float]:
+        if (isinstance(raw, bool) or not isinstance(raw, (int, float))):
+            return None
+        number = float(raw)
+        return number if math.isfinite(number) and number >= 0 else None
+
+    return {
+        "prompt_tokens": tokens(usage.get("prompt_tokens")),
+        "completion_tokens": tokens(usage.get("completion_tokens")),
+        "reasoning_tokens": tokens(details.get("reasoning_tokens")),
+        "cost": cost(usage.get("cost")),
+        "upstream_cost": cost(cost_details.get("upstream_inference_cost")),
+    }
+
+
+def blocking_fetch_response(
+    prompt: str, model: str, api_key: str,
+) -> Dict[str, Any]:
+    """Запрос к OpenRouter: структура ответа и безопасная usage-сводка."""
     request_body = canonical_json_bytes({
         "model": model,
         "provider": {
@@ -278,11 +319,17 @@ def blocking_fetch_answer(prompt: str, model: str, api_key: str) -> Any:
             raise OpenRouterError("OpenRouter response did not finish cleanly")
         content = choice["message"]["content"]
         parsed = json.loads(content)
+        usage = _usage_summary(body.get("usage"))
     except OpenRouterError:
         raise
     except (KeyError, IndexError, TypeError, ValueError, UnicodeDecodeError):
         raise OpenRouterError("OpenRouter response shape is invalid") from None
-    return parsed
+    return {"answer": parsed, "usage": usage}
+
+
+def blocking_fetch_answer(prompt: str, model: str, api_key: str) -> Any:
+    """Совместимый helper: вернуть только структуру ответа модели."""
+    return blocking_fetch_response(prompt, model, api_key)["answer"]
 
 
 def _render_and_validate(parsed: Any, chats: List[DigestChat]) -> str:
@@ -412,8 +459,16 @@ async def create_digest(chats: List[DigestChat], model: str, api_key: str,
         response = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise OpenRouterError("OpenRouter worker response is invalid") from None
-    if not isinstance(response, dict) or set(response) != {"answer"}:
+    if (not isinstance(response, dict)
+            or set(response) not in ({"answer"}, {"answer", "usage"})):
         raise OpenRouterError("OpenRouter worker response is invalid")
     # Сборка текста и подстановка ссылок — здесь, а не в воркере: только у
     # родителя есть карта «номер → сообщение», и она никуда не уезжает.
-    return _render_and_validate(response["answer"], chats)
+    digest = _render_and_validate(response["answer"], chats)
+    if "usage" not in response:
+        return digest
+    try:
+        usage = validate_llm_usage(response["usage"])
+    except ValueError as exc:
+        raise OpenRouterError("OpenRouter worker usage is invalid") from exc
+    return DigestText(digest, usage)
