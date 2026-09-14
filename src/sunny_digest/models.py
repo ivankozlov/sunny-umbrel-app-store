@@ -3,7 +3,7 @@ from __future__ import annotations
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def validate_chat_title(value: Any) -> str:
@@ -94,6 +94,9 @@ class SelectedMessage:
     # Локальное display name из уже полученного Telegram message. В промпт
     # не входит и нужно только родителю для замены participant-N после LLM.
     sender_name: Optional[str] = None
+    # Адреса материалов из Telegram entities. Только память родителя;
+    # модель выбирает сообщение по n, а прямые ссылки подставляет код.
+    material_urls: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

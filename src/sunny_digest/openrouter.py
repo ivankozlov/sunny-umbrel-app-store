@@ -16,6 +16,7 @@ from .contracts import validate_digest_text, validate_llm_usage
 from .openrouter_tunnel import TUNNEL_HOST, TUNNEL_PORT
 from .models import DigestChat
 from .prompting import (
+    digest_material_urls,
     digest_sender_names,
     digest_sources,
     fit_by_lines,
@@ -47,7 +48,7 @@ MAX_WORKER_REQUEST_BYTES = 128 * 1024
 # поэтому message_id и peer_id не попадают даже в подпроцесс.
 WORKER_SCHEMA = "sunny.personal-chats.openrouter-worker.v3"
 WORKER_TERMINATE_GRACE_S = 2.0
-_SENDER_ALIAS = re.compile(r"(?<![\w-])participant-[1-9][0-9]*(?![\w-])")
+_SENDER_ALIAS = re.compile(r"(?<![\w-])participant-[1-9][0-9]*(?![\w-])", re.IGNORECASE)
 
 
 class OpenRouterError(RuntimeError):
@@ -117,32 +118,37 @@ def _clean(value: Any, limit: int) -> str:
     return text[:limit]
 
 
-def _link(sources: Dict[int, str], ref: Any) -> Optional[str]:
-    """Ссылка по номеру, названному моделью.
+def _source_links(sources: Dict[int, str], material_urls: Dict[int, List[str]],
+                  ref: Any) -> List[str]:
+    """Прямые ссылки на материалы, затем ссылка на сообщение-источник.
 
     `isinstance(True, int)` — истина, поэтому bool отсекается явно: `ref: true`
     иначе дал бы ссылку на ПЕРВОЕ сообщение прогона. Строку с цифрами принимаем
     (модели легко отдают "12" вместо 12), всё остальное — не источник."""
     if isinstance(ref, bool):
-        return None
+        return []
     if isinstance(ref, str) and ref.isdigit():
         ref = int(ref)
     if not isinstance(ref, int):
-        return None
-    return sources.get(ref)
+        return []
+    urls = list(material_urls.get(ref, []))
+    if ref in sources:
+        urls.append(sources[ref])
+    return list(dict.fromkeys(urls))
 
 
 def _restore_sender_names(value: Any, names: Dict[str, str]) -> Any:
     if not isinstance(value, str) or not names:
         return value
     return _SENDER_ALIAS.sub(
-        lambda match: names.get(match.group(0), match.group(0)), value)
+        lambda match: names.get(match.group(0).lower(), match.group(0)), value)
 
 
 def render_digest(
     parsed: Any,
     sources: Dict[int, str],
     sender_names: Optional[Dict[str, Dict[str, str]]] = None,
+    material_urls: Optional[Dict[int, List[str]]] = None,
 ) -> str:
     """Собрать текст выпуска из структурированного ответа.
 
@@ -181,10 +187,12 @@ def render_digest(
                 lines.append(summary)
             refs = topic.get("refs") or []
             if isinstance(refs, list):
+                seen_links = set()
                 for ref in refs[:5]:
-                    link = _link(sources, ref)
-                    if link:
-                        lines.append(link)
+                    for link in _source_links(sources, material_urls or {}, ref):
+                        if link not in seen_links:
+                            lines.append(link)
+                            seen_links.add(link)
             lines.append("")
 
         link_lines = []
@@ -197,8 +205,7 @@ def render_digest(
                 _restore_sender_names(row.get("title", ""), names), 200)
             link_lines.append(f"• {entry}" + (f" — {note}" if note else ""))
             ref = row.get("ref")
-            link = _link(sources, ref)
-            if link:
+            for link in _source_links(sources, material_urls or {}, ref):
                 link_lines.append(f"  {link}")
 
         if not lines and not link_lines:
@@ -334,7 +341,8 @@ def blocking_fetch_answer(prompt: str, model: str, api_key: str) -> Any:
 
 def _render_and_validate(parsed: Any, chats: List[DigestChat]) -> str:
     digest = render_digest(
-        parsed, digest_sources(chats), digest_sender_names(chats))
+        parsed, digest_sources(chats), digest_sender_names(chats),
+        digest_material_urls(chats))
     try:
         validate_digest_text(digest, allow_empty=False)
     except ValueError as exc:

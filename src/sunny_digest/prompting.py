@@ -23,7 +23,11 @@ PROMPT_PREFIX = (
     "исходной переписки. Одна тема — один блок, даже если она обсуждалась "
     "в разных местах чата.\n"
     "2. Отдельно собери статьи, ссылки, анонсы, вакансии и прочую "
-    "фактическую информацию: что это и зачем смотреть.\n"
+    "фактическую информацию: что это и зачем смотреть. Поле material_count "
+    "показывает число прямых ссылок в сообщении, в том числе скрытых под "
+    "текстом. Указывай ref именно сообщения с материалом: код сохранит "
+    "его прямые ссылки, даже если сообщение в чате позже удалят. Если "
+    "материал обсуждается в теме, включи это сообщение и в refs темы.\n"
     "3. Отбрось флуд, мемы, реакции, приветствия, спам и перепалки без "
     "содержания. Лучше короткий честный дайджест, чем раздутый.\n"
     "\n"
@@ -62,6 +66,8 @@ def message_row_bytes(message: SelectedMessage, sender_label: str,
         # Порядковый номер в этом прогоне, НЕ Telegram message_id: модель
         # ссылается им на источник, а ссылку собирает код.
         row["n"] = number
+    if message.material_urls:
+        row["material_count"] = len(message.material_urls)
     if chat_title is not None:
         row["chat"] = chat_title
     return canonical_json_bytes(row)
@@ -156,6 +162,16 @@ def digest_sender_names(chats: List[DigestChat]) -> Dict[str, Dict[str, str]]:
     return by_title
 
 
+def digest_material_urls(chats: List[DigestChat]) -> Dict[int, List[str]]:
+    """Те же сквозные n, что в промпте; URL остаются у родителя."""
+    return {
+        number: list(message.material_urls)
+        for number, message in enumerate(
+            (message for chat in chats for message in chat.messages), start=1)
+        if message.material_urls
+    }
+
+
 def render_digest_prompt(chats: List[DigestChat]) -> str:
     rows: List[bytes] = []
     number = 0
@@ -184,7 +200,7 @@ def truncate_first_to_budget(message: SelectedMessage) -> SelectedMessage:
         candidate_text = message.text[:middle].rstrip() + suffix
         candidate = SelectedMessage(
             message.message_id, message.sender_id, message.sent_at,
-            candidate_text, message.sender_name)
+            candidate_text, message.sender_name, message.material_urls)
         if prompt_size([candidate]) <= MAX_PROMPT_BYTES:
             best = candidate_text
             low = middle + 1
@@ -194,7 +210,7 @@ def truncate_first_to_budget(message: SelectedMessage) -> SelectedMessage:
         raise ValueError("one Telegram message cannot fit the prompt budget")
     return SelectedMessage(
         message.message_id, message.sender_id, message.sent_at, best,
-        message.sender_name)
+        message.sender_name, message.material_urls)
 
 
 # Хвост, которым выпуск честно сообщает, что его срезали. Обрезка бывает в

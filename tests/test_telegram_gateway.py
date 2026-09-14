@@ -23,7 +23,7 @@ CUTOFF = datetime(2026, 8, 4, 0, 30, tzinfo=timezone.utc)
 
 def message(message_id: int, *, text: str | None = None,
             sent_at: datetime = CUTOFF,
-            sender=None, post_author: str | None = None):
+            sender=None, post_author: str | None = None, entities=None):
     return SimpleNamespace(
         id=message_id,
         peer_id=CHAT_ID,
@@ -32,7 +32,16 @@ def message(message_id: int, *, text: str | None = None,
         sender_id=7,
         sender=sender,
         post_author=post_author,
+        entities=entities,
     )
+
+
+class MessageEntityUrl(SimpleNamespace):
+    pass
+
+
+class MessageEntityTextUrl(SimpleNamespace):
+    pass
 
 
 class FakeUtils:
@@ -123,6 +132,63 @@ class GatewayUnderTest(TelethonGateway):
                 self.peers = peers
 
         return InputDialogPeer, GetPeerDialogsRequest
+
+
+class TestBugDigestMaterialLinks20260914(unittest.IsolatedAsyncioTestCase):
+    """235: прямые ссылки должны переживать суточное удаление сообщений TNN."""
+
+    async def test_fetch_keeps_visible_and_hidden_links_using_original_utf16_offsets(self):
+        url = "https://example.org/статья?q=1&x=2#раздел"
+        prefix = "  📰 Читать: "
+        text = prefix + url + " и подробности"
+        client = FakeClient([message(1, text=text, entities=[
+            MessageEntityUrl(offset=len(prefix.encode("utf-16-le")) // 2,
+                             length=len(url.encode("utf-16-le")) // 2),
+            MessageEntityTextUrl(offset=0, length=2, url="https://example.net/paper"),
+            MessageEntityTextUrl(offset=0, length=2, url=url),
+        ])], upper_id=1)
+        result = await GatewayUnderTest(client).fetch(
+            "session", PeerSpec("channel", 100123, 998877), CHAT_ID, 0, CUTOFF)
+        self.assertEqual(result.messages[0].material_urls,
+                         (url, "https://example.net/paper"))
+        self.assertEqual(result.messages[0].text, text.strip())
+        self.assertEqual(len(client.get_calls), 1)
+        self.assertEqual(len(client.iter_calls), 1)
+        self.assertEqual(client.raw_calls, [])
+
+    async def test_fetch_rejects_non_http_and_malformed_links(self):
+        bad = ["javascript:alert(1)", "tg://user?id=123", "file:///tmp/x",
+               "https://user:pass@example.org/", "https://example.org/\nspoof",
+               "https://example.org/\u202espoof", "https://", "https://[broken",
+               "https://example.org:wrong/"]
+        text = "example.org/paper"
+        client = FakeClient([message(1, text=text, entities=[
+            *[MessageEntityTextUrl(url=url) for url in bad],
+            MessageEntityUrl(offset=0, length=len(text)),
+            MessageEntityUrl(offset=-1, length=2),
+            MessageEntityUrl(offset=0, length=1000),
+        ])], upper_id=1)
+        result = await GatewayUnderTest(client).fetch(
+            "session", PeerSpec("channel", 100123, 998877), CHAT_ID, 0, CUTOFF)
+        self.assertEqual(result.messages[0].material_urls,
+                         ("https://example.org/paper",))
+
+    async def test_truncated_message_keeps_materials_and_counts_prompt_metadata(self):
+        url = "https://example.net/paper"
+        client = FakeClient([message(1, text="Статья " * 5000, entities=[
+            MessageEntityTextUrl(url=url),
+        ])], upper_id=1)
+        budget = prompt_size([]) + 1000
+        result = await GatewayUnderTest(client).fetch(
+            "session", PeerSpec("channel", 100123, 998877), CHAT_ID, 0, CUTOFF,
+            max_prompt_bytes=budget)
+        selected = result.messages[0]
+        self.assertTrue(selected.text.endswith("[обрезано]"))
+        self.assertEqual(selected.material_urls, (url,))
+        self.assertLessEqual(prompt_size(result.messages), budget)
+        rendered = render_digest_prompt([DigestChat("TNN", result.messages)])
+        self.assertIn('"material_count":1', rendered)
+        self.assertNotIn(url, rendered)
 
 
 class TestBugTelegramMessageLinks20260811(unittest.IsolatedAsyncioTestCase):

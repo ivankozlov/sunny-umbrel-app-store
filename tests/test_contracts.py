@@ -764,6 +764,92 @@ class TestBugDigestLinksProductionPath20260818(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(digest.llm_usage, usage)
 
 
+class TestBugDigestSenderCase20260914(unittest.IsolatedAsyncioTestCase):
+    """238: выпуск 04.09 сохранил Participant-N из-за заглавной P."""
+
+    async def test_names_are_restored_in_all_fields_and_stay_in_their_chat(self):
+        chats = [
+            DigestChat("Первый", [SelectedMessage(41, 7, NOW, "Текст", "Алиса")]),
+            DigestChat("Второй", [SelectedMessage(42, 8, NOW, "Текст", "Боб")]),
+        ]
+        answer = {"chats": [{"chat": chat.title, "topics": [{
+            "title": "Participant-1: решение",
+            "summary": "PARTICIPANT-1 предложил, participant-1 поддержал",
+            "refs": [],
+        }], "links": [{"title": "Participant-1", "note": "PARTICIPANT-1", "ref": 1}]}
+            for chat in chats]}
+        worker = FakeAnsweringWorker(answer)
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   return_value=worker):
+            digest = await create_digest(chats, "anthropic/example", "test-key",
+                                         asyncio.Event())
+        first, second = digest.split("**Второй**")
+        self.assertEqual(first.count("Алиса"), 5)
+        self.assertEqual(second.count("Боб"), 5)
+        self.assertNotIn("Боб", first)
+        self.assertNotIn("Алиса", second)
+        self.assertNotIn("participant-", digest.lower())
+
+    def test_unknown_ambiguous_and_partial_aliases_are_not_guessed(self):
+        from sunny_digest.openrouter import _restore_sender_names
+        names = {"participant-1": "Алиса"}
+        text = "Participant-10 Participant-99 xParticipant-1 Participant-1-x"
+        self.assertEqual(_restore_sender_names(text, names), text)
+        self.assertEqual(_restore_sender_names("Participant-1", {}), "Participant-1")
+
+
+class TestBugDigestMaterialLinksProductionPath20260914(unittest.IsolatedAsyncioTestCase):
+    """235: родитель подставляет исходные URL после ответа killable worker."""
+
+    async def test_materials_survive_worker_boundary_in_topics_and_links(self):
+        chats = [
+            DigestChat("Первый", [SelectedMessage(90, 7, NOW, "Привет")]),
+            DigestChat("TNN", [SelectedMessage(
+                91, 8, NOW, "Обсудили статью и исследование", "Алиса",
+                ("https://example.org/article?x=1&y=2", "https://example.net/paper"),
+            )], "https://t.me/c/9876543210"),
+        ]
+        answer = {"chats": [{"chat": "TNN", "topics": [{
+            "title": "Исследование", "summary": "participant-1 поделилась статьёй",
+            "refs": [2, 2, True, 999],
+        }], "links": [{"title": "Статья", "note": "Разбор", "ref": "2"}]}]}
+        worker = FakeAnsweringWorker(answer)
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   return_value=worker):
+            digest = await create_digest(chats, "anthropic/example", "test-key",
+                                         asyncio.Event())
+        topic, materials = digest.split("📎 Ссылки и материалы")
+        for section in (topic, materials):
+            for url in chats[1].messages[0].material_urls:
+                self.assertEqual(section.count(url), 1)
+                self.assertLess(section.index(url), section.index("https://t.me/"))
+            self.assertEqual(section.count("https://t.me/c/9876543210/91"), 1)
+        self.assertIn("Алиса", digest)
+        request = json.loads(worker.stdin.data)
+        for local_only in (*chats[1].messages[0].material_urls, "9876543210", "Алиса"):
+            self.assertNotIn(local_only, request["prompt"])
+        self.assertIn('"material_count":2', request["prompt"])
+
+    async def test_material_without_telegram_permalink_and_invalid_refs(self):
+        url = "https://example.org/paper"
+        chats = [DigestChat("TNN", [SelectedMessage(
+            91, 8, NOW, "Исследование", material_urls=(url,))])]
+        answer = {"chats": [{"chat": "TNN", "topics": [], "links": [
+            {"title": "Материал", "ref": 1},
+            {"title": "Ошибочный номер", "ref": True},
+            {"title": "Выдуманный номер", "ref": 999,
+             "url": "https://invented.example/paper"},
+        ]}]}
+        worker = FakeAnsweringWorker(answer)
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   return_value=worker):
+            digest = await create_digest(chats, "anthropic/example", "test-key",
+                                         asyncio.Event())
+        self.assertEqual(digest.count(url), 1)
+        self.assertNotIn("https://invented.example", digest)
+        self.assertNotIn("https://t.me/", digest)
+
+
 class TestBugPromptBudgetCountsNumber20260818(unittest.TestCase):
     """Бюджет отбора обязан учитывать поле `n`.
 

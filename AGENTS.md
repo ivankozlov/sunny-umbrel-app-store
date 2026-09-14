@@ -158,6 +158,9 @@ content, receiver keys, or rendered runtime configuration.
   killable worker receive per-chat `participant-N` aliases. The parent restores a
   name only for an unambiguous known alias in that chat; unknown or ambiguous aliases
   remain pseudonymous in the delivered digest.
+  Match aliases case-insensitively, with exact token boundaries: task 238 found
+  13 capitalized `Participant-N` tokens in the 2026-09-04 issue which the lowercase
+  regex did not replace. Never infer an unknown alias or reuse another chat's map.
 - Accepted monitor and digest sequence/hash/cursor state is checkpointed locally
   before pending bytes are deleted. Receiver rollback or chain jumps must fail
   before Telegram access: the monitor chain is verified on every tick, before the
@@ -264,6 +267,15 @@ content, receiver keys, or rendered runtime configuration.
   count the `n` field: the gateway sizes one chat at a time while the assembled
   prompt is numbered across all of them, and bytes missing from the estimate
   overflow the bound after selection, failing the whole day.
+- Task 235 (`0.2.14` candidate): keep direct HTTP(S) material URLs
+  from `MessageEntityUrl` and `MessageEntityTextUrl` in the parent-only
+  `SelectedMessage.material_urls`. Decode visible URL offsets against the ORIGINAL
+  UTF-16 message, before stripping whitespace. The prompt gets only `material_count`
+  in addition to the existing text; the parent inserts source URLs before the
+  Telegram permalink for each selected reference. Hidden URL targets must not be
+  added to the worker request. TNN deletes messages after 24 hours, so a Telegram
+  permalink alone loses access to the material. This adds no Telegram requests;
+  links already deleted before the daily fetch cannot be recovered.
 - Every chat returning empty lists is an answer, not a failure — the prompt
   explicitly allows "nothing notable today", and the issue then says so in one
   line. An empty `chats` array is a failure: the model walked no chat at all.

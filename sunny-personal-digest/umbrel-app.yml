@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Chats
-version: "0.2.13"
+version: "0.2.14"
 tagline: One daily digest and morning read receipts for selected chats
 description: >-
   Resolves message links for only the explicitly selected Telegram groups.
@@ -20,11 +20,11 @@ description: >-
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  Switches to a daily mode so the account no longer appears online around the
-  clock: Telegram is contacted only in the 08:00–09:45 Moscow-time window for
-  the digest and one read receipt per day, and the receiver connection is
-  checked every 5 minutes. Mentions are no longer collected or forwarded, and
-  read receipts keep mention badges. The collector wire protocol remains 0.2.1.
+  Keeps direct links to articles and other materials in digests, including
+  links hidden behind text, so they remain accessible after the source chat
+  deletes its messages. Restores known sender names when the model writes
+  Participant-N with a capital letter. The daily schedule, mention badges,
+  and collector wire protocol 0.2.1 are unchanged.
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store
 dependencies: []

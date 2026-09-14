@@ -197,7 +197,7 @@ def _truncate_first_to_budget(message: SelectedMessage,
         candidate_text = message.text[:middle].rstrip() + suffix
         candidate = SelectedMessage(
             message.message_id, message.sender_id, message.sent_at,
-            candidate_text, message.sender_name)
+            candidate_text, message.sender_name, message.material_urls)
         if prompt_size([candidate], chat_title) <= max_prompt_bytes:
             best = candidate_text
             low = middle + 1
@@ -207,7 +207,50 @@ def _truncate_first_to_budget(message: SelectedMessage,
         raise ValueError("one Telegram message cannot fit the prompt budget")
     return SelectedMessage(
         message.message_id, message.sender_id, message.sent_at, best,
-        message.sender_name)
+        message.sender_name, message.material_urls)
+
+
+def _message_material_urls(message: Any) -> Tuple[str, ...]:
+    """Прямые HTTP(S)-ссылки из уже полученного сообщения, без запросов.
+
+    TNN удаляет сообщения через сутки (задача 235): ссылка на сообщение
+    перестаёт открываться. URL берём из entities, включая скрытые под текстом;
+    offset/length Telegram считает в UTF-16 ДО strip, а не в символах Python.
+    """
+    raw = str(message.message or "").encode("utf-16-le")
+    urls: List[str] = []
+    for entity in getattr(message, "entities", None) or ():
+        kind = type(entity).__name__
+        if kind == "MessageEntityTextUrl":
+            url = entity.url
+        elif kind == "MessageEntityUrl":
+            offset, length = entity.offset, entity.length
+            if offset < 0 or length <= 0 or (offset + length) * 2 > len(raw):
+                continue
+            try:
+                url = raw[offset * 2:(offset + length) * 2].decode("utf-16-le")
+            except UnicodeDecodeError:
+                continue
+            # Telegram распознаёт и ссылки без схемы: example.org/article.
+            if "://" not in url:
+                url = "https://" + url
+        else:
+            continue
+        if (not isinstance(url, str) or not url
+                or any(char.isspace() or unicodedata.category(char) in
+                       ("Cc", "Cf", "Cs") for char in url)):
+            continue
+        try:
+            parsed = urlsplit(url)
+            if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                    or parsed.username is not None or parsed.password is not None):
+                continue
+            parsed.port  # Невалидный порт — не рабочая ссылка на материал.
+        except ValueError:
+            continue
+        if url not in urls:
+            urls.append(url)
+    return tuple(urls)
 
 
 def _clean_text(value: Any, *, max_utf16_units: Optional[int] = None) -> str:
@@ -768,6 +811,7 @@ class TelethonGateway:
                     sender_name=(
                         sender_name if sender_name != UNKNOWN_SENDER else None
                     ),
+                    material_urls=_message_material_urls(message),
                 )
                 if prompt_size(selected + [candidate], chat_title) > max_prompt_bytes:
                     if selected:

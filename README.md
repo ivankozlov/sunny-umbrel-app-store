@@ -45,7 +45,7 @@ Both server steps must precede `0.2.13`: the app takes its window from the gate.
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.13` have public multi-arch images.
 **Update** and uninstall/reinstall therefore have a public source again. The device now
-runs public `0.2.11`; its update from `0.2.9` to `0.2.10` exercised the real recreate/pull path and
+runs public `0.2.13`; its update from `0.2.9` to `0.2.10` exercised the real recreate/pull path and
 preserved state. Docker image pruning remains out of bounds without a separate destructive
 approval and a concrete need, and a future distribution closure could remove the public
 source again. The `umbrel/` subtree of private source
@@ -54,6 +54,13 @@ Phase-A candidate; the enabling commit lives only in the Store repository.
 
 ## Product contract
 
+- `0.2.14` candidate (tasks 235/238): referenced materials retain their direct
+  HTTP(S) URLs, including links hidden behind text, before the Telegram permalink.
+  This also works in TNN, where messages disappear after 24 hours. The existing
+  daily fetch supplies the links; there is no extra polling or local raw-message
+  archive. Messages already deleted before that fetch cannot be recovered.
+  Known sender aliases are restored regardless of capitalization (`Participant-N`
+  as well as `participant-N`); unknown or ambiguous aliases still remain pseudonymous.
 - Setup accepts one Telegram message link from each of 1–16 groups, resolves the
   exact accessible peers once, and shows their titles for immutable confirmation.
   A forum-message link selects the whole chat; individual topics are not selected.
