@@ -35,8 +35,10 @@ restoration and forum-topic read acknowledgements for the added chat still need
 observation; the native-mention smoke test never happened and was dropped together with
 mentions on 2026-09-13. The collector has been stopped since 2026-09-11. The daily-mode
 `0.2.13` was released on 2026-09-14, after the DO receiver with the new window and the
-Sunny `chats` skill; the device Update is owner-operated, and its first morning has not
-been observed yet. Each step was separately approved.
+Sunny `chats` skill, and the owner updated the device the same night. Its first morning
+(2026-09-14) took three failed ticks on the address stale after the nightly rotation, then
+re-resolved itself and delivered digest sequence 20 at 08:34 Moscow time. Each step was
+separately approved.
 Both server steps must precede `0.2.13`: the app takes its window from the gate. Wire
 `COLLECTOR_VERSION` remains `0.2.1`.
 
