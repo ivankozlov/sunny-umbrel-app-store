@@ -33,15 +33,15 @@ parts without error. The first `0.2.11` daily was accepted on 2026-08-26 in two 
 and visibly reported the old-tail skip for the extended chat. Local sender-name
 restoration and forum-topic read acknowledgements for the added chat still need
 observation; the native-mention smoke test never happened and was dropped together with
-mentions on 2026-09-13. Public `0.2.12` is ready in the Store, but the owner has not yet
-confirmed a device update. The collector has been stopped since 2026-09-11. The daily-mode
-`0.2.13` is not published yet; its rollout order is DO receiver with the new window →
-Sunny `chats` skill → `0.2.13` release → device Update, each step separately approved.
+mentions on 2026-09-13. The collector has been stopped since 2026-09-11. The daily-mode
+`0.2.13` was released on 2026-09-14, after the DO receiver with the new window and the
+Sunny `chats` skill; the device Update is owner-operated, and its first morning has not
+been observed yet. Each step was separately approved.
 Both server steps must precede `0.2.13`: the app takes its window from the gate. Wire
 `COLLECTOR_VERSION` remains `0.2.1`.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
-restored on 2026-08-17; `0.2.6` through `0.2.12` have public multi-arch images.
+restored on 2026-08-17; `0.2.6` through `0.2.13` have public multi-arch images.
 **Update** and uninstall/reinstall therefore have a public source again. The device now
 runs public `0.2.11`; its update from `0.2.9` to `0.2.10` exercised the real recreate/pull path and
 preserved state. Docker image pruning remains out of bounds without a separate destructive
@@ -312,10 +312,10 @@ activation screens.
 Anonymous umbrelOS install/update requires both a public Store repository and a
 public `ghcr.io/ivankozlov/sunny-personal-digest` image. Both surfaces were closed on
 2026-08-14 and reopened on 2026-08-17 by an explicit owner decision; `v0.2.6`
-through `v0.2.12` were published and enabled from there. Reopening stays an
+through `v0.2.13` were published and enabled from there. Reopening stays an
 explicit, per-release decision — never republish silently.
 
-Every release follows this exact sequence, as `0.2.5` did and `0.2.6`–`0.2.12` did
+Every release follows this exact sequence, as `0.2.5` did and `0.2.6`–`0.2.13` did
 after it: disabled source first, the protected `Publish image` workflow with
 `bootstrap_empty_package=false`, independent public OCI verification for
 `linux/amd64` and `linux/arm64`, and only then the exact digest pin plus
@@ -380,8 +380,8 @@ in three parts without errors. The physical device was then updated from `0.2.9`
 `0.2.11` daily was accepted on 2026-08-26 in two parts and visibly reported the extended
 chat's skipped old tail. Public `0.2.12` adds sanitized numeric OpenRouter usage/cost to
 each non-empty daily artifact and is enabled in the Store, but the owner has not yet
-confirmed a device update. Observe the next daily issue after that update for the
-first usage-bearing artifact; there is deliberately no manual same-day backfill.
+confirmed a device update. Public `0.2.13` (daily mode) supersedes it; observe the first
+morning issue after the device update, which is also the first usage-bearing artifact; there is deliberately no manual same-day backfill.
 
 ## Incident response
 
