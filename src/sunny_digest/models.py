@@ -111,21 +111,3 @@ class DigestChat:
     # порядковые номера сообщений, а ссылки подставляются после ответа —
     # так стабильные Telegram-идентификаторы не покидают Umbrel.
     link_prefix: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class MentionEvent:
-    event_id: str
-    chat_id: int
-    message_id: int
-    sent_at: datetime
-    chat_title: str
-    sender: str
-    snippet: str
-    link: Optional[str]
-
-
-@dataclass(frozen=True)
-class MentionScanResult:
-    through_message_id: int
-    events: List[MentionEvent]

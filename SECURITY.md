@@ -46,11 +46,13 @@ is physically reaped. Factory reset cannot promise SSD forensic erasure or revok
 provider token; rotate that token after compromise.
 
 Daily selected-chat text is memory-only. OpenRouter receives chat-local
-`participant-N` labels instead of stable Telegram sender/message IDs. Native
-mentions are the narrow exception: a durable event may contain a sanitized snippet
-of at most 300 UTF-16 units, chat title, sender display name and message link. It is
-persisted byte-for-byte until the receiver acknowledges it and is then retained by
-Sunny's normal outbox/Telegram delivery path. Media is never downloaded and sender
+`participant-N` labels instead of stable Telegram sender/message IDs. Until
+2026-09-13 native mentions were the narrow exception: a durable event could contain a
+sanitized snippet of at most 300 UTF-16 units, chat title, sender display name and
+message link, persisted byte-for-byte until the receiver acknowledged it and then
+retained by Sunny's normal outbox/Telegram delivery path. Since `0.2.13` mentions are
+neither collected nor forwarded; an undelivered pending mention left by `0.2.12` is
+discarded without upload. Media is never downloaded and sender
 IDs are not exported. Pending digest and mention payloads are excluded from Umbrel
 backups together with their atomic temporary files. Local acknowledged checkpoints
 contain only metadata and prevent a rolled-back receiver from causing old messages
@@ -71,9 +73,17 @@ its history. A separate explicit activation first durably records the current ex
 heads and only then clears pre-existing unread state, without exporting historical
 mentions. The first authenticated daily `due=true` gate
 independently derives each 72-hour lower boundary from receiver `server_time`, and
-rows older than that timestamp are discarded before OpenRouter. Thereafter a
-mention-bearing range is marked read only after its bounded event has a durable
-receiver receipt; no-mention ranges are checkpointed locally before read-ACK.
+rows older than that timestamp are discarded before OpenRouter. Until 2026-09-13 a
+mention-bearing range was then marked read only after its bounded event had a durable
+receiver receipt, while a no-mention range was checkpointed locally before read-ACK.
+Since `0.2.13` background work contacts Telegram only for monitor-chain service work and
+in the receiver-announced 08:00–09:45 Moscow-time window: the daily digest (retried on
+every tick of the window until the receiver accepts it), then a read acknowledgement up
+to each chat's latest message, checkpointed locally before read-ACK, sent with
+`clear_mentions=False`, and limited to three answered attempts and nine ticks per day. The automatic VPN
+re-resolve follows from those: its authorization probe runs only after three ticks in
+which Telegram did not answer, at most once per 30 minutes. Explicit UI actions (setup,
+a new chat link, VPN replacement, logout on reset) contact Telegram on their own.
 
 ## Incident response
 

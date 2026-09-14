@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import sunny_digest.ipc as ipc_module
 from sunny_digest.ipc import _handle, dispatch
 from sunny_digest.web import (
     IPC_CONNECT_TIMEOUT_S,
@@ -193,6 +196,73 @@ class IPCTests(unittest.TestCase):
         self.assertEqual(
             response, {"ok": False, "error_type": "RuntimeError"})
         self.assertNotIn(b"secret-provider-detail", writer.raw)
+
+
+class _StopScheduler(Exception):
+    pass
+
+
+class _TickingCollector:
+    def __init__(self):
+        self.runs = 0
+        self.closed = False
+
+    async def run_once(self):
+        self.runs += 1
+
+    async def close(self):
+        self.closed = True
+
+
+class TestBugOnlinePresenceTick20260913(unittest.IsolatedAsyncioTestCase):
+    """Такт планировщика — пять минут, и окружение его больше не меняет.
+
+    13.09.2026: пока collector тикал раз в минуту, контакты владельца постоянно
+    видели его «в сети», а с выключенным приложением — нет. Тик теперь только
+    сверяется с приёмником, а редкий такт вдобавок убирает поминутный SSH.
+    Переменная SUNNY_COLLECT_INTERVAL_S в старом compose осталась бы
+    незаметным способом вернуть минутный такт — поэтому она игнорируется."""
+
+    async def test_scheduler_starts_after_five_seconds_then_ticks_every_five_minutes(self):
+        collector = _TickingCollector()
+        delays = []
+
+        async def fake_sleep(delay):
+            delays.append(delay)
+            if len(delays) == 3:
+                raise _StopScheduler
+
+        with patch.dict(os.environ, {"SUNNY_COLLECT_INTERVAL_S": "60"}), \
+                patch.object(ipc_module.asyncio, "sleep", fake_sleep):
+            with self.assertRaises(_StopScheduler):
+                await ipc_module._scheduler(collector)
+
+        self.assertEqual(delays, [5, 300, 300])
+        self.assertEqual(collector.runs, 2)
+
+    async def test_serve_ignores_the_legacy_interval_variable(self):
+        collector = _TickingCollector()
+        started = asyncio.Event()
+        calls = []
+
+        async def recording_scheduler(*args, **kwargs):
+            calls.append((args, kwargs))
+            started.set()
+            await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as directory:
+            paths = SimpleNamespace(ipc_socket=Path(directory) / "c.sock")
+            with patch.dict(os.environ, {"SUNNY_COLLECT_INTERVAL_S": "60"}), \
+                    patch.object(ipc_module, "Collector", lambda _paths: collector), \
+                    patch.object(ipc_module, "_scheduler", recording_scheduler):
+                server = asyncio.create_task(ipc_module.serve(paths))
+                await asyncio.wait_for(started.wait(), timeout=2)
+                server.cancel()
+                await asyncio.gather(server, return_exceptions=True)
+
+        self.assertEqual(calls, [((collector,), {})])
+        self.assertTrue(collector.closed)
+        self.assertEqual(ipc_module.SCHEDULER_TICK_S, 300)
 
 
 if __name__ == "__main__":

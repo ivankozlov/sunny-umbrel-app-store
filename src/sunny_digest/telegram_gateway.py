@@ -4,7 +4,6 @@ import asyncio
 import time
 import base64
 import binascii
-import hashlib
 import re
 import unicodedata
 from datetime import datetime, timezone
@@ -14,16 +13,12 @@ from urllib.parse import urlsplit
 from .models import (
     DialogCandidate,
     FetchResult,
-    MentionEvent,
-    MentionScanResult,
     PeerSpec,
     SelectedMessage,
 )
 from .prompting import prompt_size
 from .version import (
     APP_VERSION,
-    MAX_MENTION_EVENTS,
-    MAX_MENTION_SNIPPET_UTF16,
     MAX_PROMPT_BYTES,
     MAX_SCAN_MESSAGES,
 )
@@ -497,145 +492,55 @@ class TelethonGateway:
         finally:
             await client.disconnect()
 
-    async def _scan_mentions_connected(
-            self, client: Any, utils: Any, peer: PeerSpec, expected_chat_id: int,
-            chat_title: str, source_id: str, from_message_id_exclusive: int,
-            frozen_through_message_id: int) -> MentionScanResult:
-        if expected_chat_id != peer.telegram_chat_id():
-            raise ValueError("expected chat_id does not match peer")
-        if (type(from_message_id_exclusive) is not int
-                or type(frozen_through_message_id) is not int
-                or from_message_id_exclusive < 0
-                or frozen_through_message_id < from_message_id_exclusive):
-            raise ValueError("Telegram mention scan range is invalid")
-        if not isinstance(source_id, str) or not source_id:
-            raise ValueError("source_id is invalid")
-        clean_title = _clean_text(chat_title, max_utf16_units=160) or "Unnamed chat"
-        if frozen_through_message_id == from_message_id_exclusive:
-            return MentionScanResult(from_message_id_exclusive, [])
-        through = from_message_id_exclusive
-        events: List[MentionEvent] = []
-        viewed = 0
-        stopped_at_mention_cap = False
-        async for message in client.iter_messages(
-                self._input_peer(peer), min_id=from_message_id_exclusive,
-                max_id=frozen_through_message_id + 1, reverse=True,
-                limit=MAX_SCAN_MESSAGES):
-            viewed += 1
-            message_id = int(message.id)
-            if not through < message_id <= frozen_through_message_id:
-                raise RuntimeError("Telegram mention scan returned an invalid message order")
-            actual_chat_id = int(utils.get_peer_id(message.peer_id))
-            if actual_chat_id != expected_chat_id:
-                raise RuntimeError("Telegram returned a message from an unexpected peer")
-            if bool(getattr(message, "mentioned", False)):
-                if len(events) >= MAX_MENTION_EVENTS:
-                    stopped_at_mention_cap = True
-                    break
-                sent_at = message.date
-                if sent_at.tzinfo is None:
-                    sent_at = sent_at.replace(tzinfo=timezone.utc)
-                sent_at = sent_at.astimezone(timezone.utc)
-                event_id = hashlib.sha256(
-                    f"{source_id}:{expected_chat_id}:{message_id}".encode("utf-8")
-                ).hexdigest()
-                link = (
-                    f"https://t.me/c/{peer.peer_id}/{message_id}"
-                    if peer.kind == "channel" else None
-                )
-                events.append(MentionEvent(
-                    event_id=event_id,
-                    chat_id=expected_chat_id,
-                    message_id=message_id,
-                    sent_at=sent_at,
-                    chat_title=clean_title,
-                    sender=_sender_display(message),
-                    snippet=_clean_text(
-                        getattr(message, "message", None),
-                        max_utf16_units=MAX_MENTION_SNIPPET_UTF16,
-                    ),
-                    link=link,
-                ))
-            through = message_id
+    async def snapshot_peer_tops(
+            self, session_text: str,
+            selected_peers: Sequence[Tuple[int, PeerSpec]],
+    ) -> Tuple[Dict[int, int], List[int]]:
+        """Вершины точных peer для утренней пометки прочитанным.
 
-        if (not stopped_at_mention_cap
-                and (viewed < MAX_SCAN_MESSAGES
-                     or through == frozen_through_message_id)):
-            through = frozen_through_message_id
-        return MentionScanResult(through, events)
-
-    async def scan_mentions(
-            self, session_text: str, peer: PeerSpec, expected_chat_id: int,
-            chat_title: str, source_id: str, from_message_id_exclusive: int,
-            frozen_through_message_id: int) -> MentionScanResult:
-        """Scan one exact frozen ID window using Telegram's native mention flag."""
-        _, utils, _, _, _, _, _ = self._modules()
-        client = self._client(session_text)
-        await client.connect()
-        try:
-            if not await client.is_user_authorized():
-                raise RuntimeError("Telegram session is not authorized")
-            return await self._scan_mentions_connected(
-                client, utils, peer, expected_chat_id, chat_title, source_id,
-                from_message_id_exclusive, frozen_through_message_id,
-            )
-        finally:
-            await client.disconnect()
-
-    async def snapshot_and_scan_mentions(
-            self, session_text: str, source_id: str,
-            selected: Sequence[Tuple[int, PeerSpec, str, int]],
-    ) -> Tuple[Dict[int, int], Dict[int, MentionScanResult], List[int]]:
-        """Snapshot and scan every exact peer in one authenticated connection."""
-        pairs = [(chat_id, peer) for chat_id, peer, _, _ in selected]
-        self._validate_selected_peers(pairs)
+        Тот же `GetPeerDialogs`, что и у `snapshot_tops`: без листинга
+        диалогов и без чтения истории, из ответа берётся только
+        `top_message`. Отличие — изоляция: каждый peer запрашивается отдельно
+        в общем соединении, с тем же 30-секундным дедлайном и не больше
+        четырёх одновременно. Один протухший access_hash или зависший RPC
+        (инцидент 2026-08-14) не должен оставить непрочитанными все чаты
+        сразу, а общий запрос на весь набор падает целиком."""
+        self._validate_selected_peers(selected_peers)
         _, utils, _, _, _, _, _ = self._modules()
         client = self._client(session_text)
         try:
             await client.connect()
             if not await client.is_user_authorized():
                 raise RuntimeError("Telegram session is not authorized")
-            tops: Dict[int, int] = {}
-            scans: Dict[int, MentionScanResult] = {}
-            failed: List[int] = []
             semaphore = asyncio.Semaphore(PEER_OPERATION_CONCURRENCY)
 
-            async def scan_one(
-                    chat_id: int, peer: PeerSpec, title: str, start: int,
-            ) -> Tuple[int, Optional[int], Optional[MentionScanResult], bool]:
+            async def snapshot_one(
+                    chat_id: int, peer: PeerSpec) -> Tuple[int, Optional[int]]:
                 async with semaphore:
                     try:
-                        async def peer_operation() -> Tuple[int, MentionScanResult]:
-                            top = (await self._snapshot_tops_connected(
-                                client, [(chat_id, peer)], utils))[chat_id]
-                            scan = await self._scan_mentions_connected(
-                                client, utils, peer, chat_id, title, source_id,
-                                start, top,
-                            )
-                            return top, scan
-
-                        top, scan = await asyncio.wait_for(
-                            peer_operation(), timeout=PEER_OPERATION_TIMEOUT_S,
+                        tops = await asyncio.wait_for(
+                            self._snapshot_tops_connected(
+                                client, [(chat_id, peer)], utils),
+                            timeout=PEER_OPERATION_TIMEOUT_S,
                         )
-                        return chat_id, top, scan, True
+                        return chat_id, tops[chat_id]
                     except Exception:
-                        # Peer-local failures are intentionally redacted. One
-                        # stale access_hash or hanging RPC must not starve the
-                        # other locked chats.
-                        return chat_id, None, None, False
+                        # Отказ peer намеренно обезличен: текст ошибки
+                        # Telegram наружу не идёт.
+                        return chat_id, None
 
             tasks = [
-                asyncio.create_task(scan_one(chat_id, peer, title, start))
-                for chat_id, peer, title, start in selected
+                asyncio.create_task(snapshot_one(chat_id, peer))
+                for chat_id, peer in selected_peers
             ]
-            for chat_id, top, scan, succeeded in await _gather_peer_tasks(tasks):
-                if succeeded:
-                    assert top is not None and scan is not None
-                    tops[chat_id] = top
-                    scans[chat_id] = scan
-                else:
+            tops: Dict[int, int] = {}
+            failed: List[int] = []
+            for chat_id, top in await _gather_peer_tasks(tasks):
+                if top is None:
                     failed.append(chat_id)
-            return tops, scans, failed
+                else:
+                    tops[chat_id] = top
+            return tops, failed
         finally:
             await _disconnect_client(client)
 
@@ -724,10 +629,16 @@ class TelethonGateway:
                     # лимит вызывающего.
                     deadline = self.monotonic() + PEER_OPERATION_TIMEOUT_S
                     try:
+                        # clear_mentions=False — решение Ивана 13.09.2026:
+                        # упоминания больше не доставляются в Sunny, поэтому
+                        # «@» в группе остаётся гореть, пока он сам не откроет
+                        # чат. Снимать его здесь значило бы молча прятать
+                        # упоминание, о котором он больше нигде не узнает.
+                        # Правило одно для всех путей, включая baseline-активацию.
                         await asyncio.wait_for(
                             client.send_read_acknowledge(
                                 self._input_peer(peer), max_id=through_message_id,
-                                clear_mentions=True,
+                                clear_mentions=False,
                             ),
                             timeout=PEER_OPERATION_TIMEOUT_S,
                         )

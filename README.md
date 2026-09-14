@@ -3,9 +3,18 @@
 Umbrel package for a narrowly scoped Telegram user-session client. It was released
 through a Community App Store; public distribution was withdrawn on 2026-08-14 and
 restored on 2026-08-17.
-It watches 1–16 immutable groups/supergroups, clears read state about once a
-minute, forwards bounded native-mention events to Sunny, and creates one combined
-daily digest through OpenRouter.
+It is bound to 1–16 immutable groups/supergroups and, since `0.2.13` (2026-09-13),
+runs in a daily mode: every 5 minutes it only checks the receiver connection, and it
+touches Telegram only in the 08:00–09:45 Moscow-time window announced by the receiver,
+where it creates one combined daily digest through OpenRouter and then marks those groups
+read up to their latest message once. Mentions are no longer collected or forwarded.
+
+Up to `0.2.12` the collector cleared read state about once a minute and forwarded bounded
+native-mention events to Sunny, with the daily digest accepted at 03:00–04:45 in the
+owner's timezone. That minute tick kept the owner's account visibly "online" around the
+clock, and the status disappeared while the collector was stopped (2026-09-13). Which
+request produces the online status was not established, so the owner chose a short
+morning window and dropped mentions.
 
 > **Release gate:** install only a commit whose manifest has `disabled: false`
 > and whose two Compose services pin the same real immutable multi-architecture
@@ -22,10 +31,14 @@ survived the updates and the first chat-set extension. The first nightly issue a
 extension was accepted on 2026-08-21 with all eight chat ranges and delivered in three
 parts without error. The first `0.2.11` daily was accepted on 2026-08-26 in two parts
 and visibly reported the old-tail skip for the extended chat. Local sender-name
-restoration, forum-topic read acknowledgements for the added chat, and a real
-native-mention event still need observation. Public `0.2.12` is ready in the Store,
-but the owner has not yet updated the physical device. Wire `COLLECTOR_VERSION` remains
-`0.2.1`.
+restoration and forum-topic read acknowledgements for the added chat still need
+observation; the native-mention smoke test never happened and was dropped together with
+mentions on 2026-09-13. Public `0.2.12` is ready in the Store, but the owner has not yet
+confirmed a device update. The collector has been stopped since 2026-09-11. The daily-mode
+`0.2.13` is not published yet; its rollout order is DO receiver with the new window →
+Sunny `chats` skill → `0.2.13` release → device Update, each step separately approved.
+Both server steps must precede `0.2.13`: the app takes its window from the gate. Wire
+`COLLECTOR_VERSION` remains `0.2.1`.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.12` have public multi-arch images.
@@ -53,15 +66,36 @@ Phase-A candidate; the enabling commit lives only in the Store repository.
 - First activation captures a frozen head for every exact peer, durably uploads
   a baseline with no mention events, and only after its receiver receipt marks
   existing unread messages through those heads as read. Historical mentions are
-  never forwarded.
-- Subsequent scans run about every 60 seconds. Native `message.mentioned` events
-  are detected locally without an LLM and contain only chat title, display sender,
-  timestamp, message ID, up to 300 UTF-16 units of text, and an exact link when
-  Telegram provides one.
-- A mention-bearing range is marked read only after a durable DO receipt. If Sunny
-  is unavailable, unread may remain temporarily. Scans use an ID cursor, so a new
-  post-activation mention is still forwarded if another Telegram client read it
-  before the next poll.
+  never forwarded. Activation, a chat-set extension, and a pending monitor artifact are
+  monitor-chain service work and run on the next tick, outside the morning window.
+- Every read acknowledgement, including the activation baseline, uses
+  `clear_mentions=False`: mentions are no longer delivered to Sunny, so the "@" badge
+  stays lit until the owner opens the chat.
+- Since `0.2.13` a tick runs every 5 minutes (fixed in code; `SUNNY_COLLECT_INTERVAL_S`
+  is gone). Outside the window a tick only takes the authenticated receiver gate and
+  reports `idle`. Inside the window — judged by the receiver's authenticated
+  `server_time`, never the Umbrel clock — it first runs the digest and then, once per
+  day, marks every chat read up to its latest message. Chat tops come from exact
+  per-peer `GetPeerDialogs` requests without listing dialogs or reading text; the local
+  cursor only moves forward and is persisted before the read acknowledgement. The two
+  streams are independent: a failed digest does not cancel the read pass, and vice versa.
+  A failed digest is retried on every tick of the window until the receiver accepts it.
+  The read pass closes the day at once when every chat is confirmed; a partial or failed
+  pass is retried in the same window, at most three attempts per day (only ticks where
+  Telegram answered something count) and at most nine read-pass ticks in total, after which the day
+  closes with its last outcome. The "done" mark and the attempt count live in memory, so
+  a restart inside the window grants a fresh set of attempts. A chat still awaiting its
+  extension baseline is skipped by the morning pass and counts as unconfirmed.
+- Until 2026-09-13 scans ran about every 60 seconds and native `message.mentioned` events
+  were detected locally without an LLM, carrying only chat title, display sender,
+  timestamp, message ID, up to 300 UTF-16 units of text, and an exact link when Telegram
+  provided one; a mention-bearing range was marked read only after a durable DO receipt,
+  so unread could remain temporarily while Sunny was unavailable. Scans used an ID
+  cursor, so a new post-activation mention was still forwarded if another Telegram
+  client had read it before the next poll.
+  `0.2.13` removed the scan but keeps the `mentions` wire contracts so a rollback to
+  `0.2.12` stays possible. An undelivered pending `mentions` artifact left by `0.2.12` is
+  discarded without upload; one the receiver already accepted is only applied locally.
 - One daily OpenRouter call produces one combined Russian digest for all selected
   chats. OpenRouter and the killable worker see only per-chat `participant-N` aliases;
   the parent keeps sanitized display names in memory and locally restores only an
@@ -69,9 +103,11 @@ Phase-A candidate; the enabling commit lives only in the Store repository.
   pseudonymous. The accepted digest carries only numeric OpenRouter usage/cost fields
   into Sunny's LLM ledger; provider response data and request IDs are not forwarded.
   The monitor and digest hash/cursor chains are independent, so an LLM or daily failure
-  cannot stop frequent read handling. The receiver accepts a daily
-  only from 03:00 through 04:45 in the configured IANA timezone; there is no
-  same-day catch-up after that window.
+  cannot stop read handling or monitor service work. The receiver accepts a daily
+  only from 08:00 through 09:45 inclusive in the fixed `Europe/Moscow` timezone (until
+  2026-09-13: 03:00–04:45 in the owner's current IANA timezone); there is no same-day
+  catch-up after that window. Sunny's `missing_daily_digest` fires after 09:45 Moscow time
+  and is now the only alert for a dead Telegram route.
 
 ## Security model
 
@@ -103,15 +139,18 @@ specific chats. Containment is enforced locally and fails closed:
 - locked settings store exact `InputPeer` values. Runtime never calls generic
   entity resolution, receives no push updates, and never downloads media;
 - every runtime tick first obtains authenticated `status-v2` from the forced-command
-  receiver. Without a valid gate there is no Telegram scan, read acknowledgement,
-  or OpenRouter request;
-- a watcher cycle shares one Telegram connection across every selected peer and
-  one connection for batched read acknowledgements. At most four whole peer operations
-  run concurrently, each has a 30-second deadline, result order remains deterministic,
-  and cancellation joins every sibling before disconnect;
-- only an aggregate `TimeoutError` from an already-active monitor may continue to the
-  independent digest path, and only after a fresh authenticated gate. Baseline,
-  receiver-chain, pending conflicts, and cancellation remain fail-closed;
+  receiver and verifies the monitor chain position. Without a valid gate there is no
+  Telegram access, read acknowledgement, or OpenRouter request; VPN, gateway, and
+  Telegram start only for monitor service work or the morning pass;
+- a morning pass shares one Telegram connection for the per-peer top snapshot (until
+  2026-09-13: for the mention scan) and one connection for batched read acknowledgements.
+  At most four whole peer operations run concurrently, each has a 30-second deadline,
+  result order remains deterministic, and cancellation joins every sibling before
+  disconnect;
+- only an aggregate `TimeoutError` from already-active monitor service work may continue
+  to the morning pass, and only after a fresh authenticated gate. Baseline,
+  receiver-chain breaks (`ReceiverChainError`), pending conflicts, revocation, and
+  cancellation remain fail-closed and abort the whole tick;
 - every daily run derives each chat's lower boundary from authenticated receiver
   `server_time`, not the Umbrel wall clock: 72 hours, stretched over the days missed
   since the last accepted issue. A chat's cursor is pulled up to that boundary and never
@@ -123,9 +162,12 @@ specific chats. Containment is enforced locally and fails closed:
 - raw daily chat text exists only in collector memory and the ZDR OpenRouter
   request. Every request sets `provider.zdr=true` and
   `provider.data_collection=deny`; Opus uses an explicit `max_tokens=32768` budget;
-- bounded mention events are an explicit privacy exception: they are durable on
-  Umbrel while pending, in DO receiver/inbox/backups, and in Sunny's Telegram
-  outbox. Locked runtime health/status never contains titles, snippets, digest
+- bounded mention events were an explicit privacy exception until 2026-09-13: they were
+  durable on Umbrel while pending, in DO receiver/inbox/backups, and in Sunny's Telegram
+  outbox. `0.2.13` creates none, and already accepted events stay where they are.
+  `CONSENT_SCOPE` still names them, because the stored scope is compared exactly; the
+  setup and renewal consent labels in `web.py` are separate UI strings that still mention
+  them too. Locked runtime health/status never contains titles, snippets, digest
   text, phone, credentials, or session data. During setup, the authenticated UI
   may show a masked phone number and resolved group titles for confirmation;
 - two independent sequence/hash/cursor chains reject rollback, gaps, equivocation,
@@ -150,7 +192,7 @@ web :8080 (second Basic Auth with APP_PASSWORD)
         ▼
 collector ── exact Telegram peers
     │      ├── loopback SOCKS → VLESS/REALITY → Telegram only
-    │      ├── OpenRouter ZDR (daily raw text only, direct)
+    │      ├── OpenRouter ZDR (daily raw text only, ssh forward via DO)
     │      └── SSH forced-command receiver (direct)
     │
     ├── /data/config   locked settings, checkpoints, pending final payloads
@@ -189,7 +231,8 @@ Telegram, acknowledge that action in the UI, and provision a fresh credential ep
    any required subscription download/DNS pinning, Mihomo startup, and SOCKS readiness finish before
    settings are committed and before any Telegram authorization call. Consent covers
    daily selected-chat text sent to ZDR OpenRouter, bounded native-mention events
-   sent to Sunny, and read acknowledgements visible on every Telegram client.
+   sent to Sunny (still named in the scope, though `0.2.13` sends none), and read
+   acknowledgements visible on every Telegram client.
 8. Finish Telegram login, paste one message link from each of 1–16 groups, then
    verify the resolved titles and lock the exact checkbox set within the same
    one-hour collector process. Do not submit two links from the same group.
@@ -221,8 +264,8 @@ repair cancels and reaps the probe, stops the candidate, and continues revocatio
 without restarting a route behind the reset boundary.
 
 On explicit activation, baseline upload precedes every read acknowledgement. If the
-daily gate is already due, the same runtime cycle may immediately scan up to the
-trusted 72-hour boundary and call OpenRouter.
+activation lands inside the morning window and the daily gate is already due, the same
+runtime cycle may immediately read up to the trusted 72-hour boundary and call OpenRouter.
 
 ## Local verification
 
@@ -310,12 +353,17 @@ seamless credential backup.
 Topic creation, public release, physical Umbrel installation, receiver `--apply`,
 Sunny deployment, and activation are separate externally visible or persistent
 actions. Each needs its own explicit approval. Activation intentionally clears the
-existing unread baseline and can trigger a due daily request immediately.
+existing unread baseline and, inside the morning window, can trigger a due daily request
+immediately.
 
-After activation, create one **new** real mention for the smoke test. Verify durable
+Until 2026-09-13 the post-activation smoke test was one **new** real mention: durable
 receiver receipt before read disappearance, delivery to the Sunny topic **Чаты**, no
 duplicate after retry, independent monitor/digest health, and then the first combined
-daily digest.
+daily digest. The mention part never ran and no longer applies. After a `0.2.13` update,
+verify instead: about 12 receiver sessions per hour and no Telegram access outside the
+window, the next digest accepted within 08:00–09:45 Moscow time, and a `read_acked`
+read-acknowledgement result in the UI. Whether the account stops appearing online outside
+the window can only be observed, not tested.
 
 Production has completed setup, receiver rotation, activation, and one chat-set
 extension, and now has eight peers. The first daily, while `0.2.3` was installed on
@@ -331,8 +379,8 @@ in three parts without errors. The physical device was then updated from `0.2.9`
 `0.2.11`; receiver activity continued and the durable state remained aligned. Its first
 `0.2.11` daily was accepted on 2026-08-26 in two parts and visibly reported the extended
 chat's skipped old tail. Public `0.2.12` adds sanitized numeric OpenRouter usage/cost to
-each non-empty daily artifact and is enabled in the Store, but remains pending an
-owner-operated device update. Observe the next nightly issue after that update for the
+each non-empty daily artifact and is enabled in the Store, but the owner has not yet
+confirmed a device update. Observe the next daily issue after that update for the
 first usage-bearing artifact; there is deliberately no manual same-day backfill.
 
 ## Incident response

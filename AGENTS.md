@@ -49,21 +49,38 @@ content, receiver keys, or rendered runtime configuration.
   leaves no shell and no other address. The forward is raised only for the
   request and torn down after; a dead tunnel fails the attempt rather than
   falling back, and keygen lives in the digest path so its failure cannot stop
-  mention monitoring.
+  the morning read pass or monitor service work (mention monitoring until 2026-09-13).
 - The provider rotates its node address on a schedule while the app pins an IP
   literal, so Telegram vanished silently until someone replaced the node by
   hand (13–16.08, again on 19.08). The subscription URL is bearer material and
   is deliberately never stored, so the recovery key is the node's host name,
   which is not a secret: it is written next to the active node, under the same
   lock, and wiped by factory reset together with the stall counter and the
-  cooldown. The detector counts a tick as stalled whenever the receiver gate —
+  cooldown. The detector counts a tick as stalled when the receiver gate —
   which reaches the droplet outside the VPN — answered but Telegram did not, in
-  any of its forms: the aggregate monitor timeout, a normal return where every
-  chat failed on its own timeout, or any exception raised after the gate. Only
-  the first form is a hang; a stale address reassigned to another tenant
-  answers with RST, so watching for timeouts alone would miss the very failure
-  this exists for. After three such ticks the app re-resolves the name and
-  moves itself, starting the attempt outside the run lock it will need.
+  any of its forms: an aggregate timeout, a normal return where every chat
+  failed on its own timeout, or a fast connection failure. Only the first form
+  is a hang; a stale address reassigned to another tenant answers with RST, so
+  watching for timeouts alone would miss the very failure this exists for.
+  Until `0.2.13` the third form was any exception raised after the gate; the
+  minute mention scan answered first on every tick and reset the counter, so
+  that was harmless. Without the scan it let OpenRouter, tunnel, keygen, upload,
+  or receiver-chain failures accumulate stalls and tear down a live route.
+  Since `0.2.13` only a tick that actually went to Telegram may count, and only
+  when Telegram answered none of its operations (`_TelegramContact`): `idle`
+  ticks never touch the counter (without a Telegram request there is nothing to
+  judge), any answered Telegram operation resets it, and a partial success — the
+  digest went through, one chat's read acknowledgement did not — must not condemn
+  the route. The daily 01:00 UTC rotation is therefore found in the morning
+  window. Three fast failures (RST) re-resolve within about 10–15 minutes; a
+  hanging route stretches each tick over its operation timeouts (up to 180
+  seconds each) and the 300-second pause starts only after the tick ends, so it
+  takes about half an hour. Those ticks do not spend read-acknowledgement
+  attempts: only a tick where Telegram answered at least one operation does,
+  otherwise the nightly rotation would exhaust the limit before the re-resolve
+  and push the read pass to the next morning. After three such ticks the app
+  re-resolves the name and moves itself, starting the attempt outside the run
+  lock it will need.
   The candidate goes through the same path as a manual replacement: it is
   started, proven by a killable SOCKS authorization probe, and only then
   committed; an unchanged address is refused before the route is touched, and
@@ -93,7 +110,10 @@ content, receiver keys, or rendered runtime configuration.
   `access_hash` is known only to the Telegram client and dialog enumeration
   stays closed after lock; that is the single permitted exception, bound to a
   durable one-shot `resolving_extension` phase entered before the network call
-  and refused unless the gate already named that exact chat_id. Activation is an
+  and refused unless the gate already named that exact chat_id. Since `0.2.13`
+  idle ticks no longer raise the VPN (after a restart outside the window there may be
+  no route), so the extension raises the route itself
+  before entering that phase: a VPN failure must not leave the phase set. Activation is an
   `extension_baseline` covering only the new chats: it continues the monitor
   chain rather than restarting it, so cursors and history of the existing chats
   survive. A baseline is validated against the chat set of the version it was
@@ -107,9 +127,13 @@ content, receiver keys, or rendered runtime configuration.
   network request and remains in config backups. Restoring config without private
   session material must require manual device revocation and acknowledgement before
   any new setup; never clear that marker merely because the session file is absent.
-- The status file describes only the latest tick and is rewritten every minute,
-  so a rare failure used to survive exactly one tick and was overwritten before
-  anyone saw it. A bounded journal of the last 20 runs — timestamp, result,
+- The status file describes only the latest tick and is rewritten every tick
+  (every minute until `0.2.13`, every 5 minutes since), so a rare failure used to
+  survive exactly one tick and was overwritten before anyone saw it. The morning
+  read-acknowledgement outcome (`read_ack_result`, `read_ack_error_type`) is
+  carried across ticks for the same reason: the rest of the day is `idle`, and
+  without the carry the UI would forget the morning result five minutes later.
+  A bounded journal of the last 20 runs — timestamp, result,
   exception type, counters, with consecutive identical outcomes collapsed into a
   repeat count — is kept in the status and rendered in the UI. It carries no
   message text, chat titles, or senders, and is sanitized like every other
@@ -117,28 +141,52 @@ content, receiver keys, or rendered runtime configuration.
 - The web service never mounts `data/private` or `data/config`. Setup credentials
   necessarily transit its authenticated form and memory, but it does not persist
   them; its only disk view is redacted runtime state and the narrow Unix socket.
-- Daily source text is never written to disk or logs. A native mention may create
-  one explicitly consented durable event containing only its chat title, sender
-  display name, link and a sanitized snippet of at most 300 UTF-16 units. The
-  exact pending event is retained until receiver acknowledgement; no media is
-  downloaded and stable sender IDs never leave Umbrel.
+- Daily source text is never written to disk or logs. Until 2026-09-13 a native
+  mention could create one explicitly consented durable event containing only its
+  chat title, sender display name, link and a sanitized snippet of at most 300
+  UTF-16 units, retained until receiver acknowledgement. Since `0.2.13` mentions are
+  neither scanned nor forwarded (owner's decision): the `mentions` contracts stay in
+  `contracts.py`, the receiver, and the Sunny skill only for wire compatibility and
+  rollback to `0.2.12` — do not delete them, and do not bring the scan back without
+  that decision being reversed. An undelivered pending `mentions` artifact left by
+  `0.2.12` is discarded without upload (the receiver sits exactly at the local
+  checkpoint and local cursors have not moved yet), while one already accepted is only
+  applied locally. A rollback to `0.2.12` rescans that range only until the first
+  `0.2.13` morning pass raises the local cursor to each chat's top; after it, those
+  mentions are gone for good. No media is downloaded and stable sender IDs never leave Umbrel.
 - Daily sender display names stay in the parent process only: OpenRouter and the
   killable worker receive per-chat `participant-N` aliases. The parent restores a
   name only for an unambiguous known alias in that chat; unknown or ambiguous aliases
   remain pseudonymous in the delivered digest.
 - Accepted monitor and digest sequence/hash/cursor state is checkpointed locally
   before pending bytes are deleted. Receiver rollback or chain jumps must fail
-  before Telegram access. The two streams remain independent so a failed daily
-  digest cannot block mention delivery or read acknowledgements.
+  before Telegram access: the monitor chain is verified on every tick, before the
+  VPN and before deciding whether Telegram is needed at all, and a chain break
+  (`ReceiverChainError`) aborts the whole tick. The two streams remain independent
+  so an ordinary digest failure cannot block the morning read acknowledgement or
+  monitor service work (mention delivery until 2026-09-13), and vice versa.
 - Peer work uses one Telegram client with at most four concurrent whole-peer units;
   each unit gets a 30-second deadline after acquiring the semaphore, results retain
   locked-peer order, and cancellation must cancel and join every sibling before a
-  cancellation-resistant disconnect. Only aggregate `TimeoutError` from an already
-  active monitor may continue to digest, after reloading durable phase and taking a
-  fresh authenticated gate. Baseline, chain/pending failures, and cancellation remain
-  fail-closed.
-- Every minute run obtains an authenticated remote monitor gate before Telegram
-  access. OpenRouter and the daily history scan additionally require
+  cancellation-resistant disconnect. Only aggregate `TimeoutError` from already
+  active monitor service work may continue to the morning pass, after reloading
+  durable phase and taking a fresh authenticated gate. Baseline, chain/pending
+  failures, and cancellation remain fail-closed.
+- The scheduler tick is a fixed 300 seconds (`SCHEDULER_TICK_S`;
+  `SUNNY_COLLECT_INTERVAL_S` was removed with `0.2.13`). The minute tick that walked
+  Telegram around the clock kept the owner's account "online" (confirmed
+  2026-09-13), and which request causes that is unknown — so, apart from explicit UI
+  actions (setup, a new chat link, VPN replacement with its authorization probe, logout
+  on reset), background work must not touch Telegram outside two cases. The automatic
+  VPN re-resolve probe is derived from them: it needs three ticks in which Telegram did
+  not answer and is rate-limited to once per 30 minutes. Every run obtains an authenticated remote
+  gate first; VPN, gateway, and Telegram start only for monitor-chain service work
+  (pending artifact, activation, extension — run immediately) or for the morning
+  pass, which requires receiver `server_time` inside `[prepare_not_before,
+  accept_until]` inclusive plus outstanding work (`due`, a pending digest, or the
+  day's read acknowledgement not yet done). Every other tick is `idle`. Five
+  minutes also keep the heartbeat inside the healthcheck's 900-second limit.
+  OpenRouter and the daily history scan additionally require
   `digest.due: true`. Consent is checked locally before the gate and against the
   receiver's authenticated clock immediately afterwards, then again around each
   external operation. A slow or skewed Umbrel clock must never extend consent.
@@ -164,11 +212,36 @@ content, receiver keys, or rendered runtime configuration.
   the receiver's cursor). Such a skip must be announced in the issue itself — a
   `[пропущено старше окна выпуска]` header placed FIRST, because trimming always eats the
   tail. A chat still at cursor zero gets no warning: what it skips is its own prior history.
-- After activation, the watcher scans every message ID after its own frozen
-  cursor and detects mentions only from Telegram's native `mentioned` flag. A
-  mention-bearing range is marked read only after its event batch has a durable
-  receiver receipt; a no-mention range is checkpointed locally before read-ACK.
-  Read-ACK always uses the exact peer and a bounded `max_id`. A forum needs a
+- Until 2026-09-13 the watcher scanned every message ID after its own frozen
+  cursor and detected mentions only from Telegram's native `mentioned` flag; a
+  mention-bearing range was marked read only after its event batch had a durable
+  receiver receipt, while a no-mention range was checkpointed locally before
+  read-ACK. Since `0.2.13` the morning pass runs after the digest, once per
+  day: it takes each chat's top from exact per-peer `GetPeerDialogs` (no dialog
+  listing, no text), raises the local cursor under `state_lock` only forward
+  (`max(current, top)`), persists it, and then goes through the shared read-ACK
+  retry. A chat still awaiting its extension baseline is skipped — acknowledging it
+  first would push its local cursor past the future baseline range — and counts as
+  unconfirmed. A fully confirmed day closes at once; a partial or failed pass is
+  retried on the next ticks of the window, but at most `MORNING_READ_ACK_MAX_ATTEMPTS`
+  (3) times per day key — counting only ticks where Telegram answered something —
+  and at most `MORNING_READ_ACK_MAX_TICKS` (9) read-pass ticks in total, because every
+  peer failing on a live connection (account-wide FLOOD_WAIT, CHANNEL_PRIVATE for all)
+  looks exactly like a dead route from here; after either limit the day closes with
+  the last outcome. Without
+  the limit one permanently failing chat kept the day open, and every one of the
+  window's 22 ticks raised the VPN and went to Telegram — exactly the "online"
+  pattern daily mode exists to avoid; a chat whose extension baseline keeps failing
+  in the window is therefore acknowledged the next morning. The "done" key
+  `(source_id, chat set, digest_date)` and the attempt counter live in memory only:
+  a durable mark would need a new `watch_state` field, whose field set stays closed
+  for rollback to `0.2.12`, so a restart grants a fresh set of attempts; the chat set
+  is part of the key so a chat accepted by extension after the morning pass is still
+  acknowledged in the same window.
+  Read-ACK always uses the exact peer, a bounded `max_id`, and
+  `clear_mentions=False` on every path, including the activation baseline: mentions
+  no longer reach Sunny, so clearing the "@" badge would silently hide a mention the
+  owner learns about nowhere else. A forum needs a
   second step: `channels.readHistory` — what `send_read_acknowledge` sends — has
   no topic field at all, so it clears the group badge while every topic keeps
   its own unread count burning. Topics are therefore enumerated
@@ -204,16 +277,21 @@ content, receiver keys, or rendered runtime configuration.
   refused. The receiver's ceiling arrives in the gate and may be LOWER than
   ours: the app is released first so it can accept a raised ceiling, and only
   then does the receiver raise it. The reverse order fails gate validation and
-  takes mention monitoring down with the digest.
+  takes monitor service work and the read pass (mention monitoring until
+  2026-09-13) down with the digest.
 - Every OpenRouter request must set `provider.zdr=true` and
   `provider.data_collection=deny`; account/key privacy controls remain defence
   in depth and may not replace the per-request guard. Opus must use explicit
   `max_tokens>=32768` so adaptive thinking cannot consume the usable response
   budget: 16384 was nearly exhausted by it once an issue stopped fitting in one message.
-- The receiver daily window is exactly 03:00–04:45 inclusive in its authenticated
-  IANA timezone, with no same-day catch-up. Sunny `chats` emits one durable
-  `missing_daily_digest` per local date; the host watchdog suppresses only that
-  duplicate code and must keep alerting every other monitor/digest failure.
+- The receiver daily window is exactly 08:00–09:45 inclusive in the fixed
+  `Europe/Moscow` timezone announced in its authenticated gate (until 2026-09-13:
+  03:00–04:45 in the owner's current IANA timezone), with no same-day catch-up. The
+  app never hard-codes the window: it takes `prepare_not_before`/`accept_until` from
+  the gate, so behind an old receiver `0.2.13` would still touch Telegram at night.
+  Sunny `chats` emits one durable `missing_daily_digest` per Moscow date after
+  09:45 (per local date of the owner's timezone until 2026-09-13); the host watchdog suppresses only that duplicate code and must keep
+  alerting every other monitor/digest failure.
 - SSH must use the generated dedicated Ed25519 key and the exact pinned
   `known_hosts` entry. Never add `StrictHostKeyChecking=no` or `ssh-keyscan`.
 - Do not add host networking, raw ports, Docker socket mounts, `privileged`,

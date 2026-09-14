@@ -10,6 +10,14 @@ from .storage import Paths, canonical_json_bytes, safe_unlink
 
 
 MAX_IPC_BYTES = 512 * 1024
+# Такт планировщика фиксирован и из окружения больше не берётся. Пока
+# collector тикал раз в минуту (gate → TelegramClient → скан → read-ACK),
+# аккаунт Ивана круглые сутки выглядел «в сети» (подтверждено 13.09.2026).
+# Теперь тик только проверяет связь с приёмником, а Telegram трогается
+# в утреннем окне; пять минут держат heartbeat (healthcheck ждёт < 900 с)
+# и дают самолечению VPN три провала подряд в пределах 10–15 минут окна.
+SCHEDULER_TICK_S = 300
+SCHEDULER_FIRST_RUN_DELAY_S = 5
 
 
 async def dispatch(collector: Collector, request: Dict[str, Any]) -> Dict[str, Any]:
@@ -93,11 +101,11 @@ async def _handle(collector: Collector, reader: asyncio.StreamReader,
             pass
 
 
-async def _scheduler(collector: Collector, interval: int) -> None:
-    await asyncio.sleep(5)
+async def _scheduler(collector: Collector) -> None:
+    await asyncio.sleep(SCHEDULER_FIRST_RUN_DELAY_S)
     while True:
         await collector.run_once()
-        await asyncio.sleep(interval)
+        await asyncio.sleep(SCHEDULER_TICK_S)
 
 
 async def serve(paths: Paths) -> None:
@@ -109,9 +117,7 @@ async def serve(paths: Paths) -> None:
     )
     os.chmod(paths.ipc_socket, 0o600)
     try:
-        raw_interval = int(os.environ.get("SUNNY_COLLECT_INTERVAL_S", "60"))
-        interval = max(60, min(raw_interval, 3600))
-        scheduler = asyncio.create_task(_scheduler(collector, interval))
+        scheduler = asyncio.create_task(_scheduler(collector))
         async with server:
             await server.serve_forever()
     finally:

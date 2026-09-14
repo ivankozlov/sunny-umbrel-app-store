@@ -1,15 +1,17 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Chats
-version: "0.2.12"
-tagline: Mentions, read receipts, and one digest for selected chats
+version: "0.2.13"
+tagline: One daily digest and morning read receipts for selected chats
 description: >-
-  Resolves message links for only the explicitly selected Telegram groups,
-  clears their unread state about once a minute, forwards bounded native-mention
-  snippets to Sunny, and creates one combined daily digest through OpenRouter
-  over a pinned SSH connection.
+  Resolves message links for only the explicitly selected Telegram groups.
+  Telegram is touched only in a daily 08:00–09:45 Moscow-time window: the app
+  creates one combined digest through OpenRouter over a pinned SSH connection,
+  then marks those groups read up to their latest message once, leaving mention
+  badges in place. Outside the window it only checks the receiver connection
+  every 5 minutes. Mentions are not forwarded to Sunny.
 
 
   Telegram and provider credentials are deliberately excluded from Umbrel
@@ -18,10 +20,11 @@ description: >-
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  Adds sanitized OpenRouter usage and cost metadata to each non-empty daily
-  digest upload, so Sunny's LLM-cost report includes Personal Chats. Raw chat
-  text, credentials, and stable Telegram identifiers remain outside the usage
-  record. The collector wire protocol remains 0.2.1.
+  Switches to a daily mode so the account no longer appears online around the
+  clock: Telegram is contacted only in the 08:00–09:45 Moscow-time window for
+  the digest and one read receipt per day, and the receiver connection is
+  checked every 5 minutes. Mentions are no longer collected or forwarded, and
+  read receipts keep mention badges. The collector wire protocol remains 0.2.1.
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store
 dependencies: []

@@ -139,7 +139,7 @@ def _layout(content: str, csrf: str, notice: str = "") -> bytes:
     <h1>Sunny Personal Chats</h1><div class="muted">1–16 выбранных чатов · локальная Telegram-сессия</div>
   </div></div>
   {notice_html}<section class="card">{content}{reset_html}</section>
-  <footer>Сырые сообщения дайджеста не сохраняются. Финальный mention-фрагмент до 300 UTF-16, название чата, отправитель и ссылка durably передаются в Sunny. Setup credentials и VPN subscription URL проходят через web только транзитом.</footer>
+  <footer>Сырые сообщения дайджеста не сохраняются. Упоминания в Sunny не отправляются. Telegram — только в суточном окне 08:00–09:45 МСК. Setup credentials и VPN subscription URL проходят через web только транзитом.</footer>
 </main></body></html>"""
     return document.encode("utf-8")
 
@@ -169,8 +169,9 @@ def _render_openrouter_key(public_key: Any) -> str:
 def _render_recent_runs(rows: Any) -> str:
     """Журнал последних прогонов: время, исход, тип ошибки, счётчики.
 
-    Статус описывает только последний тик и перезаписывается каждую минуту,
-    поэтому редкая ошибка исчезала раньше, чем её успевали увидеть. Здесь
+    Статус описывает только последний тик и перезаписывается каждым тиком
+    (раз в 5 минут), поэтому редкая ошибка исчезала раньше, чем её успевали
+    увидеть. Здесь
     всё служебное и ничего из переписки: тексты, имена чатов и отправители
     сюда не попадают by design. Значения санитизируются так же строго, как
     остальные поля статуса — они приходят по IPC от collector'а."""
@@ -359,6 +360,24 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
             else "CollectorError" if error_value else None
         )
         error_row = f'<dt>Последняя ошибка</dt><dd>{_escape(error)}</dd>' if error else ""
+        # Исход утренней пометки прочитанным приходит по IPC и
+        # санитизируется так же строго, как остальные поля статуса.
+        read_ack_value = status.get("read_ack_result")
+        read_ack = (
+            read_ack_value
+            if isinstance(read_ack_value, str)
+            and read_ack_value in {"read_acked", "read_ack_partial", "error"}
+            else "ещё не выполнялась"
+        )
+        read_ack_error_value = status.get("read_ack_error_type")
+        read_ack_error = (
+            read_ack_error_value
+            if isinstance(read_ack_error_value, str)
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", read_ack_error_value)
+            else "CollectorError" if read_ack_error_value else None
+        )
+        if read_ack_error:
+            read_ack = f"{read_ack} — {read_ack_error}"
         recent_rows = _render_recent_runs(status.get("recent_runs"))
         repair_state_value = status.get("vpn_repair_state")
         repair_state = (
@@ -395,9 +414,9 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
         if status.get("activation_required"):
             activation = f"""
 <div class="notice"><strong>Нужно отдельное включение.</strong><br>
-Первый запуск durably запишет baseline в Sunny, затем пометит все старые unread и mentions выбранных групп прочитанными. Старые mentions не будут отправлены. Только после этого начнётся минутный watcher.</div>
+Первый запуск durably запишет baseline в Sunny, затем пометит старые непрочитанные сообщения выбранных групп прочитанными; значки «@» упоминаний останутся, сами упоминания в Sunny не отправляются. Дальше collector раз в 5 минут проверяет связь с приёмником, не обращаясь к Telegram, а к Telegram идёт только в суточном окне 08:00–09:45 МСК: общий дайджест, затем одна пометка прочитанным.</div>
 <form method="post">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="activate_monitoring">
-  <label class="check"><input type="checkbox" name="confirm_activation" value="yes" required>Включить мониторинг и очистить текущие старые unread/mentions после durable baseline ACK.</label>
+  <label class="check"><input type="checkbox" name="confirm_activation" value="yes" required>Включить суточный режим и пометить текущие старые сообщения прочитанными после durable baseline ACK.</label>
   <button type="submit">Включить мониторинг</button>
 </form>"""
         return f"""
@@ -406,6 +425,7 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
   <dt>Группы</dt><dd>{chats}</dd>
   <dt>Source ID</dt><dd>{_escape(status.get("source_id"))}</dd>
   <dt>Мониторинг</dt><dd>{_escape(status.get("monitoring_phase") or "не включён")}</dd>
+  <dt>Режим</dt><dd>Telegram — только в окне 08:00–09:45 МСК: дайджест, затем пометка прочитанным; связь с приёмником — раз в 5 минут</dd>
   <dt>Модель</dt><dd>{_escape(status.get("model") or "зафиксирована")}</dd>
   <dt>Receiver</dt><dd>{_escape(status.get("upload_target") or "зафиксирован")}</dd>
   <dt>Согласие</dt><dd>{consent} · до {_escape(status.get("consent_expires_at") or "—")}</dd>
@@ -413,6 +433,7 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
   <dt>Pending digest</dt><dd>{"да" if status.get("pending_digest_upload") else "нет"}</dd>
   <dt>Ошибки peer</dt><dd>{_escape(status.get("failed_chat_count") or 0)}</dd>
   <dt>Последний результат</dt><dd>{result}</dd>{error_row}
+  <dt>Пометка прочитанным</dt><dd>{_escape(read_ack)}</dd>
   <dt>Проверка нового VPN</dt><dd>{_escape(repair_state)}</dd>
   <dt>Проверено маршрутов</dt><dd>{repair_attempted}</dd>
   <dt>Ошибка замены VPN</dt><dd>{_escape(repair_error)}</dd>

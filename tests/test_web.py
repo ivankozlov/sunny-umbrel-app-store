@@ -409,8 +409,44 @@ class WebTests(unittest.TestCase):
         interrupted = render_status(status("resolving_links"), "a" * 64)
         self.assertIn("Повторный запрос заблокирован", interrupted)
         locked = render_status(status("chat_locked"), "a" * 64)
-        self.assertIn("Старые mentions не будут отправлены", locked)
+        self.assertIn("упоминания в Sunny не отправляются", locked)
+        self.assertIn("значки «@» упоминаний останутся", locked)
         self.assertIn("durable baseline ACK", locked)
+
+
+class TestBugOnlinePresenceUi20260913(unittest.TestCase):
+    """Интерфейс описывает суточный режим, а не минутный watcher.
+
+    13.09.2026 collector перестал ходить в Telegram раз в минуту: теперь
+    только окно 08:00–09:45 МСК, а раз в 5 минут — проверка связи с
+    приёмником. Текст о «минутном watcher» и отправке упоминаний стал бы
+    ложным описанием того, что приложение делает с аккаунтом."""
+
+    def test_locked_page_describes_the_daily_window_and_no_mentions(self):
+        page = render_status(status("chat_locked"), "a" * 64)
+        document = _layout(page, "a" * 64).decode("utf-8")
+        self.assertIn("08:00–09:45 МСК", page)
+        self.assertIn("раз в 5 минут", page)
+        self.assertNotIn("минутный watcher", page)
+        # Текст согласия (продление scope) сознательно не меняется вместе с
+        # CONSENT_SCOPE; меняется описание того, что приложение делает.
+        self.assertNotIn("Финальный mention-фрагмент", document)
+        self.assertIn("Упоминания в Sunny не отправляются", document)
+
+    def test_read_ack_outcome_is_rendered_and_sanitized(self):
+        value = status("chat_locked")
+        value.update(read_ack_result="read_ack_partial",
+                     read_ack_error_type="ConnectionError")
+        page = render_status(value, "a" * 64)
+        self.assertIn("read_ack_partial — ConnectionError", page)
+
+        for hostile in ("<script>", ["read_acked"], {"x": 1}):
+            value.update(read_ack_result=hostile,
+                         read_ack_error_type="<img src=x>")
+            page = render_status(value, "a" * 64)
+            self.assertNotIn("<script>", page)
+            self.assertNotIn("<img", page)
+            self.assertIn("ещё не выполнялась — CollectorError", page)
 
 
 class TestRecentRunsRendering20260817(unittest.TestCase):

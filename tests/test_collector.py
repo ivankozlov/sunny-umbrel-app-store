@@ -20,15 +20,15 @@ from sunny_digest.collector import (
     WATCH_STATE_SCHEMA,
 )
 from sunny_digest.contracts import (
+    build_monitor_upload,
     canonical_digest_bytes,
     canonical_monitor_bytes,
     mention_event_id,
 )
+from sunny_digest.ipc import SCHEDULER_TICK_S
 from sunny_digest.models import (
     DialogCandidate,
     FetchResult,
-    MentionEvent,
-    MentionScanResult,
     PeerSpec,
     SelectedMessage,
 )
@@ -175,7 +175,10 @@ def seed_locked(paths: Paths, *, watch_phase: str | None = None):
 def gate(*, baseline_required=False, monitor_sequence=2,
          monitor_previous=BASELINE_HASH, monitor_cursors=None,
          digest_due=False, digest_sequence=1, digest_previous=None,
-         digest_cursors=None):
+         digest_cursors=None, server_time="2026-08-04T00:30:00Z",
+         digest_date="2026-08-04",
+         prepare_not_before="2026-08-04T03:00:00+03:00",
+         accept_until="2026-08-04T04:45:00+03:00"):
     monitor_cursors = monitor_cursors or (
         {chat_id: 0 for chat_id in CHAT_IDS}
         if baseline_required else dict(BASELINE_TOPS)
@@ -184,7 +187,7 @@ def gate(*, baseline_required=False, monitor_sequence=2,
     return {
         "schema": "sunny.personal-chats.status-gate.v2",
         "ok": True,
-        "server_time": "2026-08-04T00:30:00Z",
+        "server_time": server_time,
         "timezone": "Europe/Istanbul",
         "monitor": {
             "baseline_required": baseline_required,
@@ -200,9 +203,9 @@ def gate(*, baseline_required=False, monitor_sequence=2,
         "digest": {
             "due": digest_due,
             "reason": "due" if digest_due else "before_window",
-            "digest_date": "2026-08-04",
-            "prepare_not_before": "2026-08-04T03:00:00+03:00",
-            "accept_until": "2026-08-04T04:45:00+03:00",
+            "digest_date": digest_date,
+            "prepare_not_before": prepare_not_before,
+            "accept_until": accept_until,
             "next_sequence": digest_sequence,
             "previous_sha256": digest_previous,
             "cursors": [
@@ -250,9 +253,12 @@ class FakeTransport:
             "baseline_required": False,
             "next_sequence": payload["sequence"] + 1,
             "previous_sha256": payload["content_sha256"],
+            # Порядок и состав — из ожидаемого набора: после расширения
+            # приёмник объявляет и новый чат, и gate без него не прошёл бы
+            # сверку с локальным набором.
             "cursors": [
                 {"chat_id": chat_id, "through_message_id": cursors[chat_id]}
-                for chat_id in CHAT_IDS
+                for chat_id in self.expected_chat_ids
             ],
         })
         if self.lose_monitor_ack:
@@ -291,14 +297,10 @@ class FakeGateway:
         self.paths = paths
         self.trace = trace if trace is not None else []
         self.tops = dict(BASELINE_TOPS)
-        self.scans = {
-            chat_id: MentionScanResult(self.tops[chat_id], [])
-            for chat_id in CHAT_IDS
-        }
-        self.scan_failures = []
+        self.top_failures = []
         self.read_failures = []
         self.snapshot_calls = 0
-        self.aggregate_scan_calls = 0
+        self.peer_tops_calls = 0
         self.read_batches = []
         self.boundary_calls = []
         self.boundary = {chat_id: 0 for chat_id in CHAT_IDS}
@@ -339,24 +341,15 @@ class FakeGateway:
                 or len(set(chosen)) != len(chosen)):
             raise AssertionError("collector escaped locked chat set")
 
-    async def snapshot_and_scan_mentions(self, _session, source_id, selected):
-        self.trace.append("scan_batch")
-        self.aggregate_scan_calls += 1
-        if (source_id != SOURCE_ID
-                or [row[0] for row in selected] != self.expected_chat_ids):
-            raise AssertionError("invalid aggregate scan binding")
-        available = {}
-        starts = {row[0]: row[3] for row in selected}
-        for chat_id in self.expected_chat_ids:
-            if chat_id in self.scan_failures:
-                continue
-            configured = self.scans[chat_id]
-            start = starts[chat_id]
-            available[chat_id] = MentionScanResult(
-                max(start, configured.through_message_id),
-                [event for event in configured.events if event.message_id > start],
-            )
-        return dict(self.tops), available, list(self.scan_failures)
+    async def snapshot_peer_tops(self, _session, selected):
+        self.trace.append("tops")
+        self.peer_tops_calls += 1
+        self.assert_exact_selected(selected)
+        tops = {
+            row[0]: self.tops[row[0]] for row in selected
+            if row[0] not in self.top_failures
+        }
+        return tops, [row[0] for row in selected if row[0] in self.top_failures]
 
     async def acknowledge_reads(self, _session, targets):
         self.trace.append("read_batch")
@@ -430,17 +423,29 @@ class BlockingVPNRuntime(FakeVPNRuntime):
         self.ready = True
 
 
-def mention(chat_index: int, message_id: int) -> MentionEvent:
+def legacy_mentions_payload(gate_value, chat_index: int, message_id: int):
+    """Событие упоминания в том виде, в каком его стейджил 0.2.12.
+
+    Нужен только проверкам досылки: сам collector такие события больше не
+    формирует (решение 13.09.2026), но pending-файл от прежней версии
+    может пережить обновление."""
     chat_id = CHAT_IDS[chat_index]
-    return MentionEvent(
-        event_id=mention_event_id(SOURCE_ID, chat_id, message_id),
-        chat_id=chat_id,
-        message_id=message_id,
-        sent_at=NOW,
-        chat_title=TITLES[chat_index],
-        sender="Иван",
-        snippet="@ivan проверь",
-        link=f"https://t.me/c/{PEERS[chat_index].peer_id}/{message_id}",
+    cursor = next(row["through_message_id"] for row in gate_value["monitor"]["cursors"]
+                  if row["chat_id"] == chat_id)
+    return build_monitor_upload(
+        source_id=SOURCE_ID, gate=gate_value, kind="mentions",
+        ranges=[{"chat_id": chat_id, "from_message_id_exclusive": cursor,
+                 "through_message_id": message_id}],
+        events=[{
+            "event_id": mention_event_id(SOURCE_ID, chat_id, message_id),
+            "message_id": message_id,
+            "date": "2026-08-04T00:29:00Z",
+            "chat_title": TITLES[chat_index],
+            "sender": "Иван",
+            "snippet": "@ivan проверь",
+            "link": f"https://t.me/c/{PEERS[chat_index].peer_id}/{message_id}",
+        }],
+        generated_at=NOW,
     )
 
 
@@ -1526,7 +1531,7 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["last_result"], "error")
             self.assertEqual(result["last_error_type"], "RuntimeError")
             self.assertEqual(transport.gate_calls, 0)
-            self.assertEqual(gateway.aggregate_scan_calls, 0)
+            self.assertEqual(gateway.peer_tops_calls, 0)
             self.assertEqual(gateway.fetch_calls, [])
             self.assertEqual(runtime.starts, [])
 
@@ -1584,7 +1589,7 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["last_result"], "activation_required")
             self.assertEqual(transport.gate_calls, 0)
             self.assertEqual(gateway.snapshot_calls, 0)
-            self.assertEqual(gateway.aggregate_scan_calls, 0)
+            self.assertEqual(gateway.peer_tops_calls, 0)
             self.assertEqual(gateway.read_batches, [])
 
     async def test_select_chats_is_sorted_immutable_and_reads_no_history(self):
@@ -1652,7 +1657,7 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([row["initial_message_id"] for row in settings["chats"]], [0, 0])
             self.assertFalse(paths.watch_state.exists())
             self.assertEqual(gateway.snapshot_calls, 0)
-            self.assertEqual(gateway.aggregate_scan_calls, 0)
+            self.assertEqual(gateway.peer_tops_calls, 0)
             with self.assertRaises(RuntimeError):
                 await collector.select_chats({
                     "selection_id": SELECTION_ID, "chat_ids": CHAT_IDS,
@@ -1721,7 +1726,7 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             )
             uuid.UUID(result["selection_id"])
             self.assertEqual(gateway.snapshot_calls, 0)
-            self.assertEqual(gateway.aggregate_scan_calls, 0)
+            self.assertEqual(gateway.peer_tops_calls, 0)
             self.assertEqual(gateway.boundary_calls, [])
             self.assertEqual(gateway.fetch_calls, [])
             persisted = paths.dialog_candidates.read_bytes() + paths.settings.read_bytes()
@@ -1862,10 +1867,12 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(gateway.read_batches), 1)
             self.assertEqual(len(digest_calls), 1)
             self.assertEqual(len(transport.digest_uploads), 1)
+            # Утренняя пометка идёт после выпуска: вершины равны только что
+            # подтверждённому baseline, поэтому второй пометки нет вовсе.
             self.assertEqual(
                 trace,
                 ["status", "snapshot", "monitor_upload", "read_batch",
-                 "status", "digest_upload"],
+                 "status", "digest_upload", "tops"],
             )
 
     async def test_partial_baseline_read_retries_only_failed_peer_then_allows_digest(self):
@@ -1895,7 +1902,7 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(second["last_result"], "uploaded_digest")
             self.assertEqual(read_json(paths.watch_state)["phase"], "active")
             self.assertEqual(gateway.snapshot_calls, 1)
-            self.assertEqual(gateway.aggregate_scan_calls, 0)
+            self.assertEqual(gateway.peer_tops_calls, 1)
             self.assertEqual(len(transport.monitor_uploads), 1)
             self.assertEqual(
                 [row[0] for row in gateway.read_batches[1]], [CHAT_IDS[0]])
@@ -1939,22 +1946,20 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
 
             recovered = await collector.run_once()
 
-            self.assertEqual(recovered["last_result"], "watched_not_due")
+            # Досылка — служебная работа цепочки; выпуска и пометки за день
+            # больше не нужно, поэтому тик на этом и заканчивается.
+            self.assertEqual(recovered["last_result"], "monitor_service_done")
             self.assertFalse(paths.monitor_pending.exists())
             self.assertEqual(read_json(paths.watch_state), checkpoint)
             self.assertEqual(gateway.snapshot_calls, 1)
             self.assertEqual(len(transport.monitor_uploads), 1)
 
-    async def test_no_mentions_advance_only_local_cursor_before_read_ack(self):
+    async def test_morning_ack_advances_only_local_cursor_to_the_top(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = make_paths(Path(temporary))
             seed_locked(paths, watch_phase="active")
             gateway = FakeGateway(paths)
             gateway.tops = {CHAT_IDS[0]: 12, CHAT_IDS[1]: 23}
-            gateway.scans = {
-                CHAT_IDS[0]: MentionScanResult(12, []),
-                CHAT_IDS[1]: MentionScanResult(23, []),
-            }
             transport = FakeTransport(paths, gate())
             result = await collector_for(paths, gateway, transport).run_once()
             self.assertEqual(result["last_result"], "watched_not_due")
@@ -1970,51 +1975,23 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(len(gateway.read_batches), 1)
 
-    async def test_mention_ack_precedes_read_and_remote_range_includes_local_gap(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            paths = make_paths(Path(temporary))
-            seed_locked(paths, watch_phase="active")
-            state = read_json(paths.watch_state)
-            state["chats"][0].update({
-                "scan_through_message_id": 15,
-                "read_pending_through_message_id": 15,
-                "read_acked_through_message_id": 15,
-            })
-            atomic_write_json(paths.watch_state, state)
-            trace = []
-            gateway = FakeGateway(paths, trace)
-            gateway.tops[CHAT_IDS[0]] = 16
-            gateway.scans[CHAT_IDS[0]] = MentionScanResult(16, [mention(0, 16)])
-            transport = FakeTransport(paths, gate(), trace)
-            result = await collector_for(paths, gateway, transport).run_once()
-            self.assertEqual(result["last_result"], "watched_not_due")
-            payload = transport.monitor_uploads[0]
-            self.assertEqual(payload["kind"], "mentions")
-            self.assertEqual(payload["ranges"][0]["from_message_id_exclusive"], 10)
-            self.assertEqual(payload["ranges"][0]["through_message_id"], 16)
-            self.assertEqual(payload["events"][0]["event_id"],
-                             mention_event_id(SOURCE_ID, CHAT_IDS[0], 16))
-            self.assertLess(trace.index("monitor_upload"), trace.index("read_batch"))
-
-    async def test_lost_mention_ack_never_reads_until_next_status_reconciles(self):
+    async def test_morning_ack_never_moves_a_cursor_backwards(self):
+        """Вершина ниже подтверждённого (удалённые сообщения) не откатывает
+        курсор и не порождает пометки: подтверждать нечего."""
         with tempfile.TemporaryDirectory() as temporary:
             paths = make_paths(Path(temporary))
             seed_locked(paths, watch_phase="active")
             gateway = FakeGateway(paths)
-            gateway.tops[CHAT_IDS[0]] = 11
-            gateway.scans[CHAT_IDS[0]] = MentionScanResult(11, [mention(0, 11)])
-            transport = FakeTransport(paths, gate())
-            transport.lose_monitor_ack = True
-            collector = collector_for(paths, gateway, transport)
-            self.assertEqual((await collector.run_once())["last_result"], "error")
-            self.assertTrue(paths.monitor_pending.exists())
+            gateway.tops = {CHAT_IDS[0]: 7, CHAT_IDS[1]: 20}
+            collector = collector_for(paths, gateway, FakeTransport(paths, gate()))
+
+            result = await collector.run_once()
+
+            self.assertEqual(result["read_ack_result"], "read_acked")
             self.assertEqual(gateway.read_batches, [])
-            self.assertEqual(read_json(paths.watch_state)["chats"][0][
-                "scan_through_message_id"], 10)
-            self.assertEqual((await collector.run_once())["last_result"], "watched_not_due")
-            self.assertEqual(len(transport.monitor_uploads), 1)
-            self.assertFalse(paths.monitor_pending.exists())
-            self.assertGreaterEqual(len(gateway.read_batches), 1)
+            state = read_json(paths.watch_state)
+            self.assertEqual(
+                [row["scan_through_message_id"] for row in state["chats"]], [10, 20])
 
     async def test_receiver_monitor_rollback_blocks_all_telegram_calls(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2029,7 +2006,7 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             result = await collector_for(paths, gateway, transport).run_once()
             self.assertEqual(result["last_result"], "error")
             self.assertEqual(gateway.snapshot_calls, 0)
-            self.assertEqual(gateway.aggregate_scan_calls, 0)
+            self.assertEqual(gateway.peer_tops_calls, 0)
             self.assertEqual(gateway.read_batches, [])
 
     async def test_broken_first_peer_does_not_advance_it_or_block_good_second(self):
@@ -2037,13 +2014,13 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             paths = make_paths(Path(temporary))
             seed_locked(paths, watch_phase="active")
             gateway = FakeGateway(paths)
-            gateway.scan_failures = [CHAT_IDS[0]]
+            gateway.top_failures = [CHAT_IDS[0]]
             gateway.tops[CHAT_IDS[1]] = 25
-            gateway.scans[CHAT_IDS[1]] = MentionScanResult(25, [])
             result = await collector_for(
                 paths, gateway, FakeTransport(paths, gate())).run_once()
             self.assertEqual(result["last_result"], "watched_not_due")
             self.assertEqual(result["failed_chat_count"], 1)
+            self.assertEqual(result["read_ack_result"], "read_ack_partial")
             state = read_json(paths.watch_state)
             self.assertEqual(state["chats"][0]["scan_through_message_id"], 10)
             self.assertEqual(state["chats"][1]["scan_through_message_id"], 25)
@@ -2055,10 +2032,6 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             seed_locked(paths, watch_phase="active")
             gateway = FakeGateway(paths)
             gateway.tops = {CHAT_IDS[0]: 11, CHAT_IDS[1]: 21}
-            gateway.scans = {
-                CHAT_IDS[0]: MentionScanResult(11, []),
-                CHAT_IDS[1]: MentionScanResult(21, []),
-            }
             gateway.read_failures = [CHAT_IDS[0]]
             result = await collector_for(
                 paths, gateway, FakeTransport(paths, gate())).run_once()
@@ -2068,7 +2041,7 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(state["chats"][0]["read_pending_through_message_id"], 11)
             self.assertEqual(state["chats"][1]["read_acked_through_message_id"], 21)
 
-    async def test_active_retry_batches_old_and_new_read_acks_after_one_scan(self):
+    async def test_active_retry_batches_old_and_new_read_acks_after_one_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = make_paths(Path(temporary))
             seed_locked(paths, watch_phase="active")
@@ -2080,16 +2053,13 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
             })
             atomic_write_json(paths.watch_state, state)
             gateway = FakeGateway(paths)
-            gateway.scans = {
-                CHAT_IDS[0]: MentionScanResult(12, []),
-                CHAT_IDS[1]: MentionScanResult(21, []),
-            }
+            gateway.tops = {CHAT_IDS[0]: 12, CHAT_IDS[1]: 21}
 
             result = await collector_for(
                 paths, gateway, FakeTransport(paths, gate())).run_once()
 
             self.assertEqual(result["last_result"], "watched_not_due")
-            self.assertEqual(gateway.aggregate_scan_calls, 1)
+            self.assertEqual(gateway.peer_tops_calls, 1)
             self.assertEqual(len(gateway.read_batches), 1)
             self.assertEqual(
                 [(row[0], row[2]) for row in gateway.read_batches[0]],
@@ -2258,38 +2228,49 @@ class CollectorV2Tests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(path.exists(), str(path))
 
 
+def sequenced_transport(paths, *values):
+    """Транспорт, отдающий gate по очереди; последний повторяется."""
+
+    class SequencedTransport(FakeTransport):
+        def __init__(self):
+            super().__init__(paths, values[0])
+            self._values = list(values)
+
+        async def gate(self, source_id, chat_ids, revoked):
+            self.trace.append("status")
+            self.gate_calls += 1
+            if (source_id != SOURCE_ID or chat_ids != self.expected_chat_ids
+                    or revoked.is_set()):
+                raise AssertionError("invalid status binding")
+            index = min(self.gate_calls - 1, len(self._values) - 1)
+            return copy.deepcopy(self._values[index])
+
+    return SequencedTransport()
+
+
 class TestBugMonitorDigestStarvation20260814(
         unittest.IsolatedAsyncioTestCase):
-    """A hung mention batch must not consume the whole daily digest window."""
+    """Зависшая работа Telegram не должна съедать окно выпуска.
 
-    @staticmethod
-    def sequenced_transport(paths, *values):
-        class SequencedTransport(FakeTransport):
-            def __init__(self):
-                super().__init__(paths, values[0])
-                self._values = list(values)
+    2026-08-14 это был скан упоминаний; с 13.09.2026 скана нет, а утренняя
+    пометка прочитанным идёт ПОСЛЕ выпуска, поэтому съесть его окно не
+    может по построению. Осталась служебная работа цепочки (extension
+    baseline) — для неё прежнее правило: таймаут в active-фазе пропускает к
+    выпуску только через свежий authenticated gate."""
 
-            async def gate(self, source_id, chat_ids, revoked):
-                self.trace.append("status")
-                self.gate_calls += 1
-                if source_id != SOURCE_ID or chat_ids != CHAT_IDS or revoked.is_set():
-                    raise AssertionError("invalid status binding")
-                index = min(self.gate_calls - 1, len(self._values) - 1)
-                return copy.deepcopy(self._values[index])
-
-        return SequencedTransport()
-
-    async def test_due_digest_runs_after_active_monitor_timeout_with_fresh_gate(self):
+    async def test_hung_morning_read_ack_never_blocks_the_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = make_paths(Path(temporary))
             seed_locked(paths, watch_phase="active")
 
-            class HangingMonitorGateway(FakeGateway):
-                async def snapshot_and_scan_mentions(self, *_args):
+            class HangingTopsGateway(FakeGateway):
+                async def snapshot_peer_tops(self, *_args):
+                    self.trace.append("tops")
                     await asyncio.Event().wait()
 
-            gateway = HangingMonitorGateway(paths)
-            transport = FakeTransport(paths, gate(digest_due=True))
+            trace = []
+            gateway = HangingTopsGateway(paths, trace)
+            transport = FakeTransport(paths, gate(digest_due=True), trace)
             digest_calls = []
             collector = collector_for(paths, gateway, transport, digest_calls)
 
@@ -2299,11 +2280,14 @@ class TestBugMonitorDigestStarvation20260814(
 
             self.assertEqual(result["last_result"], "uploaded_digest")
             self.assertEqual(result["last_error_type"], "TimeoutError")
+            self.assertEqual(result["read_ack_result"], "error")
+            self.assertEqual(result["read_ack_error_type"], "TimeoutError")
             self.assertEqual(result["failed_chat_count"], len(CHAT_IDS))
-            self.assertEqual(transport.gate_calls, 2)
+            self.assertEqual(trace, ["status", "digest_upload", "tops"])
             self.assertEqual(len(digest_calls), 1)
-            self.assertEqual(len(transport.digest_uploads), 1)
-            self.assertFalse(paths.monitor_pending.exists())
+            # Граница и выборка выпуска в этом тике ответили: маршрут жив, и
+            # зависшая пометка — не повод гасить его перерезолвом.
+            self.assertEqual(collector._telegram_stall_ticks, 0)
 
     async def test_monitor_timeout_before_active_phase_never_runs_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2330,19 +2314,59 @@ class TestBugMonitorDigestStarvation20260814(
             self.assertEqual(digest_calls, [])
             self.assertEqual(transport.digest_uploads, [])
 
+    async def test_due_digest_runs_after_extension_baseline_timeout_with_fresh_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            order = seed_pending_extension(paths)
+
+            class HangingExtensionGateway(FakeGateway):
+                async def snapshot_tops(self, *_args):
+                    await asyncio.Event().wait()
+
+            gateway = extension_gateway(HangingExtensionGateway(paths), order)
+            transport = FakeTransport(paths, extended_gate(digest_due=True))
+            transport.expected_chat_ids = order
+            digest_calls = []
+            collector = collector_for(paths, gateway, transport, digest_calls)
+
+            with patch.object(
+                    collector_module, "TELEGRAM_FETCH_TIMEOUT_S", 0.01):
+                result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            self.assertEqual(result["last_error_type"], "TimeoutError")
+            self.assertEqual(result["failed_chat_count"], len(order))
+            self.assertEqual(transport.gate_calls, 2)
+            self.assertEqual(len(digest_calls), 1)
+            self.assertEqual(transport.monitor_uploads, [])
+            self.assertFalse(paths.monitor_pending.exists())
+            # Чат, ждущий extension baseline, пометкой не трогается.
+            watch = read_json(paths.watch_state)
+            fresh = next(row for row in watch["chats"]
+                         if row["chat_id"] == NEW_CHAT_ID)
+            self.assertEqual(fresh["scan_through_message_id"], 0)
+            self.assertNotIn(
+                NEW_CHAT_ID,
+                [row[0] for batch in gateway.read_batches for row in batch])
+            self.assertEqual(result["read_ack_result"], "read_ack_partial")
+
     async def test_fresh_not_due_gate_after_timeout_never_fetches_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = make_paths(Path(temporary))
             seed_locked(paths, watch_phase="active")
+            order = seed_pending_extension(paths)
 
-            class HangingMonitorGateway(FakeGateway):
-                async def snapshot_and_scan_mentions(self, *_args):
+            class HangingExtensionGateway(FakeGateway):
+                async def snapshot_tops(self, *_args):
                     await asyncio.Event().wait()
 
-            gateway = HangingMonitorGateway(paths)
-            transport = self.sequenced_transport(
-                paths, gate(digest_due=True), gate(digest_due=False),
+            gateway = extension_gateway(HangingExtensionGateway(paths), order)
+            transport = sequenced_transport(
+                paths, extended_gate(digest_due=True),
+                extended_gate(digest_due=False),
             )
+            transport.expected_chat_ids = order
             digest_calls = []
             collector = collector_for(paths, gateway, transport, digest_calls)
 
@@ -2357,48 +2381,39 @@ class TestBugMonitorDigestStarvation20260814(
             self.assertEqual(gateway.fetch_calls, [])
             self.assertEqual(transport.digest_uploads, [])
 
-    async def test_fresh_digest_chain_jump_still_blocks_all_digest_work(self):
+    async def test_digest_chain_jump_blocks_the_whole_tick_including_read_ack(self):
+        """Разрыв цепочки — не обычный отказ выпуска: пометка прочитанным в
+        этом тике тоже не идёт."""
         with tempfile.TemporaryDirectory() as temporary:
             paths = make_paths(Path(temporary))
             seed_locked(paths, watch_phase="active")
-
-            class HangingMonitorGateway(FakeGateway):
-                async def snapshot_and_scan_mentions(self, *_args):
-                    await asyncio.Event().wait()
-
             jumped = gate(
                 digest_due=True, digest_sequence=2,
                 digest_previous="a" * 64,
             )
-            gateway = HangingMonitorGateway(paths)
-            transport = self.sequenced_transport(
-                paths, gate(digest_due=True), jumped,
-            )
+            gateway = FakeGateway(paths)
+            gateway.tops = {CHAT_IDS[0]: 15, CHAT_IDS[1]: 25}
+            transport = FakeTransport(paths, jumped)
             digest_calls = []
             collector = collector_for(paths, gateway, transport, digest_calls)
 
-            with patch.object(
-                    collector_module, "TELEGRAM_FETCH_TIMEOUT_S", 0.01):
-                result = await collector.run_once()
+            result = await collector.run_once()
 
             self.assertEqual(result["last_result"], "error")
-            self.assertEqual(result["last_error_type"], "RuntimeError")
-            self.assertEqual(result["failed_chat_count"], len(CHAT_IDS))
+            self.assertEqual(result["last_error_type"], "ReceiverChainError")
             self.assertEqual(digest_calls, [])
             self.assertEqual(gateway.boundary_calls, [])
             self.assertEqual(gateway.fetch_calls, [])
             self.assertEqual(transport.digest_uploads, [])
+            self.assertEqual(gateway.peer_tops_calls, 0)
+            self.assertEqual(gateway.read_batches, [])
 
-    async def test_revocation_cancellation_during_monitor_never_runs_digest(self):
+    async def test_cancellation_during_digest_never_reaches_read_ack(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = make_paths(Path(temporary))
             seed_locked(paths, watch_phase="active")
-
-            class CancelledMonitorGateway(FakeGateway):
-                async def snapshot_and_scan_mentions(self, *_args):
-                    raise asyncio.CancelledError
-
-            gateway = CancelledMonitorGateway(paths)
+            gateway = FakeGateway(paths)
+            gateway.fetches[CHAT_IDS[0]] = asyncio.CancelledError()
             transport = FakeTransport(paths, gate(digest_due=True))
             digest_calls = []
             result = await collector_for(
@@ -2408,6 +2423,930 @@ class TestBugMonitorDigestStarvation20260814(
             self.assertEqual(result["last_result"], "revoked")
             self.assertEqual(digest_calls, [])
             self.assertEqual(transport.digest_uploads, [])
+            self.assertEqual(gateway.peer_tops_calls, 0)
+            self.assertEqual(gateway.read_batches, [])
+
+    async def test_revocation_during_read_ack_is_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+
+            class CancelledTopsGateway(FakeGateway):
+                async def snapshot_peer_tops(self, *_args):
+                    raise asyncio.CancelledError
+
+            gateway = CancelledTopsGateway(paths)
+            transport = FakeTransport(paths, gate(digest_due=True))
+            collector = collector_for(paths, gateway, transport)
+            result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "revoked")
+            self.assertEqual(gateway.read_batches, [])
+            self.assertIsNone(collector._read_ack_done)
+
+
+class TestBugOnlinePresence20260913(unittest.IsolatedAsyncioTestCase):
+    """Telegram трогается только в утреннем окне приёмника.
+
+    13.09.2026 Иван подтвердил: пока collector раз в минуту проходил по
+    Telegram (gate → TelegramClient → скан → read-ACK), контакты постоянно
+    видели его «в сети»; с выключенным приложением — нет. Какой именно запрос
+    даёт online, неизвестно, поэтому решение — касаться Telegram коротким
+    утренним окном 08:00–09:45 МСК: сначала выпуск, затем одна пометка
+    прочитанным за день. Упоминания больше не собираются и не доставляются,
+    «@» остаётся. Остальные тики — только gate к приёмнику."""
+
+    WINDOW = {
+        "prepare_not_before": "2026-08-04T08:00:00+03:00",
+        "accept_until": "2026-08-04T09:45:00+03:00",
+    }
+
+    def _gate(self, server_time, **kwargs):
+        return gate(server_time=server_time, **self.WINDOW, **kwargs)
+
+    @staticmethod
+    def _counting(collector, gateway):
+        constructed = []
+
+        def factory(*args):
+            constructed.append(args)
+            return gateway
+
+        collector.gateway_factory = factory
+        return constructed
+
+    async def test_outside_window_only_the_receiver_is_contacted(self):
+        # Часы Umbrel (NOW = 00:30Z) тоже вне окна, но решает время
+        # приёмника; оно и двигается в этом тесте.
+        cases = {
+            "before": dict(server_time="2026-08-04T04:59:59Z"),
+            "after": dict(server_time="2026-08-04T06:45:01Z"),
+            "after_even_if_due": dict(
+                server_time="2026-08-04T06:45:01Z", digest_due=True),
+        }
+        for name, options in cases.items():
+            with self.subTest(case=name), \
+                    tempfile.TemporaryDirectory() as temporary:
+                paths = make_paths(Path(temporary))
+                seed_locked(paths, watch_phase="active")
+                gateway = FakeGateway(paths)
+                gateway.tops = {CHAT_IDS[0]: 99, CHAT_IDS[1]: 99}
+                transport = FakeTransport(paths, self._gate(**options))
+                runtime = FakeVPNRuntime(paths.private_dir)
+                collector = collector_for(
+                    paths, gateway, transport, runtime=runtime)
+                constructed = self._counting(collector, gateway)
+                collector._telegram_stall_ticks = 2
+                before = paths.watch_state.read_bytes()
+                paths.heartbeat.unlink()
+
+                result = await collector.run_once()
+
+                self.assertEqual(result["last_result"], "idle")
+                self.assertIsNone(result["last_error_type"])
+                self.assertEqual(transport.gate_calls, 1)
+                self.assertEqual(constructed, [])
+                self.assertEqual(runtime.starts, [])
+                self.assertEqual(gateway.peer_tops_calls, 0)
+                self.assertEqual(gateway.read_batches, [])
+                self.assertEqual(gateway.fetch_calls, [])
+                self.assertEqual(collector._telegram_stall_ticks, 2)
+                self.assertEqual(paths.watch_state.read_bytes(), before)
+                self.assertTrue(paths.heartbeat.exists())
+
+    async def test_monitor_chain_is_verified_on_idle_tick_outside_window(self):
+        """Пустой тик вне окна не пропускает сверку цепочки monitor.
+
+        Ревью суточного режима 13.09.2026. Вне окна тик ходит только к
+        приёмнику, но и там прыжок или откат его цепочки обязан ронять тик
+        до решения «idle»: иначе разрыв молчал бы почти сутки. Отказ случается
+        до VPN и клиента, поэтому о маршруте Telegram он ничего не говорит и
+        счётчик stall не трогает."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            transport = FakeTransport(paths, self._gate(
+                "2026-08-04T12:00:00Z", monitor_sequence=99,
+                monitor_previous="c" * 64))
+            runtime = FakeVPNRuntime(paths.private_dir)
+            collector = collector_for(paths, gateway, transport, runtime=runtime)
+            constructed = self._counting(collector, gateway)
+            collector._telegram_stall_ticks = 2
+            before = paths.watch_state.read_bytes()
+
+            result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "error")
+            self.assertEqual(result["last_error_type"], "ReceiverChainError")
+            self.assertEqual(transport.gate_calls, 1)
+            self.assertEqual(runtime.starts, [])
+            self.assertEqual(constructed, [])
+            self.assertEqual(collector._telegram_stall_ticks, 2)
+            self.assertEqual(paths.watch_state.read_bytes(), before)
+
+    async def test_window_boundaries_are_inclusive_by_receiver_time(self):
+        for server_time in ("2026-08-04T05:00:00Z", "2026-08-04T06:45:00Z"):
+            with self.subTest(server_time=server_time), \
+                    tempfile.TemporaryDirectory() as temporary:
+                paths = make_paths(Path(temporary))
+                seed_locked(paths, watch_phase="active")
+                gateway = FakeGateway(paths)
+                transport = FakeTransport(paths, self._gate(server_time))
+                collector = collector_for(paths, gateway, transport)
+
+                result = await collector.run_once()
+
+                self.assertEqual(result["last_result"], "watched_not_due")
+                self.assertEqual(result["read_ack_result"], "read_acked")
+                self.assertEqual(gateway.peer_tops_calls, 1)
+
+    async def test_in_window_digest_goes_first_then_read_ack_to_the_top(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            trace = []
+            gateway = FakeGateway(paths, trace)
+            gateway.tops = {CHAT_IDS[0]: 41, CHAT_IDS[1]: 57}
+            transport = FakeTransport(
+                paths, self._gate("2026-08-04T05:10:00Z", digest_due=True), trace)
+
+            result = await collector_for(paths, gateway, transport).run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            self.assertEqual(result["read_ack_result"], "read_acked")
+            self.assertIsNone(result["last_error_type"])
+            self.assertEqual(
+                trace, ["status", "digest_upload", "tops", "read_batch"])
+            self.assertEqual(
+                [(row[0], row[2]) for row in gateway.read_batches[0]],
+                [(CHAT_IDS[0], 41), (CHAT_IDS[1], 57)])
+            state = read_json(paths.watch_state)
+            self.assertEqual(
+                [row["read_acked_through_message_id"] for row in state["chats"]],
+                [41, 57])
+            # Удалённая цепочка monitor при этом не двигается и не пополняется.
+            self.assertEqual(
+                [row["through_message_id"] for row in state["monitor_cursors"]],
+                [10, 20])
+            self.assertEqual(transport.monitor_uploads, [])
+
+    async def test_read_ack_failure_does_not_block_the_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+
+            class BrokenTopsGateway(FakeGateway):
+                async def snapshot_peer_tops(self, *_args):
+                    raise ConnectionError("Telegram refused")
+
+            gateway = BrokenTopsGateway(paths)
+            transport = FakeTransport(
+                paths, self._gate("2026-08-04T05:10:00Z", digest_due=True))
+            collector = collector_for(paths, gateway, transport)
+
+            result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            self.assertEqual(len(transport.digest_uploads), 1)
+            self.assertEqual(result["last_error_type"], "ConnectionError")
+            self.assertEqual(result["read_ack_result"], "error")
+            self.assertEqual(result["read_ack_error_type"], "ConnectionError")
+            self.assertEqual(result["failed_chat_count"], len(CHAT_IDS))
+            self.assertIsNone(collector._read_ack_done)
+
+    async def test_digest_failure_does_not_block_the_read_ack(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            gateway.tops = {CHAT_IDS[0]: 41, CHAT_IDS[1]: 57}
+            gateway.fetches[CHAT_IDS[1]] = RuntimeError("peer unavailable")
+            transport = FakeTransport(
+                paths, self._gate("2026-08-04T05:10:00Z", digest_due=True))
+
+            result = await collector_for(paths, gateway, transport).run_once()
+
+            self.assertEqual(result["last_result"], "error")
+            self.assertEqual(result["last_error_type"], "RuntimeError")
+            self.assertEqual(transport.digest_uploads, [])
+            self.assertEqual(result["read_ack_result"], "read_acked")
+            self.assertEqual(result["failed_chat_count"], 0)
+            self.assertEqual(len(gateway.read_batches), 1)
+            state = read_json(paths.watch_state)
+            self.assertEqual(
+                [row["read_acked_through_message_id"] for row in state["chats"]],
+                [41, 57])
+
+    async def test_read_ack_runs_once_per_digest_date(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            gateway.tops = {CHAT_IDS[0]: 41, CHAT_IDS[1]: 57}
+            transport = FakeTransport(paths, self._gate("2026-08-04T05:10:00Z"))
+            runtime = FakeVPNRuntime(paths.private_dir)
+            collector = collector_for(paths, gateway, transport, runtime=runtime)
+
+            first = await collector.run_once()
+            self.assertEqual(first["read_ack_result"], "read_acked")
+            self.assertEqual(gateway.peer_tops_calls, 1)
+
+            # Тот же день, в окне, новые сообщения: второго касания нет.
+            gateway.tops = {CHAT_IDS[0]: 45, CHAT_IDS[1]: 60}
+            constructed = self._counting(collector, gateway)
+            transport.value = self._gate("2026-08-04T05:15:00Z")
+            second = await collector.run_once()
+            self.assertEqual(second["last_result"], "idle")
+            self.assertEqual(constructed, [])
+            self.assertEqual(gateway.peer_tops_calls, 1)
+            self.assertEqual(len(gateway.read_batches), 1)
+            # Исход утренней пометки виден и на пустом тике.
+            self.assertEqual(second["read_ack_result"], "read_acked")
+
+            # Следующий день — снова одна пометка.
+            transport.value = gate(
+                server_time="2026-08-05T05:10:00Z", digest_date="2026-08-05",
+                prepare_not_before="2026-08-05T08:00:00+03:00",
+                accept_until="2026-08-05T09:45:00+03:00",
+            )
+            # Согласие продлено на следующие сутки: иначе время приёмника
+            # вышло бы за его срок и тик честно остановился бы как revoked.
+            settings = read_json(paths.settings)
+            settings["consent"]["expires_at"] = "2026-08-06T00:00:00Z"
+            atomic_write_json(paths.settings, settings)
+            third = await collector.run_once()
+            self.assertEqual(third["read_ack_result"], "read_acked")
+            self.assertEqual(gateway.peer_tops_calls, 2)
+            self.assertEqual(
+                [(row[0], row[2]) for row in gateway.read_batches[-1]],
+                [(CHAT_IDS[0], 45), (CHAT_IDS[1], 60)])
+
+    async def test_chat_extended_after_the_days_read_ack_is_marked_same_window(self):
+        """Набор чатов входит в ключ дня пометки.
+
+        Ревью суточного режима 13.09.2026. Ключ из одних source_id и
+        digest_date считал бы день закрытым и после расширения: чат, принятый
+        и активированный extension baseline в том же окне, остался бы с
+        непрочитанным до следующего утра."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            gateway.tops = {CHAT_IDS[0]: 41, CHAT_IDS[1]: 57}
+            transport = FakeTransport(paths, self._gate("2026-08-04T05:10:00Z"))
+            collector = collector_for(paths, gateway, transport)
+
+            first = await collector.run_once()
+            self.assertEqual(first["read_ack_result"], "read_acked")
+            self.assertEqual(
+                [row[0] for row in gateway.read_batches[-1]], CHAT_IDS)
+
+            # Чат принят расширением после утренней пометки, в том же окне.
+            order = seed_pending_extension(paths)
+            extension_gateway(gateway, order)
+            gateway.tops = {CHAT_IDS[0]: 41, CHAT_IDS[1]: 57, NEW_CHAT_ID: 4242}
+            transport.value = extended_gate(
+                server_time="2026-08-04T05:15:00Z", **self.WINDOW)
+            transport.expected_chat_ids = order
+
+            second = await collector.run_once()
+
+            self.assertEqual(
+                [row["kind"] for row in transport.monitor_uploads],
+                ["extension_baseline"])
+            self.assertEqual(second["read_ack_result"], "read_acked")
+            self.assertEqual(len(gateway.read_batches), 2)
+            # Уже помеченные чаты не помечаются заново: вершины не сдвинулись.
+            self.assertEqual(
+                [(row[0], row[2]) for row in gateway.read_batches[-1]],
+                [(NEW_CHAT_ID, 4242)])
+            state = read_json(paths.watch_state)
+            self.assertEqual(
+                {row["chat_id"]: row["read_acked_through_message_id"]
+                 for row in state["chats"]},
+                {CHAT_IDS[0]: 41, CHAT_IDS[1]: 57, NEW_CHAT_ID: 4242})
+
+            # Для расширенного набора день теперь закрыт.
+            transport.value["server_time"] = "2026-08-04T05:20:00Z"
+            self.assertEqual((await collector.run_once())["last_result"], "idle")
+            self.assertEqual(gateway.peer_tops_calls, 2)
+
+    async def test_restart_inside_the_window_repeats_the_read_ack_once(self):
+        """Метка «сделано» живёт в памяти: рестарт в окне даёт один повтор,
+        и он ничего не помечает заново, если вершины не сдвинулись."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            gateway.tops = {CHAT_IDS[0]: 41, CHAT_IDS[1]: 57}
+            transport = FakeTransport(paths, self._gate("2026-08-04T05:10:00Z"))
+            await collector_for(paths, gateway, transport).run_once()
+            restarted = collector_for(paths, gateway, transport)
+
+            result = await restarted.run_once()
+
+            self.assertEqual(result["read_ack_result"], "read_acked")
+            self.assertEqual(gateway.peer_tops_calls, 2)
+            self.assertEqual(len(gateway.read_batches), 1)
+            self.assertEqual(
+                (await restarted.run_once())["last_result"], "idle")
+
+    async def test_partial_read_ack_repeats_on_the_next_tick_until_confirmed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            gateway.tops = {CHAT_IDS[0]: 41, CHAT_IDS[1]: 57}
+            gateway.read_failures = [CHAT_IDS[0]]
+            transport = FakeTransport(paths, self._gate("2026-08-04T05:10:00Z"))
+            collector = collector_for(paths, gateway, transport)
+
+            first = await collector.run_once()
+            self.assertEqual(first["read_ack_result"], "read_ack_partial")
+            self.assertEqual(first["failed_chat_count"], 1)
+
+            gateway.read_failures = []
+            transport.value = self._gate("2026-08-04T05:15:00Z")
+            second = await collector.run_once()
+            self.assertEqual(second["read_ack_result"], "read_acked")
+            self.assertEqual(gateway.peer_tops_calls, 2)
+            self.assertEqual(
+                [row[0] for row in gateway.read_batches[-1]], [CHAT_IDS[0]])
+
+            transport.value = self._gate("2026-08-04T05:20:00Z")
+            self.assertEqual((await collector.run_once())["last_result"], "idle")
+            self.assertEqual(gateway.peer_tops_calls, 2)
+
+    async def test_active_phase_never_uploads_mentions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+
+            class NoMentionGateway(FakeGateway):
+                async def snapshot_and_scan_mentions(self, *_args):
+                    raise AssertionError("mention scan must never run")
+
+            gateway = NoMentionGateway(paths)
+            transport = FakeTransport(paths, self._gate(
+                "2026-08-04T05:10:00Z", digest_due=True))
+            collector = collector_for(paths, gateway, transport)
+            for minute, due in ((10, True), (15, False), (20, False)):
+                gateway.tops = {CHAT_IDS[0]: 40 + minute, CHAT_IDS[1]: 60 + minute}
+                transport.value["server_time"] = f"2026-08-04T05:{minute}:00Z"
+                transport.value["digest"]["due"] = due
+                await collector.run_once()
+            transport.value["server_time"] = "2026-08-04T12:00:00Z"
+            await collector.run_once()
+
+            self.assertEqual(transport.monitor_uploads, [])
+            self.assertFalse(paths.monitor_pending.exists())
+
+    async def test_undelivered_legacy_mentions_are_discarded_not_uploaded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            outside = self._gate("2026-08-04T12:00:00Z")
+            payload = legacy_mentions_payload(outside, 0, 16)
+            atomic_write_bytes(
+                paths.monitor_pending, canonical_monitor_bytes(payload), 0o600)
+            before = read_json(paths.watch_state)
+            gateway = FakeGateway(paths)
+            transport = FakeTransport(paths, outside)
+
+            result = await collector_for(paths, gateway, transport).run_once()
+
+            self.assertEqual(result["last_result"], "monitor_service_done")
+            self.assertEqual(transport.monitor_uploads, [])
+            self.assertFalse(paths.monitor_pending.exists())
+            self.assertEqual(read_json(paths.watch_state), before)
+
+    async def test_legacy_mentions_already_accepted_are_only_reconciled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            outside = self._gate("2026-08-04T12:00:00Z")
+            payload = legacy_mentions_payload(outside, 0, 16)
+            atomic_write_bytes(
+                paths.monitor_pending, canonical_monitor_bytes(payload), 0o600)
+            accepted = self._gate(
+                "2026-08-04T12:00:00Z", monitor_sequence=3,
+                monitor_previous=payload["content_sha256"],
+                monitor_cursors={CHAT_IDS[0]: 16, CHAT_IDS[1]: 20})
+            transport = FakeTransport(paths, accepted)
+
+            result = await collector_for(
+                paths, FakeGateway(paths), transport).run_once()
+
+            self.assertEqual(result["last_result"], "monitor_service_done")
+            self.assertEqual(transport.monitor_uploads, [])
+            self.assertFalse(paths.monitor_pending.exists())
+            state = read_json(paths.watch_state)
+            self.assertEqual(state["monitor_sequence"], 2)
+            self.assertEqual(state["chats"][0]["scan_through_message_id"], 16)
+
+    async def test_activation_and_extension_do_not_wait_for_the_window(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="activation_requested")
+            gateway = FakeGateway(paths)
+            transport = FakeTransport(paths, self._gate(
+                "2026-08-04T12:00:00Z", baseline_required=True))
+            digest_calls = []
+            result = await collector_for(
+                paths, gateway, transport, digest_calls).run_once()
+
+            self.assertEqual(result["last_result"], "monitor_service_done")
+            self.assertEqual(
+                [row["kind"] for row in transport.monitor_uploads], ["baseline"])
+            self.assertEqual(len(gateway.read_batches), 1)
+            self.assertEqual(read_json(paths.watch_state)["phase"], "active")
+            self.assertEqual(digest_calls, [])
+            self.assertEqual(gateway.peer_tops_calls, 0)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            order = seed_pending_extension(paths)
+            gateway = extension_gateway(FakeGateway(paths), order)
+            transport = FakeTransport(
+                paths, extended_gate(server_time="2026-08-04T12:00:00Z",
+                                     **self.WINDOW))
+            transport.expected_chat_ids = order
+
+            result = await collector_for(paths, gateway, transport).run_once()
+
+            self.assertEqual(result["last_result"], "monitor_service_done")
+            self.assertEqual(
+                [row["kind"] for row in transport.monitor_uploads],
+                ["extension_baseline"])
+            self.assertNotIn(
+                "pending_extension_chat_ids", read_json(paths.watch_state))
+            self.assertEqual(gateway.peer_tops_calls, 0)
+
+    async def test_stall_is_counted_only_on_ticks_that_touched_telegram(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            gateway.top_failures = list(CHAT_IDS)
+            transport = FakeTransport(paths, self._gate("2026-08-04T05:10:00Z"))
+            collector = collector_for(paths, gateway, transport)
+
+            await collector.run_once()
+            self.assertEqual(collector._telegram_stall_ticks, 1)
+
+            # Вне окна Telegram не трогается: ни провала, ни успеха.
+            transport.value = self._gate("2026-08-04T12:00:00Z")
+            self.assertEqual((await collector.run_once())["last_result"], "idle")
+            self.assertEqual(collector._telegram_stall_ticks, 1)
+
+            # Отказ на пустом тике (gate) тоже не про маршрут Telegram.
+            transport.value = {"broken": True}
+            self.assertEqual((await collector.run_once())["last_result"], "error")
+            self.assertEqual(collector._telegram_stall_ticks, 1)
+
+            # Gate ОТВЕТИЛ, но цепочка monitor прыгнула: отказ после gate,
+            # а Telegram не трогали. Правило «любое исключение после gate»
+            # засчитало бы его — этот шаг их и различает.
+            transport.value = self._gate(
+                "2026-08-04T12:00:00Z", monitor_sequence=99,
+                monitor_previous="c" * 64)
+            jumped = await collector.run_once()
+            self.assertEqual(jumped["last_error_type"], "ReceiverChainError")
+            self.assertEqual(collector._telegram_stall_ticks, 1)
+
+            transport.value = self._gate("2026-08-04T05:15:00Z")
+            await collector.run_once()
+            self.assertEqual(collector._telegram_stall_ticks, 2)
+
+            gateway.top_failures = []
+            transport.value = self._gate("2026-08-04T05:20:00Z")
+            await collector.run_once()
+            self.assertEqual(collector._telegram_stall_ticks, 0)
+
+    async def test_three_failed_window_ticks_reresolve_within_fifteen_minutes(self):
+        """Такт 300 с и порог в три тика: самолечение VPN начинается через
+        два интервала после первого провала — около 10 минут, в пределах
+        15 и задолго до конца окна."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            atomic_write_json(
+                paths.vpn_node_origin, {"hostname": "vpn.example.com"}, 0o600)
+            gateway = FakeGateway(paths)
+
+            async def dead_route(*_args, **_kwargs):
+                raise ConnectionError("Connection to Telegram failed")
+
+            gateway.snapshot_peer_tops = dead_route
+            start = datetime(2026, 8, 4, 5, 0, tzinfo=timezone.utc)
+            transport = FakeTransport(paths, self._gate("2026-08-04T05:00:00Z"))
+            clock = [10_000.0]
+            collector = collector_for(paths, gateway, transport)
+            collector.monotonic = lambda: clock[0]
+            collector.node_resolver = lambda nodes: [
+                dict(nodes[0], server="9.9.9.9")]
+
+            async def probe(*_args):
+                return True
+
+            collector.telegram_probe_function = probe
+            first_failure = clock[0]
+            ticks = collector_module.VPN_STALL_TICKS_BEFORE_RERESOLVE
+            for index in range(ticks):
+                moment = start + timedelta(seconds=SCHEDULER_TICK_S * index)
+                transport.value["server_time"] = moment.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+                clock[0] = first_failure + SCHEDULER_TICK_S * index
+                if index < ticks - 1:
+                    await collector.run_once()
+                    self.assertIsNone(collector._vpn_repair_task)
+            await collector.run_once()
+
+            self.assertIsNotNone(collector._vpn_repair_task)
+            self.assertLessEqual(clock[0] - first_failure, 15 * 60)
+            self.assertGreaterEqual(clock[0] - first_failure, 10 * 60)
+            await collector._vpn_repair_task
+            self.assertEqual(read_json(paths.vpn_active_node)["server"], "9.9.9.9")
+
+
+class TestBugStallWithLiveTelegram20260913(unittest.IsolatedAsyncioTestCase):
+    """Сбой рядом с Telegram не должен гасить живой маршрут.
+
+    Ревью суточного режима 13.09.2026. Раньше поминутный скан упоминаний шёл
+    первым в каждом тике и своим успехом обнулял счётчик stall до выпуска.
+    Без скана любой отказ выпуска и любой ReceiverChainError на тике, где
+    поднимали VPN, засчитывались как stall без сброса: три подряд сбоя
+    OpenRouter, туннеля, выгрузки или цепочки запускали перерезолв VPN при
+    исправном Telegram. Stall — это тик, где Telegram-операции были и не
+    ответила ни одна."""
+
+    @staticmethod
+    def _gate(server_time, **kwargs):
+        return gate(server_time=server_time,
+                    **TestBugOnlinePresence20260913.WINDOW, **kwargs)
+
+    @staticmethod
+    def _self_healing(collector, paths, clock):
+        """Самолечение VPN взведено: имя хоста известно, адрес сменился.
+
+        Такт идёт по подменённым monotonic-часам, иначе повторная попытка
+        выпуска упёрлась бы в пятиминутный digest_cooldown и не дошла бы до
+        Telegram."""
+        atomic_write_json(
+            paths.vpn_node_origin, {"hostname": "vpn.example.com"}, 0o600)
+        collector.monotonic = lambda: clock[0]
+        collector.node_resolver = lambda nodes: [
+            dict(nodes[0], server="9.9.9.9")]
+
+        async def probe(*_args):
+            return True
+
+        collector.telegram_probe_function = probe
+
+    def _tick(self, transport, clock, index):
+        moment = datetime(2026, 8, 4, 5, 10, tzinfo=timezone.utc) + timedelta(
+            seconds=SCHEDULER_TICK_S * index)
+        transport.value["server_time"] = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+        clock[0] = 10_000.0 + SCHEDULER_TICK_S * index
+
+    async def test_digest_failure_with_answering_telegram_is_not_a_stall(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            gateway.tops = {CHAT_IDS[0]: 41, CHAT_IDS[1]: 57}
+            transport = FakeTransport(
+                paths, self._gate("2026-08-04T05:10:00Z", digest_due=True))
+            collector = collector_for(paths, gateway, transport)
+            clock = [10_000.0]
+            self._self_healing(collector, paths, clock)
+            refused = []
+
+            async def failing_digest(*_args):
+                refused.append(True)
+                raise RuntimeError("OpenRouter refused")
+
+            collector.digest_function = failing_digest
+
+            for index in range(collector_module.VPN_STALL_TICKS_BEFORE_RERESOLVE):
+                self._tick(transport, clock, index)
+                result = await collector.run_once()
+                self.assertEqual(result["last_result"], "error")
+                self.assertEqual(result["last_error_type"], "RuntimeError")
+                self.assertEqual(collector._telegram_stall_ticks, 0)
+
+            # Выпуск каждый тик доходил до модели, то есть через Telegram.
+            self.assertEqual(
+                len(refused), collector_module.VPN_STALL_TICKS_BEFORE_RERESOLVE)
+            self.assertEqual(result["read_ack_result"], "read_acked")
+            self.assertEqual(len(gateway.read_batches), 1)
+            self.assertIsNone(collector._vpn_repair_task)
+            self.assertEqual(read_json(paths.vpn_active_node), VPN_NODE)
+
+    async def test_receiver_chain_error_after_gate_leaves_the_counter_alone(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            transport = FakeTransport(paths, self._gate(
+                "2026-08-04T05:10:00Z", digest_due=True, digest_sequence=2,
+                digest_previous="a" * 64))
+            runtime = FakeVPNRuntime(paths.private_dir)
+            collector = collector_for(paths, gateway, transport, runtime=runtime)
+            constructed = TestBugOnlinePresence20260913._counting(
+                collector, gateway)
+            collector._telegram_stall_ticks = 2
+
+            result = await collector.run_once()
+
+            self.assertEqual(result["last_error_type"], "ReceiverChainError")
+            # Тик честно шёл к Telegram — VPN поднят, gateway создан, — но ни
+            # одной Telegram-операции не случилось: счётчик не растёт и не
+            # обнуляется.
+            self.assertEqual(len(runtime.starts), 1)
+            self.assertEqual(len(constructed), 1)
+            self.assertEqual(gateway.boundary_calls, [])
+            self.assertEqual(gateway.peer_tops_calls, 0)
+            self.assertEqual(collector._telegram_stall_ticks, 2)
+
+    async def test_dead_telegram_for_every_operation_reresolves_on_third_tick(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+
+            class DeadRouteGateway(FakeGateway):
+                async def snapshot_peer_tops(self, *_args):
+                    raise ConnectionError("Connection to Telegram failed")
+
+                async def acknowledge_reads(self, *_args):
+                    raise ConnectionError("Connection to Telegram failed")
+
+                async def boundary_cursor(self, *_args):
+                    raise ConnectionError("Connection to Telegram failed")
+
+                async def fetch(self, *_args, **_kwargs):
+                    raise ConnectionError("Connection to Telegram failed")
+
+            transport = FakeTransport(
+                paths, self._gate("2026-08-04T05:10:00Z", digest_due=True))
+            collector = collector_for(paths, DeadRouteGateway(paths), transport)
+            clock = [10_000.0]
+            self._self_healing(collector, paths, clock)
+            ticks = collector_module.VPN_STALL_TICKS_BEFORE_RERESOLVE
+
+            for index in range(ticks):
+                self._tick(transport, clock, index)
+                result = await collector.run_once()
+                self.assertEqual(result["last_error_type"], "ConnectionError")
+                self.assertEqual(result["read_ack_error_type"], "ConnectionError")
+                if index < ticks - 1:
+                    self.assertEqual(collector._telegram_stall_ticks, index + 1)
+                    self.assertIsNone(collector._vpn_repair_task)
+
+            self.assertIsNotNone(collector._vpn_repair_task)
+            await collector._vpn_repair_task
+            self.assertEqual(read_json(paths.vpn_active_node)["server"], "9.9.9.9")
+
+
+class TestBugEndlessPartialReadAck20260913(unittest.IsolatedAsyncioTestCase):
+    """Стабильно падающий чат не должен держать Telegram открытым всё окно.
+
+    Ревью суточного режима 13.09.2026. День пометки закрывался только
+    полностью подтверждённым, поэтому чат с протухшим access_hash или вечно
+    отклоняемым read-ACK заставлял КАЖДЫЙ тик окна 08:00–09:45 — 22 тика —
+    поднимать клиента и идти в Telegram. Это ровно тот «в сети», против
+    которого суточный режим и делался. Попыток за день теперь не больше
+    трёх, дальше до следующей даты выпуска тики пустые."""
+
+    async def test_always_failing_peer_gets_three_attempts_then_idle(self):
+        start = datetime(2026, 8, 4, 5, 0, tzinfo=timezone.utc)
+        end = datetime(2026, 8, 4, 6, 45, tzinfo=timezone.utc)
+        ticks = int((end - start).total_seconds()) // SCHEDULER_TICK_S + 1
+        self.assertEqual(ticks, 22)
+        for failing in ("top", "read"):
+            with self.subTest(failing=failing), \
+                    tempfile.TemporaryDirectory() as temporary:
+                paths = make_paths(Path(temporary))
+                seed_locked(paths, watch_phase="active")
+                gateway = FakeGateway(paths)
+                gateway.tops = {CHAT_IDS[0]: 41, CHAT_IDS[1]: 57}
+                if failing == "top":
+                    gateway.top_failures = [CHAT_IDS[0]]
+                else:
+                    gateway.read_failures = [CHAT_IDS[0]]
+                transport = FakeTransport(paths, gate(
+                    server_time="2026-08-04T05:00:00Z", digest_due=True,
+                    **TestBugOnlinePresence20260913.WINDOW))
+                collector = collector_for(paths, gateway, transport)
+                constructed = TestBugOnlinePresence20260913._counting(
+                    collector, gateway)
+
+                results = []
+                for index in range(ticks):
+                    moment = start + timedelta(seconds=SCHEDULER_TICK_S * index)
+                    transport.value["server_time"] = moment.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ")
+                    results.append(await collector.run_once())
+
+                limit = collector_module.MORNING_READ_ACK_MAX_ATTEMPTS
+                self.assertEqual(limit, 3)
+                self.assertEqual(results[0]["last_result"], "uploaded_digest")
+                self.assertEqual(len(transport.digest_uploads), 1)
+                self.assertEqual(gateway.peer_tops_calls, limit)
+                self.assertEqual(len(constructed), limit)
+                self.assertEqual(
+                    [row["read_ack_result"] for row in results[:limit]],
+                    ["read_ack_partial"] * limit)
+                self.assertEqual(
+                    {row["last_result"] for row in results[limit:]}, {"idle"})
+                # Исход дня остаётся виден на пустых тиках.
+                self.assertEqual(results[-1]["read_ack_result"], "read_ack_partial")
+
+                # Лимит — на дату выпуска: следующий день снова получает
+                # свои три попытки, а не наследует исчерпанные.
+                settings = read_json(paths.settings)
+                settings["consent"]["expires_at"] = "2026-08-06T00:00:00Z"
+                atomic_write_json(paths.settings, settings)
+                transport.value = gate(
+                    server_time="2026-08-05T05:00:00Z", digest_date="2026-08-05",
+                    prepare_not_before="2026-08-05T08:00:00+03:00",
+                    accept_until="2026-08-05T09:45:00+03:00",
+                    digest_sequence=2,
+                    digest_previous=transport.digest_uploads[0]["content_sha256"],
+                    digest_cursors={CHAT_IDS[0]: 1, CHAT_IDS[1]: 1})
+                for minute in (0, 5, 10, 15):
+                    transport.value["server_time"] = f"2026-08-05T05:{minute:02d}:00Z"
+                    last = await collector.run_once()
+                self.assertEqual(gateway.peer_tops_calls, 2 * limit)
+                self.assertEqual(last["last_result"], "idle")
+
+    async def test_every_peer_failing_on_a_live_connection_is_still_capped(self):
+        """Отказ всех чатов при живом соединении не должен открывать все 22 тика.
+
+        Повторное ревью 13.09.2026. Тик, где Telegram не ответил ни на одну
+        операцию, попытку не тратит — ради ночной ротации. Но FLOOD_WAIT на
+        весь аккаунт или CHANNEL_PRIVATE у каждого чата выглядят отсюда так
+        же: пачка вернулась штатно, успешных чатов нет. Без отдельного
+        потолка тиков такой день снова шёл в Telegram каждые пять минут."""
+        start = datetime(2026, 8, 4, 5, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            gateway.tops = {CHAT_IDS[0]: 41, CHAT_IDS[1]: 57}
+            gateway.top_failures = list(CHAT_IDS)
+            transport = FakeTransport(paths, gate(
+                server_time="2026-08-04T05:00:00Z", digest_due=True,
+                **TestBugOnlinePresence20260913.WINDOW))
+            collector = collector_for(paths, gateway, transport)
+
+            results = []
+            for index in range(22):
+                moment = start + timedelta(seconds=SCHEDULER_TICK_S * index)
+                transport.value["server_time"] = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+                results.append(await collector.run_once())
+
+            ceiling = collector_module.MORNING_READ_ACK_MAX_TICKS
+            self.assertEqual(ceiling, 9)
+            self.assertEqual(results[0]["last_result"], "uploaded_digest")
+            self.assertEqual(gateway.peer_tops_calls, ceiling)
+            self.assertEqual(
+                {row["last_result"] for row in results[ceiling:]}, {"idle"})
+            self.assertEqual(results[-1]["read_ack_result"], "read_ack_partial")
+
+    async def test_dead_route_ticks_do_not_spend_read_ack_attempts(self):
+        """Утро после ночной ротации узла не должно терять пометку за день.
+
+        Ревью доков 13.09.2026. Ротация в 01:00 UTC — каждую ночь, и первые
+        тики окна идут по протухшему адресу. Если каждый такой тик тратил
+        попытку, три мёртвых тика до перерезолва исчерпывали лимит, и после
+        переезда пометка за день уже не шла. Мёртвый тик Telegram не
+        достигает и «в сети» не держит — попытку он тратить не должен."""
+
+        class DeadRouteGateway(FakeGateway):
+            dead = True
+
+            def _check_route(self):
+                if self.dead:
+                    raise ConnectionError("route is dead")
+
+            async def snapshot_peer_tops(self, *args):
+                self._check_route()
+                return await super().snapshot_peer_tops(*args)
+
+            async def acknowledge_reads(self, *args):
+                self._check_route()
+                return await super().acknowledge_reads(*args)
+
+            async def boundary_cursor(self, *args):
+                self._check_route()
+                return await super().boundary_cursor(*args)
+
+            async def fetch(self, *args, **kwargs):
+                self._check_route()
+                return await super().fetch(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = DeadRouteGateway(paths)
+            gateway.tops = {CHAT_IDS[0]: 41, CHAT_IDS[1]: 57}
+            transport = FakeTransport(paths, gate(
+                server_time="2026-08-04T05:00:00Z", digest_due=True,
+                **TestBugOnlinePresence20260913.WINDOW))
+            collector = collector_for(paths, gateway, transport)
+            # Такт по подменённым monotonic-часам: иначе повтор выпуска
+            # упёрся бы в пятиминутный digest_cooldown.
+            clock = [1000.0]
+            collector.monotonic = lambda: clock[0]
+            limit = collector_module.MORNING_READ_ACK_MAX_ATTEMPTS
+            start = datetime(2026, 8, 4, 5, 0, tzinfo=timezone.utc)
+
+            def tick(index):
+                clock[0] = 1000.0 + (SCHEDULER_TICK_S + 30) * index
+                moment = start + timedelta(seconds=SCHEDULER_TICK_S * index)
+                transport.value["server_time"] = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            for index in range(limit + 1):
+                tick(index)
+                dead = await collector.run_once()
+                self.assertEqual(dead["read_ack_result"], "error")
+            self.assertEqual(gateway.read_batches, [])
+            key = collector._read_ack_key(transport.value, SOURCE_ID, CHAT_IDS)
+            self.assertEqual(collector._read_ack_attempts, (key, 0, limit + 1))
+
+            gateway.dead = False
+            tick(limit + 1)
+            alive = await collector.run_once()
+
+            self.assertEqual(alive["last_result"], "uploaded_digest")
+            self.assertEqual(alive["read_ack_result"], "read_acked")
+            self.assertEqual(
+                sorted(chat_id for batch in gateway.read_batches
+                       for chat_id, _peer, _max_id in batch),
+                sorted(CHAT_IDS))
+
+    async def test_reset_and_manual_revocation_forget_the_days_read_ack(self):
+        """Исход пометки и счётчик попыток принадлежат прежней эпохе.
+
+        Как счётчик stall и cooldown авторезолва рядом с ними. Пережив factory
+        reset или подтверждение ручного отзыва, read_ack_* показали бы
+        следующей конфигурации чужой исход в интерфейсе, а метка «сделано» и
+        исчерпанный лимит в памяти пережили бы эпоху, к которой относятся."""
+        exits = {
+            "revoke_and_reset": lambda collector: collector.revoke_and_reset(),
+            "acknowledge_manual_revocation":
+                lambda collector: collector.acknowledge_manual_revocation(),
+        }
+        for name, finish in exits.items():
+            with self.subTest(exit=name), \
+                    tempfile.TemporaryDirectory() as temporary:
+                paths = make_paths(Path(temporary))
+                seed_locked(paths, watch_phase="active")
+
+                # Вершины Telegram отдаёт, отказывает сама пометка: попытку
+                # тратит только тик, где Telegram ответил хоть на что-то.
+                class BrokenReadGateway(FakeGateway):
+                    async def acknowledge_reads(self, *_args):
+                        raise ConnectionError("Telegram refused")
+
+                gateway = BrokenReadGateway(paths)
+                gateway.tops = {CHAT_IDS[0]: 41, CHAT_IDS[1]: 57}
+                transport = FakeTransport(paths, gate(
+                    server_time="2026-08-04T05:10:00Z",
+                    **TestBugOnlinePresence20260913.WINDOW))
+                collector = collector_for(paths, gateway, transport)
+                limit = collector_module.MORNING_READ_ACK_MAX_ATTEMPTS
+                for minute in range(10, 10 + 5 * limit, 5):
+                    transport.value["server_time"] = f"2026-08-04T05:{minute}:00Z"
+                    status = await collector.run_once()
+                self.assertEqual(status["read_ack_result"], "error")
+                self.assertEqual(status["read_ack_error_type"], "ConnectionError")
+                key = collector._read_ack_key(
+                    transport.value, SOURCE_ID, CHAT_IDS)
+                self.assertEqual(collector._read_ack_done, key)
+                self.assertEqual(collector._read_ack_attempts, (key, limit, limit))
+
+                if name == "acknowledge_manual_revocation":
+                    atomic_write_json(paths.revocation_warning, {
+                        "schema": "sunny.personal-chats.revocation-warning.v1",
+                        "warning": "TelegramLogoutUnconfirmed",
+                        "created_at": "2026-08-04T05:30:00Z",
+                    })
+                result = await finish(collector)
+
+                self.assertIn(
+                    result["last_result"],
+                    {"reset", "manual_revocation_acknowledged"})
+                self.assertIsNone(result["read_ack_result"])
+                self.assertIsNone(result["read_ack_error_type"])
+                on_disk = read_json(paths.status)
+                self.assertIsNone(on_disk["read_ack_result"])
+                self.assertIsNone(on_disk["read_ack_error_type"])
+                self.assertIsNone(collector._read_ack_done)
+                self.assertIsNone(collector._read_ack_attempts)
 
 
 class TestRecentRunsJournal20260817(unittest.IsolatedAsyncioTestCase):
@@ -2666,9 +3605,10 @@ class TestOpenRouterTunnelLifecycle20260818(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["last_error_type"], "TunnelUnavailableError")
             self.assertEqual(transport.digest_uploads, [])
 
-    async def test_keygen_failure_does_not_stop_mention_monitoring(self):
-        """Инвариант «ошибка digest не блокирует monitor»: канал — забота
-        только дайджеста, и отказ ssh-keygen не должен уносить упоминания."""
+    async def test_keygen_failure_does_not_stop_the_morning_read_ack(self):
+        """Инвариант «ошибка digest не блокирует пометку прочитанным»: канал —
+        забота только дайджеста, и отказ ssh-keygen не должен уносить
+        утреннюю пометку (до 13.09.2026 — монитор упоминаний)."""
         with tempfile.TemporaryDirectory() as temporary:
             paths = make_paths(Path(temporary))
             seed_locked(paths, watch_phase="active")
@@ -2678,15 +3618,18 @@ class TestOpenRouterTunnelLifecycle20260818(unittest.IsolatedAsyncioTestCase):
 
             trace = []
             transport = FakeTransport(paths, gate(digest_due=True), trace)
-            collector = collector_for(paths, FakeGateway(paths), transport)
+            gateway = FakeGateway(paths, trace)
+            gateway.tops = {CHAT_IDS[0]: 11, CHAT_IDS[1]: 21}
+            collector = collector_for(paths, gateway, transport)
             collector.openrouter_keygen_function = failing_keygen
             result = await collector.run_once()
 
-            # monitor успел пройти: гейт запрошен, Telegram просканирован —
-            # раньше keygen стоял в общем префиксе и ронял тик до этого
+            # пометка прошла: раньше keygen стоял в общем префиксе и ронял
+            # тик до обращения к Telegram
             self.assertGreater(transport.gate_calls, 0)
-            self.assertIn("status", trace)
+            self.assertIn("read_batch", trace)
             self.assertEqual(result["last_result"], "error")
+            self.assertEqual(result["read_ack_result"], "read_acked")
 
 
 class TestResetWipesTunnelKey20260818(unittest.IsolatedAsyncioTestCase):
@@ -2917,7 +3860,7 @@ class TestBugVPNAddressRotation20260819(unittest.IsolatedAsyncioTestCase):
             seed_locked(paths, watch_phase="active")
             self._seed_origin(paths)
             gateway = FakeGateway(paths)
-            gateway.scan_failures = list(CHAT_IDS)
+            gateway.top_failures = list(CHAT_IDS)
             collector = collector_for(
                 paths, gateway, FakeTransport(paths, gate(digest_due=False)))
             collector.node_resolver = lambda nodes: [
@@ -2929,7 +3872,7 @@ class TestBugVPNAddressRotation20260819(unittest.IsolatedAsyncioTestCase):
             collector.telegram_probe_function = probe
 
             for _ in range(collector_module.VPN_STALL_TICKS_BEFORE_RERESOLVE):
-                gateway.scan_failures = list(CHAT_IDS)
+                gateway.top_failures = list(CHAT_IDS)
                 await collector.run_once()
 
             self.assertIsNotNone(collector._vpn_repair_task)
@@ -2949,7 +3892,7 @@ class TestBugVPNAddressRotation20260819(unittest.IsolatedAsyncioTestCase):
             async def dead_route(*_args, **_kwargs):
                 raise ConnectionError("Connection to Telegram failed")
 
-            gateway.snapshot_and_scan_mentions = dead_route
+            gateway.snapshot_peer_tops = dead_route
             collector = collector_for(
                 paths, gateway, FakeTransport(paths, gate(digest_due=False)))
             collector.node_resolver = lambda nodes: [
@@ -3053,6 +3996,47 @@ if __name__ == "__main__":
 
 NEW_CHAT_ID = -1003334567890
 NEW_PEER = PeerSpec("channel", 3334567890, 555444)
+
+
+def seed_pending_extension(paths: Paths) -> list:
+    """Чат принят расширением и ждёт extension baseline; вернуть порядок."""
+    settings = read_json(paths.settings)
+    settings["chats"] = sorted(
+        settings["chats"] + [{
+            "chat_id": NEW_CHAT_ID, "title": "Добавленный чат",
+            "peer": NEW_PEER.as_dict(), "initial_message_id": 0,
+        }], key=lambda row: row["chat_id"])
+    atomic_write_json(paths.settings, settings)
+    order = [row["chat_id"] for row in settings["chats"]]
+    watch = read_json(paths.watch_state)
+    watch["monitor_cursors"] = collector_module._extended_cursor_rows(
+        watch["monitor_cursors"], NEW_CHAT_ID,
+        {"chat_id": NEW_CHAT_ID, "through_message_id": 0}, order)
+    watch["chats"] = collector_module._extended_cursor_rows(
+        watch["chats"], NEW_CHAT_ID,
+        {"chat_id": NEW_CHAT_ID, "scan_through_message_id": 0,
+         "read_pending_through_message_id": 0,
+         "read_acked_through_message_id": 0}, order)
+    watch["pending_extension_chat_ids"] = [NEW_CHAT_ID]
+    atomic_write_json(paths.watch_state, watch)
+    return order
+
+
+def extension_gateway(gateway, order):
+    gateway.expected_chat_ids = order
+    gateway.tops = {**BASELINE_TOPS, NEW_CHAT_ID: 4242}
+    gateway.boundary[NEW_CHAT_ID] = 0
+    gateway.fetches[NEW_CHAT_ID] = FetchResult(
+        1, [SelectedMessage(1, 9, NOW, "text-new")])
+    return gateway
+
+
+def extended_gate(**kwargs):
+    """Gate приёмника, уже объявившего новый чат с нулевым курсором."""
+    cursors = {**BASELINE_TOPS, NEW_CHAT_ID: 0}
+    ordered = sorted(cursors)
+    return gate(monitor_cursors={key: cursors[key] for key in ordered},
+                digest_cursors={key: 0 for key in ordered}, **kwargs)
 
 
 class TestChatSetExtension20260820(unittest.IsolatedAsyncioTestCase):
@@ -3163,6 +4147,28 @@ class TestChatSetExtension20260820(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [row["chat_id"] for row in watch["monitor_cursors"]], order)
             self.assertEqual([row["chat_id"] for row in watch["chats"]], order)
+
+    async def test_extend_chats_raises_the_vpn_itself_after_a_restart(self):
+        """13.09.2026: пустые тики больше не поднимают VPN. После рестарта
+        вне утреннего окна маршрута нет, и ручное расширение набора обязано
+        поднять его само, а не упасть на проверке готовности SOCKS."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            gateway.dialogs = [DialogCandidate(
+                NEW_CHAT_ID, "Добавленный чат", NEW_PEER)]
+            transport = FakeTransport(paths, self._extended_gate())
+            runtime = FakeVPNRuntime(paths.private_dir)
+            collector = collector_for(paths, gateway, transport, runtime=runtime)
+            collector.trigger_run = lambda: False
+
+            status = await collector.extend_chats("https://t.me/c/3334567890/12")
+
+            self.assertEqual(status["last_result"], "chat_extension_accepted")
+            self.assertEqual(runtime.starts, [VPN_NODE])
+            self.assertTrue(runtime.ready)
+            self.assertEqual(read_json(paths.settings)["phase"], "chat_locked")
 
     async def test_extend_chats_refuses_a_chat_the_receiver_never_announced(self):
         """Иначе приложение добавляло бы себе доступ само — ровно то, ради
@@ -3293,7 +4299,7 @@ class TestChatSetExtension20260820(unittest.IsolatedAsyncioTestCase):
                 FakeTransport(paths, jumped)).run_once()
 
             self.assertEqual(status["last_result"], "error")
-            self.assertEqual(status["last_error_type"], "RuntimeError")
+            self.assertEqual(status["last_error_type"], "ReceiverChainError")
 
     async def test_extension_survives_a_lost_upload_acknowledgement(self):
         """Обрыв между выгрузкой extension baseline и записью состояния.
@@ -3328,7 +4334,6 @@ class TestChatSetExtension20260820(unittest.IsolatedAsyncioTestCase):
             gateway = FakeGateway(paths)
             gateway.tops = {**BASELINE_TOPS, NEW_CHAT_ID: 4242}
             gateway.expected_chat_ids = order
-            gateway.scans[NEW_CHAT_ID] = MentionScanResult(4242, [])
             transport = FakeTransport(paths, self._extended_gate())
             transport.expected_chat_ids = order
             transport.lose_monitor_ack = True

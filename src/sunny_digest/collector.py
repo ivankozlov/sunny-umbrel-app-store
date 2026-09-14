@@ -15,7 +15,6 @@ from .contracts import (
     canonical_digest_bytes,
     canonical_monitor_bytes,
     parse_utc,
-    utc_iso,
     validate_digest_upload,
     validate_gate,
     validate_monitor_upload,
@@ -115,6 +114,19 @@ VPN_REPAIR_RUN_LOCK_TIMEOUT_S = 240
 VPN_REPAIR_TEST_TIMEOUT_S = 300
 VPN_REPAIR_MAX_CANDIDATES = 8
 SETUP_CONSENT_LEASE_S = 3600
+# Попыток утренней пометки прочитанным за день. Чат, чья вершина или
+# пометка стабильно падает, иначе держал бы день открытым и тащил в
+# Telegram каждый тик окна — до 22 раз, ровно тот «в сети», против
+# которого суточный режим и делался. Три попытки покрывают разовую рябь.
+MORNING_READ_ACK_MAX_ATTEMPTS = 3
+# Потолок тиков пометки за день, включая те, где Telegram не ответил ни на
+# что. Такие тики попытку не тратят (тик мёртвого маршрута «в сети» не
+# держит, а ночная ротация иначе съедала бы лимит до перерезолва), но
+# отсюда их не отличить от живого соединения, где отказал каждый peer
+# (FLOOD_WAIT на весь аккаунт, CHANNEL_PRIVATE у всех чатов): тогда без
+# потолка снова шли бы все 22 тика окна. Девять тиков — больше 45 минут,
+# с запасом дольше перерезолва после ротации (около получаса).
+MORNING_READ_ACK_MAX_TICKS = 9
 
 
 class VPNMigrationRequiredError(RuntimeError):
@@ -131,6 +143,15 @@ class VPNRollbackError(RuntimeError):
 
 class TelegramSessionUnauthorized(VPNRepairFailed):
     """The stored Telegram session is no longer authorized."""
+
+
+class ReceiverChainError(RuntimeError):
+    """Цепочка приёмника откатилась, прыгнула или разошлась с локальной.
+
+    Отдельный класс нужен с 13.09.2026: утром выпуск и пометка прочитанным
+    идут независимо, и обычный отказ выпуска не отменяет пометку. Разрыв
+    цепочки — не обычный отказ: он роняет весь тик до любого следующего
+    обращения к Telegram, как и раньше."""
 
 
 def _now() -> datetime:
@@ -174,6 +195,63 @@ def _extended_cursor_rows(rows, chat_id: int, fresh: Dict[str, Any],
     existing = {row["chat_id"]: row for row in rows}
     existing[chat_id] = fresh
     return [existing[value] for value in order]
+
+
+class _TelegramContact:
+    """Gateway одного тика: было ли обращение к Telegram и ответил ли он.
+
+    Ревью 13.09.2026. Пока шёл поминутный скан упоминаний, он стоял первым
+    в каждом тике и своим успехом обнулял счётчик stall раньше выпуска.
+    Утренний проход такого сброса не имеет, и правило «любой отказ после
+    gate» копило stall от сбоев, к маршруту не относящихся: OpenRouter,
+    туннель, keygen, выгрузка, цепочка приёмника. Три таких тика подряд
+    запускали перерезолв VPN и гасили живой маршрут.
+
+    Поэтому считается сам Telegram. Тик мёртвого маршрута — тот, где была
+    хоть одна Telegram-операция и не ответила ни одна; агрегатный таймаут,
+    провал всех чатов по своим таймаутам и исключение самой операции сюда
+    попадают, как и раньше. Ответ хотя бы одной — вершина или пометка хотя
+    бы одного чата, граница или выборка выпуска — доказывает, что маршрут
+    жив. Набор методов закрыт намеренно: новая операция тика без учёта здесь
+    упадёт на AttributeError, а не выпадет из детектора молча."""
+
+    def __init__(self, gateway: Any):
+        self._gateway = gateway
+        self.attempted = False
+        self.answered = False
+
+    async def _observe(self, call: Awaitable[Any], per_chat: bool) -> Any:
+        result = await call
+        # Пачечные операции возвращают (успешные, отказавшие): штатный
+        # возврат, где отказали все чаты, — ответом не считается.
+        if not per_chat or (isinstance(result, tuple) and result and result[0]):
+            self.answered = True
+        return result
+
+    def snapshot_tops(self, *args: Any, **kwargs: Any) -> Awaitable[Any]:
+        self.attempted = True
+        return self._observe(
+            self._gateway.snapshot_tops(*args, **kwargs), per_chat=False)
+
+    def snapshot_peer_tops(self, *args: Any, **kwargs: Any) -> Awaitable[Any]:
+        self.attempted = True
+        return self._observe(
+            self._gateway.snapshot_peer_tops(*args, **kwargs), per_chat=True)
+
+    def acknowledge_reads(self, *args: Any, **kwargs: Any) -> Awaitable[Any]:
+        self.attempted = True
+        return self._observe(
+            self._gateway.acknowledge_reads(*args, **kwargs), per_chat=True)
+
+    def boundary_cursor(self, *args: Any, **kwargs: Any) -> Awaitable[Any]:
+        self.attempted = True
+        return self._observe(
+            self._gateway.boundary_cursor(*args, **kwargs), per_chat=False)
+
+    def fetch(self, *args: Any, **kwargs: Any) -> Awaitable[Any]:
+        self.attempted = True
+        return self._observe(
+            self._gateway.fetch(*args, **kwargs), per_chat=False)
 
 
 def _gate_cursor(gate: Dict[str, Any], chat_id: int) -> Optional[int]:
@@ -234,6 +312,17 @@ class Collector:
         self._telegram_stall_ticks = 0
         self._vpn_reresolve_after_mono: Optional[float] = None
         self._last_attempt: Optional[tuple[int, float]] = None
+        # Утренняя пометка прочитанным выполнена за (source_id, набор чатов,
+        # digest_date). Хранится только в памяти: после рестарта внутри окна
+        # пометка и её лимит попыток начинаются заново, а durable-метка потребовала бы нового поля в
+        # watch_state, набор полей которого закрыт ради отката на 0.2.12.
+        # Набор чатов входит в ключ, чтобы чат, принятый расширением после
+        # утренней пометки, был помечен в том же окне.
+        self._read_ack_done: Optional[tuple] = None
+        # (ключ дня, попыток с ответом Telegram, тиков всего). Живёт и
+        # сбрасывается вместе с `_read_ack_done`; любой исчерпанный лимит
+        # закрывает день.
+        self._read_ack_attempts: Optional[tuple] = None
         # Pre-lock Telegram metadata access has no authenticated server clock.
         # A single in-process monotonic lease prevents wall-clock rollback from
         # extending setup; restart before chat lock therefore fails closed.
@@ -446,6 +535,8 @@ class Collector:
             "last_message_count": None,
             "last_through_message_id": None,
             "failed_chat_count": 0,
+            "read_ack_result": None,
+            "read_ack_error_type": None,
             "revocation_required": self.paths.revocation_warning.exists(),
             "vpn_configured": self.paths.vpn_active_node.exists(),
             "vpn_ready": bool(getattr(self._vpn_runtime, "ready", False)),
@@ -522,10 +613,15 @@ class Collector:
         if self.paths.status.exists():
             try:
                 previous = read_json(self.paths.status, max_bytes=16 * 1024)
+                # Исход утренней пометки прочитанным переносится между
+                # тиками: остальные сутки тики пустые ("idle"), и без
+                # переноса интерфейс забывал бы утренний результат через
+                # пять минут.
                 for key in (
                     "last_run_at", "last_result", "last_error_type",
                     "last_message_count", "last_through_message_id",
                     "failed_chat_count", "recent_runs",
+                    "read_ack_result", "read_ack_error_type",
                 ):
                     if key in previous:
                         status[key] = previous[key]
@@ -579,6 +675,7 @@ class Collector:
             "phone_masked", "dialogs", "selection_id", "last_run_at", "last_result",
             "last_error_type", "last_message_count", "last_through_message_id",
             "failed_chat_count", "revocation_required", "recent_runs",
+            "read_ack_result", "read_ack_error_type",
             "openrouter_public_key",
             "vpn_configured", "vpn_ready", "vpn_migration_required",
             "vpn_repairing", "vpn_repair_state", "vpn_repair_attempted",
@@ -885,6 +982,17 @@ class Collector:
             self._telegram_stall_ticks = 0
             return
         self._telegram_stall_ticks += 1
+
+    def _note_telegram_contact(
+        self, contact: Optional[_TelegramContact],
+    ) -> None:
+        """Учесть тик в счётчике stall по тому, что ответил сам Telegram.
+
+        Тик без Telegram-операций счётчик не трогает: отказ до первого
+        обращения (цепочка приёмника, pending, VPN) о маршруте ничего не
+        говорит — ни как провал, ни как успех."""
+        if contact is not None and contact.attempted:
+            self._note_telegram_stall(not contact.answered)
 
     def _maybe_start_vpn_reresolve(self) -> bool:
         """Запустить авторезолв, если маршрут выглядит протухшим.
@@ -1345,6 +1453,13 @@ class Collector:
             raise RuntimeError(
                 "receiver has not announced a new chat; run extend_chat_set.sh first")
 
+        # До 13.09.2026 маршрут поднимал поминутный тик, и он всегда был жив.
+        # Теперь пустые тики VPN не трогают, поэтому после рестарта вне
+        # утреннего окна маршрута может не быть — поднимаем его сами, до
+        # durable-фазы: отказ здесь не должен оставить её выставленной.
+        await self._ensure_vpn()
+        self._require_current_epoch(epoch)
+
         async with self.state_lock:
             self._require_current_epoch(epoch)
             # Фаза фиксируется ДО сетевого вызова: прерванная попытка не должна
@@ -1537,6 +1652,8 @@ class Collector:
                     # владельца — или, наоборот, запретили бы его на полчаса.
                     self._telegram_stall_ticks = 0
                     self._vpn_reresolve_after_mono = None
+                    self._read_ack_done = None
+                    self._read_ack_attempts = None
         result = self._write_status(
             phase="fresh", configured=False, chat_locked=False,
             consent_active=False, pending_digest_upload=False,
@@ -1552,6 +1669,7 @@ class Collector:
             # Журнал принадлежит прежней конфигурации: после factory reset
             # следующий владелец не должен видеть историю предыдущей.
             recent_runs=[], failed_chat_count=None,
+            read_ack_result=None, read_ack_error_type=None,
         )
         return result
 
@@ -1577,6 +1695,8 @@ class Collector:
             self._vpn_repair_error_type = None
             self._telegram_stall_ticks = 0
             self._vpn_reresolve_after_mono = None
+            self._read_ack_done = None
+            self._read_ack_attempts = None
             return self._write_status(
                 phase="fresh", configured=False, chat_locked=False,
                 consent_active=False, pending_digest_upload=False,
@@ -1589,6 +1709,7 @@ class Collector:
                 last_result="manual_revocation_acknowledged",
                 last_error_type=None,
                 revocation_required=False,
+                read_ack_result=None, read_ack_error_type=None,
             )
 
     async def renew_consent(self, expires_at: Any) -> Dict[str, Any]:
@@ -1835,7 +1956,24 @@ class Collector:
         local = self._expected_monitor_position(state)
         accepted = remote == self._position_after_monitor_payload(state, payload)
         if not accepted and remote != local:
-            raise RuntimeError("pending monitor upload does not match remote chain")
+            raise ReceiverChainError(
+                "pending monitor upload does not match remote chain")
+        if not accepted and payload["kind"] == "mentions":
+            # Событие упоминания мог застейджить 0.2.12 и не успеть выгрузить.
+            # С 13.09.2026 упоминания не доставляются вовсе, поэтому
+            # недоставленное не досылается, а выбрасывается. Цепочку это не
+            # рвёт: приёмник стоит ровно на локальном чекпойнте (проверено
+            # выше), а локальные курсоры до принятия не двигались — откат на
+            # 0.2.12 просто пересканирует тот же диапазон. Принятое же
+            # приёмником событие (потерянная квитанция) по-прежнему только
+            # применяется локально — ниже, без повторной выгрузки.
+            async with self.state_lock:
+                self._assert_active_locked(
+                    revoked, source_id, chat_ids,
+                    self._generated_at(gate, gate_received_mono),
+                )
+                safe_unlink(self.paths.monitor_pending)
+            return self._load_watch_state(source_id, chat_ids)
         if not accepted:
             if len(raw) > gate["monitor"]["max_upload_bytes"]:
                 raise RuntimeError("pending monitor upload exceeds receiver limit")
@@ -1926,16 +2064,15 @@ class Collector:
             revoked, source_id, chat_ids, self._generated_at(gate, received))
         return gate, received
 
-    async def _run_monitor(
-        self, gate: Dict[str, Any], gate_received_mono: float, transport: Any,
-        gateway: Any, settings: Dict[str, Any], session: str,
-        revoked: asyncio.Event,
-    ) -> tuple[Dict[str, Any], float, int, int]:
-        source_id = settings["source_id"]
-        chats = settings["chats"]
-        chat_ids = [row["chat_id"] for row in chats]
-        state = self._load_watch_state(source_id, chat_ids)
-        pending_raw = self._read_pending(self.paths.monitor_pending, "monitor")
+    def _verify_monitor_chain(
+        self, state: Dict[str, Any], gate: Dict[str, Any],
+        pending_raw: Optional[bytes],
+    ) -> None:
+        """Сверить позицию цепочки monitor у приёмника с локальной.
+
+        Проверка локальная и дешёвая, поэтому идёт на КАЖДОМ тике, до VPN и
+        до решения, нужен ли Telegram вообще: откат или прыжок цепочки
+        приёмника виден в статусе сразу, а не только в утреннем окне."""
         allowed = {self._expected_monitor_position(state)}
         if pending_raw is not None:
             pending = json.loads(pending_raw.decode("utf-8"))
@@ -1952,7 +2089,76 @@ class Collector:
             tuple(row for row in announced[2] if row[0] in known_ids),
         )
         if announced not in allowed and settled not in allowed:
-            raise RuntimeError("receiver monitor chain rolled back or jumped")
+            raise ReceiverChainError(
+                "receiver monitor chain rolled back or jumped")
+
+    def _monitor_service_needed(
+        self, state: Dict[str, Any], gate: Dict[str, Any],
+    ) -> bool:
+        """Нужна ли служебная работа цепочки monitor в этом тике.
+
+        Это редкие состояния после ручной активации или расширения набора, и
+        они идут сразу, вне утреннего окна: иначе активация ждала бы утра, а
+        приёмник — baseline."""
+        return (
+            self.paths.monitor_pending.exists()
+            or state["phase"] != "active"
+            or bool(state.get("pending_extension_chat_ids"))
+            or gate["monitor"]["baseline_required"]
+        )
+
+    @staticmethod
+    def _in_digest_window(gate: Dict[str, Any]) -> bool:
+        """Время приёмника внутри окна выпуска, границы включительно.
+
+        Сравнение идёт по authenticated `server_time`, а не по часам Umbrel:
+        уехавшие часы устройства не должны ни открывать, ни закрывать окно.
+        Само окно (08:00–09:45 по Europe/Moscow) задаёт приёмник."""
+        server_time = parse_utc(gate["server_time"], "server_time")
+        return (
+            parse_utc(gate["digest"]["prepare_not_before"], "prepare_not_before")
+            <= server_time
+            <= parse_utc(gate["digest"]["accept_until"], "accept_until")
+        )
+
+    @staticmethod
+    def _read_ack_key(
+        gate: Dict[str, Any], source_id: str, chat_ids: List[int],
+    ) -> tuple:
+        return source_id, tuple(chat_ids), gate["digest"]["digest_date"]
+
+    def _morning_pass_needed(
+        self, gate: Dict[str, Any], source_id: str, chat_ids: List[int],
+    ) -> bool:
+        """Нужен ли Telegram утром: только в окне и только если есть работа."""
+        if not self._in_digest_window(gate):
+            return False
+        return (
+            gate["digest"]["due"]
+            or self.paths.pending.exists()
+            or self._read_ack_done != self._read_ack_key(gate, source_id, chat_ids)
+        )
+
+    async def _run_monitor(
+        self, gate: Dict[str, Any], gate_received_mono: float, transport: Any,
+        gateway: Any, settings: Dict[str, Any], session: str,
+        revoked: asyncio.Event,
+    ) -> tuple[Dict[str, Any], float, int]:
+        """Служебная работа цепочки monitor.
+
+        С 13.09.2026 активный монитор ничего не сканирует и событий mentions
+        не формирует: поминутный проход по Telegram держал аккаунт Ивана
+        «в сети» круглые сутки. Здесь осталось только то, что нужно самой
+        цепочке: досылка pending-артефакта, baseline активации с пометкой
+        старого непрочитанного и extension baseline нового чата.
+
+        Цепочку приёмника вызывающий уже сверил до VPN
+        (`_verify_monitor_chain`)."""
+        source_id = settings["source_id"]
+        chats = settings["chats"]
+        chat_ids = [row["chat_id"] for row in chats]
+        state = self._load_watch_state(source_id, chat_ids)
+        pending_raw = self._read_pending(self.paths.monitor_pending, "monitor")
         if pending_raw is not None:
             state = await self._handle_monitor_pending(
                 pending_raw, gate, transport, revoked, source_id, chat_ids,
@@ -1961,17 +2167,16 @@ class Collector:
             # A remote mutation makes the old monitor gate stale.
             gate, gate_received_mono = await self._fresh_gate(
                 transport, source_id, chat_ids, revoked)
-        failed_chat_count = 0
 
         # Baseline completion is its own durable phase. A retry tick performs
-        # only the outstanding read batch; active scans start on the next tick,
-        # keeping the watcher at no more than two Telegram connections per tick.
+        # only the outstanding read batch; the morning pass may follow in the
+        # same tick once the phase has become active.
         if state["phase"] == "baseline_read_pending":
             state, failed_chat_ids = await self._retry_read_acks(
                 state, gateway, session, chats, revoked, source_id, chat_ids,
                 gate, gate_received_mono,
             )
-            return gate, gate_received_mono, 0, len(failed_chat_ids)
+            return gate, gate_received_mono, len(failed_chat_ids)
 
         if state["phase"] == "activation_requested":
             if not gate["monitor"]["baseline_required"]:
@@ -2019,13 +2224,13 @@ class Collector:
                 state, gateway, session, chats, revoked, source_id, chat_ids,
                 gate, gate_received_mono,
             )
-            # Do not scan beyond the frozen baseline without a fresh status.
+            # Do not act beyond the frozen baseline without a fresh status.
             fresh_gate, fresh_mono = await self._fresh_gate(
                 transport, source_id, chat_ids, revoked)
-            return fresh_gate, fresh_mono, 0, len(set(read_failures))
+            return fresh_gate, fresh_mono, len(set(read_failures))
 
         if state["phase"] != "active" or gate["monitor"]["baseline_required"]:
-            raise RuntimeError("local and remote baseline state disagree")
+            raise ReceiverChainError("local and remote baseline state disagree")
 
         # Новизна чата ХРАНИТСЯ явно, а не выводится из нулевых курсоров:
         # у чата, где на момент baseline не было ни одного сообщения, курсор
@@ -2079,115 +2284,175 @@ class Collector:
                 state = self._apply_monitor_payload(state, payload)
                 atomic_write_json(self.paths.watch_state, state)
                 safe_unlink(self.paths.monitor_pending)
-            # Дальше сканировать в этом же тике нельзя: набор изменился, и
-            # следующий шаг обязан идти от свежего authenticated gate.
+            # Дальше в этом же тике можно идти только от свежего authenticated
+            # gate: набор изменился.
             fresh_gate, fresh_mono = await self._fresh_gate(
                 transport, source_id, chat_ids, revoked)
-            return fresh_gate, fresh_mono, 0, 0
+            return fresh_gate, fresh_mono, 0
 
-        selected = []
-        for row in chats:
-            local_row = next(
-                item for item in state["chats"] if item["chat_id"] == row["chat_id"])
-            selected.append((
-                row["chat_id"], PeerSpec.from_dict(row["peer"]), row["title"],
-                local_row["scan_through_message_id"],
-            ))
-        await self._assert_active(
-            revoked, source_id, chat_ids,
-            self._generated_at(gate, gate_received_mono),
-        )
-        _, scans, scan_failures = await self._bounded_external(
-            gateway.snapshot_and_scan_mentions(session, source_id, selected),
-            TELEGRAM_FETCH_TIMEOUT_S,
-        )
-        await self._assert_active(
-            revoked, source_id, chat_ids,
-            self._generated_at(gate, gate_received_mono),
-        )
-        if (not isinstance(scans, dict) or not isinstance(scan_failures, list)
-                or len(scan_failures) != len(set(scan_failures))
-                or set(scans).intersection(scan_failures)
-                or set(scans).union(scan_failures) != set(chat_ids)):
-            raise RuntimeError("Telegram mention scan result is invalid")
-        failed_chat_ids = set(scan_failures)
-        mention_count = 0
-        for chat in chats:
-            chat_id = chat["chat_id"]
-            if chat_id not in scans:
-                continue
-            local_row = next(row for row in state["chats"] if row["chat_id"] == chat_id)
-            start = local_row["scan_through_message_id"]
-            scan = scans[chat_id]
+        return gate, gate_received_mono, 0
+
+    async def _run_morning_read_ack(
+        self, gate: Dict[str, Any], gate_received_mono: float, gateway: Any,
+        settings: Dict[str, Any], session: str, revoked: asyncio.Event,
+    ) -> List[int]:
+        """Утренняя пометка прочитанным до последнего сообщения каждого чата.
+
+        Решение 13.09.2026: раз в сутки, в утреннем окне и после выпуска.
+        Вершина чата берётся точным GetPeerDialogs без листинга диалогов и
+        без чтения текста; курсор под state_lock только растёт
+        (`max(текущий, top)`), назад не двигается. Дальше работает общий
+        `_retry_read_acks`: если вершины уже равны подтверждённому, запроса
+        на пометку нет вовсе.
+
+        Чат, принятый расширением и ещё ждущий extension baseline, не
+        трогается: его курсор обязан начаться с baseline, а пометка раньше
+        него сдвинула бы локальный курсор за будущий диапазон baseline. Такой
+        чат считается неподтверждённым, и день не закрывается, пока не
+        исчерпан MORNING_READ_ACK_MAX_ATTEMPTS.
+
+        Возвращает неподтверждённые чаты: чью вершину не получили и чью
+        пометку Telegram не принял. Пустой список — пометка за день сделана."""
+        source_id = settings["source_id"]
+        chats = settings["chats"]
+        chat_ids = [row["chat_id"] for row in chats]
+        state = self._load_watch_state(source_id, chat_ids)
+        if state["phase"] != "active":
+            raise RuntimeError("morning read acknowledgement requires active monitoring")
+        awaiting = set(state.get("pending_extension_chat_ids") or [])
+        selected = [
+            (row["chat_id"], PeerSpec.from_dict(row["peer"]))
+            for row in chats if row["chat_id"] not in awaiting
+        ]
+        tops: Any = {}
+        top_failures: Any = []
+        if selected:
             await self._assert_active(
                 revoked, source_id, chat_ids,
                 self._generated_at(gate, gate_received_mono),
             )
-            if scan.through_message_id < start:
-                raise RuntimeError("mention scan moved backwards")
-            if scan.events:
-                remote_cursor = next(
-                    row["through_message_id"] for row in gate["monitor"]["cursors"]
-                    if row["chat_id"] == chat_id)
-                wire_events = [{
-                    "event_id": event.event_id,
-                    "message_id": event.message_id,
-                    "date": utc_iso(event.sent_at),
-                    "chat_title": event.chat_title,
-                    "sender": event.sender,
-                    "snippet": event.snippet,
-                    "link": event.link,
-                } for event in scan.events]
-                payload = build_monitor_upload(
-                    source_id=source_id, gate=gate, kind="mentions",
-                    ranges=[{
-                        "chat_id": chat_id,
-                        "from_message_id_exclusive": remote_cursor,
-                        "through_message_id": scan.through_message_id,
-                    }],
-                    events=wire_events,
-                    generated_at=self._generated_at(gate, gate_received_mono),
-                )
-                pending = canonical_monitor_bytes(payload)
-                if len(pending) > gate["monitor"]["max_upload_bytes"]:
-                    raise RuntimeError("mentions exceed receiver max_upload_bytes")
-                async with self.state_lock:
-                    self._assert_active_locked(
-                        revoked, source_id, chat_ids,
-                        self._generated_at(gate, gate_received_mono),
-                    )
-                    atomic_write_bytes(self.paths.monitor_pending, pending, 0o600)
-                await transport.upload_monitor(pending, revoked)
-                async with self.state_lock:
-                    self._assert_active_locked(
-                        revoked, source_id, chat_ids,
-                        self._generated_at(gate, gate_received_mono),
-                    )
-                    state = self._load_watch_state(source_id, chat_ids)
-                    state = self._apply_monitor_payload(state, payload)
-                    atomic_write_json(self.paths.watch_state, state)
-                    safe_unlink(self.paths.monitor_pending)
-                mention_count += len(scan.events)
-                gate, gate_received_mono = await self._fresh_gate(
-                    transport, source_id, chat_ids, revoked)
-            else:
-                async with self.state_lock:
-                    self._assert_active_locked(
-                        revoked, source_id, chat_ids,
-                        self._generated_at(gate, gate_received_mono),
-                    )
-                    state = self._load_watch_state(source_id, chat_ids)
-                    row = next(item for item in state["chats"] if item["chat_id"] == chat_id)
-                    row["scan_through_message_id"] = scan.through_message_id
-                    row["read_pending_through_message_id"] = scan.through_message_id
-                    atomic_write_json(self.paths.watch_state, state)
+            tops, top_failures = await self._bounded_external(
+                gateway.snapshot_peer_tops(session, selected),
+                TELEGRAM_FETCH_TIMEOUT_S,
+            )
+            await self._assert_active(
+                revoked, source_id, chat_ids,
+                self._generated_at(gate, gate_received_mono),
+            )
+        if (not isinstance(tops, dict) or not isinstance(top_failures, list)
+                or len(top_failures) != len(set(top_failures))
+                or set(tops).intersection(top_failures)
+                or set(tops).union(top_failures) != {row[0] for row in selected}
+                or any(type(top) is not int or top < 0 for top in tops.values())):
+            raise RuntimeError("Telegram top snapshot result is invalid")
+        async with self.state_lock:
+            self._assert_active_locked(
+                revoked, source_id, chat_ids,
+                self._generated_at(gate, gate_received_mono),
+            )
+            state = self._load_watch_state(source_id, chat_ids)
+            moved = False
+            for row in state["chats"]:
+                top = tops.get(row["chat_id"])
+                if top is None or top <= row["scan_through_message_id"]:
+                    continue
+                row["scan_through_message_id"] = top
+                row["read_pending_through_message_id"] = top
+                moved = True
+            if moved:
+                atomic_write_json(self.paths.watch_state, state)
         state, read_failures = await self._retry_read_acks(
             state, gateway, session, chats, revoked, source_id, chat_ids,
             gate, gate_received_mono,
         )
-        failed_chat_ids.update(read_failures)
-        failed_chat_count = len(failed_chat_ids)
-        return gate, gate_received_mono, mention_count, failed_chat_count
+        unconfirmed = set(top_failures) | set(read_failures) | awaiting
+        return [chat_id for chat_id in chat_ids if chat_id in unconfirmed]
+
+    async def _run_morning_pass(
+        self, gate: Dict[str, Any], gate_received_mono: float, transport: Any,
+        gateway: Any, settings: Dict[str, Any], credentials: Dict[str, Any],
+        session: str, revoked: asyncio.Event,
+    ) -> Dict[str, Any]:
+        """Утренний проход: сначала выпуск, затем пометка прочитанным.
+
+        Потоки независимы, как и раньше: обычный отказ выпуска не отменяет
+        пометку, а отказ пометки — выпуск. Порядок выбран намеренно: пометка
+        не должна ни задерживать выпуск, ни съедать его окно. Отмена и отзыв
+        (CancelledError, в том числе из `_assert_active`) и разрыв цепочки
+        приёмника (`ReceiverChainError`) по-прежнему роняют весь тик.
+
+        Возвращает изменения статуса. Признак stall здесь не выводится:
+        отказ выпуска бывает и при живом Telegram (OpenRouter, туннель,
+        выгрузка), поэтому тик судит `_TelegramContact`."""
+        source_id = settings["source_id"]
+        chat_ids = [row["chat_id"] for row in settings["chats"]]
+        changes: Dict[str, Any] = {}
+        digest_error: Optional[str] = None
+        try:
+            result, message_count = await self._run_digest(
+                gate, gate_received_mono, transport, gateway, settings,
+                credentials, session, revoked,
+            )
+        except ReceiverChainError:
+            raise
+        except Exception as exc:
+            digest_error = type(exc).__name__
+            changes["last_result"] = "error"
+        else:
+            changes["last_result"] = result
+            changes["last_message_count"] = message_count
+
+        ack_error: Optional[str] = None
+        ack_failed = 0
+        ack_key = self._read_ack_key(gate, source_id, chat_ids)
+        if self._read_ack_done != ack_key:
+            previous = self._read_ack_attempts
+            attempt, ticks = (
+                previous[1:] if previous is not None and previous[0] == ack_key
+                else (0, 0))
+            try:
+                unconfirmed = await self._run_morning_read_ack(
+                    gate, gate_received_mono, gateway, settings, session, revoked,
+                )
+            except Exception as exc:
+                ack_error = type(exc).__name__
+                ack_failed = len(chat_ids)
+                changes.update(read_ack_result="error",
+                               read_ack_error_type=ack_error)
+            else:
+                ack_failed = len(unconfirmed)
+                changes.update(
+                    read_ack_result=(
+                        "read_ack_partial" if unconfirmed else "read_acked"),
+                    read_ack_error_type=None,
+                )
+            # Полностью подтверждённый день закрывается сразу, частичный или
+            # упавший повторится следующим тиком в окне — но не больше
+            # MORNING_READ_ACK_MAX_ATTEMPTS раз. Исчерпанный день закрывается
+            # с исходом последней попытки: до следующего digest_date Telegram
+            # ради пометки не трогается (выпуск в окне по-прежнему может).
+            # Попытку тратит только тик, где Telegram хоть что-то ответил.
+            # Ротация узла в 01:00 UTC бывает каждую ночь, и зависший маршрут
+            # иначе съедал бы все три попытки до перерезолва: пометка за день
+            # закрывалась, так и не дойдя до Telegram (ревью доков 13.09.2026).
+            # Тик мёртвого маршрута «в сети» не держит — ему свой, более
+            # высокий потолок MORNING_READ_ACK_MAX_TICKS. `gateway` здесь
+            # всегда `_TelegramContact` тика: сырой gateway упадёт на
+            # AttributeError, а не вернёт молча прежний расход попыток.
+            ticks += 1
+            if gateway.answered:
+                attempt += 1
+            self._read_ack_attempts = (ack_key, attempt, ticks)
+            if ((ack_error is None and not ack_failed)
+                    or attempt >= MORNING_READ_ACK_MAX_ATTEMPTS
+                    or ticks >= MORNING_READ_ACK_MAX_TICKS):
+                self._read_ack_done = ack_key
+
+        # Тип ошибки выпуска важнее; отказ пометки при удачном выпуске тоже
+        # должен остаться в журнале прогонов, а не только в read_ack_*.
+        changes["last_error_type"] = digest_error or ack_error
+        changes["failed_chat_count"] = ack_failed
+        return changes
 
     def _load_digest_ack(
         self, source_id: str, chat_ids: List[int],
@@ -2313,7 +2578,8 @@ class Collector:
                 # pending file. A power loss in that tiny window leaves both.
                 stale_local_pending = True
             else:
-                raise RuntimeError("pending digest is not linked to local checkpoint")
+                raise ReceiverChainError(
+                    "pending digest is not linked to local checkpoint")
         remote = self._digest_position(gate["digest"])
         # Та же поправка, что и у монитора: в переходном окне у приёмника уже
         # есть курсор чата, которого локально ещё нет. Состав курсоров при
@@ -2324,7 +2590,7 @@ class Collector:
             tuple(row for row in remote[2] if row[0] in set(chat_ids)),
         )
         if remote not in allowed and settled_remote not in allowed:
-            raise RuntimeError("receiver digest chain rolled back or jumped")
+            raise ReceiverChainError("receiver digest chain rolled back or jumped")
         if stale_local_pending:
             async with self.state_lock:
                 self._assert_active_locked(
@@ -2353,7 +2619,8 @@ class Collector:
                     safe_unlink(self.paths.pending)
                     pending_raw = None
                 elif not same_plan:
-                    raise RuntimeError("pending digest does not match remote plan")
+                    raise ReceiverChainError(
+                        "pending digest does not match remote plan")
                 elif not gate["digest"]["due"]:
                     return "pending_digest_not_due", 0
                 else:
@@ -2374,7 +2641,7 @@ class Collector:
         if acknowledged is not None:
             last_day = date.fromisoformat(acknowledged["digest_date"])
             if date.fromisoformat(gate["digest"]["digest_date"]) <= last_day:
-                raise RuntimeError("receiver digest date did not advance")
+                raise ReceiverChainError("receiver digest date did not advance")
         now_mono = self.monotonic()
         sequence = gate["digest"]["next_sequence"]
         if (self._last_attempt and self._last_attempt[0] == sequence
@@ -2576,12 +2843,22 @@ class Collector:
             self._maybe_start_vpn_reresolve()
 
     async def _run_once_locked(self) -> Dict[str, Any]:
+        """Тик раз в пять минут: Telegram — только когда без него нельзя.
+
+        13.09.2026: поминутный проход по Telegram держал аккаунт Ивана
+        «в сети» круглые сутки. Теперь каждый тик делает только локальные
+        проверки и authenticated gate к приёмнику (SSH, мимо VPN). VPN,
+        gateway и Telegram поднимаются лишь для служебной работы цепочки
+        monitor (активация, расширение, pending-артефакт) или для утреннего
+        прохода — выпуск и пометка прочитанным в окне приёмника. Остальные
+        тики — "idle" и счётчик stall не трогают вовсе: без обращения к
+        Telegram нечего считать ни провалом, ни успехом."""
         async with self.run_lock:
             current_task = asyncio.current_task()
             self._active_run_task = current_task
             revoked = self.revoked
             failed_chat_count = 0
-            gate_answered = False
+            contact: Optional[_TelegramContact] = None
             try:
                 async with self.state_lock:
                     self._require_no_revocation_warning()
@@ -2604,57 +2881,80 @@ class Collector:
                 transport = self.transport_factory(self.paths, upload_config)
                 gate, gate_received_mono = await self._fresh_gate(
                     transport, source_id, chat_ids, revoked)
-                gate_answered = True
+                watch = self._load_watch_state(source_id, chat_ids)
+                self._verify_monitor_chain(
+                    watch, gate,
+                    self._read_pending(self.paths.monitor_pending, "monitor"))
+                service = self._monitor_service_needed(watch, gate)
+                if not service and not self._morning_pass_needed(
+                        gate, source_id, chat_ids):
+                    return self._write_status(
+                        last_run_at=self.clock().isoformat(),
+                        last_result="idle", last_error_type=None,
+                        pending_digest_upload=self.paths.pending.exists(),
+                        pending_monitor_upload=self.paths.monitor_pending.exists(),
+                        failed_chat_count=0,
+                    )
                 await self._ensure_vpn()
                 self._require_current_epoch(revoked)
-                gateway = self._gateway(credentials)
-                monitor_error_type = None
-                try:
-                    gate, gate_received_mono, mentions, failed_chat_count = await self._run_monitor(
-                        gate, gate_received_mono, transport, gateway, settings,
-                        session, revoked,
-                    )
-                except asyncio.TimeoutError:
-                    # 2026-08-14: one hanging active-monitor operation consumed
-                    # the aggregate deadline on every tick and starved the
-                    # independent daily stream. Baseline transitions remain
-                    # fail-closed; active state continues only from a fresh,
-                    # authenticated receiver gate.
-                    watch = self._load_watch_state(source_id, chat_ids)
-                    if watch["phase"] != "active":
-                        raise
-                    monitor_error_type = "TimeoutError"
-                    failed_chat_count = len(chat_ids)
-                    gate, gate_received_mono = await self._fresh_gate(
-                        transport, source_id, chat_ids, revoked)
                 # Gate живёт через ssh к приёмнику, мимо VPN, поэтому свежий
-                # gate рядом с недоступным Telegram — это подпись мёртвого
-                # маршрута, а не занятого Telegram. Форм отказа две, и обе
-                # обязаны считаться: агрегатный таймаут монитора и штатный
-                # возврат, где по своему таймауту отвалились ВСЕ чаты, —
-                # второй встречается чаще и раньше выглядел как успех.
-                self._note_telegram_stall(
-                    len(chat_ids) > 0
-                    and (monitor_error_type == "TimeoutError"
-                         or failed_chat_count >= len(chat_ids)))
+                # gate рядом с молчащим Telegram — подпись мёртвого маршрута.
+                # Но судить надо по ответам самого Telegram, а не по любому
+                # отказу после gate: см. `_TelegramContact`.
+                gateway = contact = _TelegramContact(self._gateway(credentials))
+                service_error_type = None
+                if service:
+                    try:
+                        gate, gate_received_mono, failed_chat_count = (
+                            await self._run_monitor(
+                                gate, gate_received_mono, transport, gateway,
+                                settings, session, revoked,
+                            ))
+                    except asyncio.TimeoutError:
+                        # 2026-08-14: one hanging active-monitor operation
+                        # consumed the aggregate deadline on every tick and
+                        # starved the independent daily stream. Baseline
+                        # transitions remain fail-closed; active state
+                        # continues only from a fresh, authenticated gate.
+                        watch = self._load_watch_state(source_id, chat_ids)
+                        if watch["phase"] != "active":
+                            raise
+                        service_error_type = "TimeoutError"
+                        failed_chat_count = len(chat_ids)
+                        gate, gate_received_mono = await self._fresh_gate(
+                            transport, source_id, chat_ids, revoked)
                 watch = self._load_watch_state(source_id, chat_ids)
                 if watch["phase"] != "active":
+                    self._note_telegram_contact(contact)
                     return self._write_status(
                         last_run_at=self.clock().isoformat(),
                         last_result="baseline_read_pending", last_error_type=None,
                         failed_chat_count=failed_chat_count,
                     )
-                result, message_count = await self._run_digest(
+                if not self._morning_pass_needed(gate, source_id, chat_ids):
+                    self._note_telegram_contact(contact)
+                    return self._write_status(
+                        last_run_at=self.clock().isoformat(),
+                        last_result="monitor_service_done",
+                        last_error_type=service_error_type,
+                        pending_digest_upload=self.paths.pending.exists(),
+                        pending_monitor_upload=self.paths.monitor_pending.exists(),
+                        failed_chat_count=failed_chat_count,
+                    )
+                changes = await self._run_morning_pass(
                     gate, gate_received_mono, transport, gateway, settings,
                     credentials, session, revoked,
                 )
+                self._note_telegram_contact(contact)
+                changes["failed_chat_count"] = max(
+                    failed_chat_count, changes["failed_chat_count"])
+                changes["last_error_type"] = (
+                    changes["last_error_type"] or service_error_type)
                 return self._write_status(
-                    last_run_at=self.clock().isoformat(), last_result=result,
-                    last_error_type=monitor_error_type,
-                    last_message_count=message_count,
+                    last_run_at=self.clock().isoformat(),
                     pending_digest_upload=self.paths.pending.exists(),
                     pending_monitor_upload=self.paths.monitor_pending.exists(),
-                    failed_chat_count=failed_chat_count,
+                    **changes,
                 )
             except asyncio.CancelledError:
                 return self._write_status(
@@ -2669,9 +2969,11 @@ class Collector:
                 # переиспользованный другим арендатором IP отвечает RST, и
                 # Telethon поднимает ConnectionError задолго до таймаута.
                 # Считать stall'ом только TimeoutError значило бы не увидеть
-                # ровно тот отказ, ради которого всё и делалось.
-                if gate_answered:
-                    self._note_telegram_stall(True)
+                # ровно тот отказ, ради которого всё и делалось. Но считается
+                # только отказ самого Telegram: разрыв цепочки приёмника,
+                # сбой VPN или выгрузки, случившийся до первой операции или
+                # после ответившей, о маршруте ничего не говорит.
+                self._note_telegram_contact(contact)
                 return self._write_status(
                     last_run_at=self.clock().isoformat(), last_result="error",
                     last_error_type=type(exc).__name__,
