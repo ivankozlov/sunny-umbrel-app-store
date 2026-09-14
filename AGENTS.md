@@ -267,7 +267,7 @@ content, receiver keys, or rendered runtime configuration.
   count the `n` field: the gateway sizes one chat at a time while the assembled
   prompt is numbered across all of them, and bytes missing from the estimate
   overflow the bound after selection, failing the whole day.
-- Task 235 (`0.2.14` candidate): keep direct HTTP(S) material URLs
+- Task 235 (released in `0.2.14`): keep direct HTTP(S) material URLs
   from `MessageEntityUrl` and `MessageEntityTextUrl` in the parent-only
   `SelectedMessage.material_urls`. Decode visible URL offsets against the ORIGINAL
   UTF-16 message, before stripping whitespace. The prompt gets only `material_count`
@@ -323,9 +323,9 @@ In the `umbrel/` subtree of the private source repository `ivankozlov/sunny/main
 `scripts/check_package.py --release` must remain red: the disabled manifest and release
 placeholder are the intentional Phase-A state of the source tree. This does not
 describe the Store `main`, where the enabling commits live — it carries enabled
-`v0.2.13`, with the historical enabled `v0.2.5` still in its history. Distribution was
+`v0.2.14`, with the historical enabled `v0.2.5` still in its history. Distribution was
 withdrawn on 2026-08-14 and reopened on 2026-08-17; the public GHCR package now holds
-`v0.2.6` through `v0.2.13`, while `v0.2.5` stays deleted. Every release requires
+`v0.2.6` through `v0.2.14`, while `v0.2.5` stays deleted. Every release requires
 separate approval, a new semver/tag, a real independently verified multi-architecture
 digest, and a separate enabling commit; never overwrite the withdrawn `v0.2.5` tag. The publish job stays `main`-only behind
 the protected `ghcr-release` Environment;

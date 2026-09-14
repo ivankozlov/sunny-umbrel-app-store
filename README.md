@@ -25,7 +25,7 @@ The app/package/image ID remains `sunny-personal-digest` for release continuity;
 the v0.2 product name is **Sunny Personal Chats**. v0.2 is a breaking credential
 generation and does not migrate the unpublished v0.1 pilot state.
 
-The last recorded state of the physical Umbrel (2026-08-25) is `0.2.11`: eight exact
+The recorded state of the physical Umbrel on 2026-08-25 was `0.2.11`: eight exact
 peers, the receiver generation, durable baseline, session, and active monitoring state
 survived the updates and the first chat-set extension. The first nightly issue after the
 extension was accepted on 2026-08-21 with all eight chat ranges and delivered in three
@@ -33,7 +33,7 @@ parts without error. The first `0.2.11` daily was accepted on 2026-08-26 in two 
 and visibly reported the old-tail skip for the extended chat. Local sender-name
 restoration and forum-topic read acknowledgements for the added chat still need
 observation; the native-mention smoke test never happened and was dropped together with
-mentions on 2026-09-13. The collector has been stopped since 2026-09-11. The daily-mode
+mentions on 2026-09-13. The collector was stopped from 2026-09-11 until the next update. The daily-mode
 `0.2.13` was released on 2026-09-14, after the DO receiver with the new window and the
 Sunny `chats` skill, and the owner updated the device the same night. Its first morning
 (2026-09-14) took three failed ticks on the address stale after the nightly rotation, then
@@ -42,8 +42,16 @@ separately approved.
 Both server steps must precede `0.2.13`: the app takes its window from the gate. Wire
 `COLLECTOR_VERSION` remains `0.2.1`.
 
+`0.2.14` was published on 2026-09-14 for direct material links and case-insensitive
+sender-name restoration (tasks 235/238). Both architectures were verified anonymously;
+Store enable commit `02c9d27` pins index digest
+`sha256:161bfed7b9d2e3317cf75b8346676cd3676760e586af0e1ff06641213da2845e`.
+The device update is still pending. Before updating, Sunny's worker also needs the
+prepared URL-line protection in `plain_tg`; its deployment needs separate approval.
+The owner confirmed the daily-mode checks and closed task 244 on 2026-09-14.
+
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
-restored on 2026-08-17; `0.2.6` through `0.2.13` have public multi-arch images.
+restored on 2026-08-17; `0.2.6` through `0.2.14` have public multi-arch images.
 **Update** and uninstall/reinstall therefore have a public source again. The device now
 runs public `0.2.13`; its update from `0.2.9` to `0.2.10` exercised the real recreate/pull path and
 preserved state. Docker image pruning remains out of bounds without a separate destructive
@@ -54,7 +62,7 @@ Phase-A candidate; the enabling commit lives only in the Store repository.
 
 ## Product contract
 
-- `0.2.14` candidate (tasks 235/238): referenced materials retain their direct
+- Since `0.2.14` (tasks 235/238), referenced materials retain their direct
   HTTP(S) URLs, including links hidden behind text, before the Telegram permalink.
   This also works in TNN, where messages disappear after 24 hours. The existing
   daily fetch supplies the links; there is no extra polling or local raw-message
@@ -321,10 +329,10 @@ activation screens.
 Anonymous umbrelOS install/update requires both a public Store repository and a
 public `ghcr.io/ivankozlov/sunny-personal-digest` image. Both surfaces were closed on
 2026-08-14 and reopened on 2026-08-17 by an explicit owner decision; `v0.2.6`
-through `v0.2.13` were published and enabled from there. Reopening stays an
+through `v0.2.14` were published and enabled from there. Reopening stays an
 explicit, per-release decision — never republish silently.
 
-Every release follows this exact sequence, as `0.2.5` did and `0.2.6`–`0.2.13` did
+Every release follows this exact sequence, as `0.2.5` did and `0.2.6`–`0.2.14` did
 after it: disabled source first, the protected `Publish image` workflow with
 `bootstrap_empty_package=false`, independent public OCI verification for
 `linux/amd64` and `linux/arm64`, and only then the exact digest pin plus
