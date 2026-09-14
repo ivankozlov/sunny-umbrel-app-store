@@ -46,8 +46,10 @@ Both server steps must precede `0.2.13`: the app takes its window from the gate.
 sender-name restoration (tasks 235/238). Both architectures were verified anonymously;
 Store enable commit `02c9d27` pins index digest
 `sha256:161bfed7b9d2e3317cf75b8346676cd3676760e586af0e1ff06641213da2845e`.
-The device update is still pending. Before updating, Sunny's worker also needs the
-prepared URL-line protection in `plain_tg`; its deployment needs separate approval.
+The device update is still pending. Sunny's worker received the required URL-line
+protection in `plain_tg` on 2026-09-14 with separate approval. The running container's
+code hash, URL preservation through the outbox path (without sending to Telegram), and
+health were verified. The server is ready for the device update.
 The owner confirmed the daily-mode checks and closed task 244 on 2026-09-14.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
