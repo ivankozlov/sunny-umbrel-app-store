@@ -64,14 +64,16 @@ workflow built source `ff3bb13` with `APP_VERSION=0.2.15`; anonymous verificatio
 confirmed the public multi-arch index digest
 `sha256:bb4ee4a1c6588cfeb75d30bd4da817fcd8a37081f8eb9c5f37ae4f4b9f95f70f`, both
 architectures, and their version/source labels. Store enable commit `ab59c4d` pins
-that exact index digest. The device Update to `0.2.15` remains pending.
+that exact index digest. The owner confirmed the device Update to `0.2.15` on
+2026-09-18; the first digest after that update has not yet been verified. The receiver
+gate carries wire version `0.2.1`, which does not independently prove the app version.
 The owner confirmed the daily-mode checks and closed task 244 on 2026-09-14.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.15` have public multi-arch images.
-**Update** and uninstall/reinstall therefore have a public source again. The device now
-runs public `0.2.14` according to the owner; the `0.2.15` device Update is pending.
-Its update from `0.2.9` to `0.2.10` exercised the real recreate/pull path and preserved
+**Update** and uninstall/reinstall therefore have a public source again. The owner
+confirmed the device now runs public `0.2.15` on 2026-09-18; the first following digest
+has not yet been verified. Its update from `0.2.9` to `0.2.10` exercised the real recreate/pull path and preserved
 state. Docker image pruning remains out of bounds without a separate destructive
 approval and a concrete need, and a future distribution closure could remove the public
 source again. The `umbrel/` subtree of private source
