@@ -56,17 +56,23 @@ and mixed-case schemes; its runtime hash was verified on 2026-09-18. All nine ou
 parts of the September 15–18 issues were sent, direct URLs survived delivery and
 no Participant-N aliases remained. Task 235 is closed; task 238 now also requests
 one source permalink per topic.
-The local, unpublished `0.2.15` candidate keeps the earliest available referenced
-message (minimum valid ordinal, independent of model ref order) and all deduplicated
-direct material URLs from the same references. The separate materials section and
-wire version `0.2.1` are unchanged. Publication and the device Update are pending.
+`0.2.15` was published on 2026-09-18 for task 238: each topic keeps the earliest
+available referenced message (minimum valid ordinal, independent of model ref order)
+and all deduplicated direct material URLs from the same references. The separate
+materials section and wire version `0.2.1` are unchanged. The protected Publish image
+workflow built source `ff3bb13` with `APP_VERSION=0.2.15`; anonymous verification
+confirmed the public multi-arch index digest
+`sha256:bb4ee4a1c6588cfeb75d30bd4da817fcd8a37081f8eb9c5f37ae4f4b9f95f70f`, both
+architectures, and their version/source labels. Store enable commit `ab59c4d` pins
+that exact index digest. The device Update to `0.2.15` remains pending.
 The owner confirmed the daily-mode checks and closed task 244 on 2026-09-14.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
-restored on 2026-08-17; `0.2.6` through `0.2.14` have public multi-arch images.
+restored on 2026-08-17; `0.2.6` through `0.2.15` have public multi-arch images.
 **Update** and uninstall/reinstall therefore have a public source again. The device now
-runs public `0.2.14` according to the owner; its update from `0.2.9` to `0.2.10` exercised
-the real recreate/pull path and preserved state. Docker image pruning remains out of bounds without a separate destructive
+runs public `0.2.14` according to the owner; the `0.2.15` device Update is pending.
+Its update from `0.2.9` to `0.2.10` exercised the real recreate/pull path and preserved
+state. Docker image pruning remains out of bounds without a separate destructive
 approval and a concrete need, and a future distribution closure could remove the public
 source again. The `umbrel/` subtree of private source
 repository `ivankozlov/sunny/main` deliberately remains a disabled, placeholder-pinned

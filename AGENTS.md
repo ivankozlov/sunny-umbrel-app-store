@@ -276,7 +276,7 @@ content, receiver keys, or rendered runtime configuration.
   added to the worker request. TNN deletes messages after 24 hours, so a Telegram
   permalink alone loses access to the material. This adds no Telegram requests;
   links already deleted before the daily fetch cannot be recovered.
-- Task 238 (`0.2.15` candidate): each topic uses the earliest available source
+- Task 238 (released in `0.2.15`): each topic uses the earliest available source
   permalink among all `refs` (minimum valid ordinal, not model ordering), retaining
   every direct material URL from those refs. A direct material can itself be a
   Telegram URL; do not discard it as an extra source permalink. The separate links
