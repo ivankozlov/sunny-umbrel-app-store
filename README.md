@@ -46,17 +46,27 @@ Both server steps must precede `0.2.13`: the app takes its window from the gate.
 sender-name restoration (tasks 235/238). Both architectures were verified anonymously;
 Store enable commit `02c9d27` pins index digest
 `sha256:161bfed7b9d2e3317cf75b8346676cd3676760e586af0e1ff06641213da2845e`.
-The device update is still pending. Sunny's worker received the required URL-line
-protection in `plain_tg` on 2026-09-14 with separate approval. The running container's
+The owner confirmed the device update to `0.2.14` on 2026-09-14. Sunny's worker received
+the initial URL-line protection in `plain_tg` on 2026-09-14 with separate approval. The running container's
 code hash, URL preservation through the outbox path (without sending to Telegram), and
-health were verified. The server is ready for the device update.
+health were verified. Receiver contact succeeded after the update; the gate carries
+wire version `0.2.1`, not the app release, so the device version is owner-confirmed.
+A review follow-up makes Sunny's URL-line protection case-insensitive for `HTTPS://`
+and mixed-case schemes; its runtime hash was verified on 2026-09-18. All nine outbox
+parts of the September 15–18 issues were sent, direct URLs survived delivery and
+no Participant-N aliases remained. Task 235 is closed; task 238 now also requests
+one source permalink per topic.
+The local, unpublished `0.2.15` candidate keeps the earliest available referenced
+message (minimum valid ordinal, independent of model ref order) and all deduplicated
+direct material URLs from the same references. The separate materials section and
+wire version `0.2.1` are unchanged. Publication and the device Update are pending.
 The owner confirmed the daily-mode checks and closed task 244 on 2026-09-14.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.14` have public multi-arch images.
 **Update** and uninstall/reinstall therefore have a public source again. The device now
-runs public `0.2.13`; its update from `0.2.9` to `0.2.10` exercised the real recreate/pull path and
-preserved state. Docker image pruning remains out of bounds without a separate destructive
+runs public `0.2.14` according to the owner; its update from `0.2.9` to `0.2.10` exercised
+the real recreate/pull path and preserved state. Docker image pruning remains out of bounds without a separate destructive
 approval and a concrete need, and a future distribution closure could remove the public
 source again. The `umbrel/` subtree of private source
 repository `ivankozlov/sunny/main` deliberately remains a disabled, placeholder-pinned

@@ -798,8 +798,66 @@ class TestBugDigestSenderCase20260914(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_restore_sender_names("Participant-1", {}), "Participant-1")
 
 
+class TestBugDigestTopicSource20260918(unittest.TestCase):
+    """238: одна ранняя source-ссылка; bool и материал без permalink не мешают."""
+
+    def test_earliest_source_and_material_after_fifth_ref_are_preserved(self):
+        from sunny_digest.openrouter import render_digest
+        sources = {n: f"https://t.me/c/123/{100+n}" for n in range(1, 7)}
+        answer = {"chats": [{"chat": "Тест", "topics": [{
+            "title": "Тема", "summary": "Суть", "refs": [6, 5, 4, 3, 2, 1],
+        }], "links": []}]}
+        text = render_digest(answer, sources, material_urls={
+            1: ["https://example.org/earliest"],
+            6: ["https://example.org/latest"],
+        })
+        self.assertEqual(text.count(sources[1]), 1)
+        for n in range(2, 7):
+            self.assertNotIn(sources[n], text)
+        self.assertIn("https://example.org/earliest", text)
+        self.assertIn("https://example.org/latest", text)
+
+    def test_earliest_available_permalink_and_material_deduplication(self):
+        from sunny_digest.openrouter import render_digest
+        sources = {1: "https://t.me/c/123/101", 3: "https://t.me/c/123/103",
+                   4: "https://t.me/c/123/104"}
+        materials = {2: ["https://example.org/a"],
+                     4: ["https://example.org/a", "https://example.org/b"]}
+        answer = {"chats": [{"chat": "Тест", "topics": [{
+            "title": "Тема", "summary": "Суть", "refs": [True, 2, "4", 3, "oops"],
+        }], "links": []}]}
+        text = render_digest(answer, sources, material_urls=materials)
+        self.assertEqual(text.count("https://t.me/c/123/103"), 1)
+        self.assertNotIn(sources[1], text)
+        self.assertNotIn(sources[4], text)
+        self.assertEqual(text.count("https://example.org/a"), 1)
+        self.assertEqual(text.count("https://example.org/b"), 1)
+
+
 class TestBugDigestMaterialLinksProductionPath20260914(unittest.IsolatedAsyncioTestCase):
     """235: родитель подставляет исходные URL после ответа killable worker."""
+
+    async def test_topic_keeps_earliest_source_and_all_materials_from_unordered_refs(self):
+        chats = [DigestChat("TNN", [
+            SelectedMessage(100, 7, NOW, "Раннее сообщение"),
+            SelectedMessage(101, 8, NOW, "Первый материал", material_urls=(
+                "https://example.org/first",)),
+            SelectedMessage(102, 9, NOW, "Второй материал", material_urls=(
+                "https://t.me/other_channel/77",)),
+        ], "https://t.me/c/9876543210")]
+        answer = {"chats": [{"chat": "TNN", "topics": [{
+            "title": "Тема", "summary": "Суть", "refs": [3, "1", 2],
+        }], "links": []}]}
+        worker = FakeAnsweringWorker(answer)
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   return_value=worker):
+            digest = await create_digest(chats, "anthropic/example", "test-key",
+                                         asyncio.Event())
+        self.assertIn("https://example.org/first", digest)
+        self.assertIn("https://t.me/other_channel/77", digest)
+        self.assertEqual(digest.count("https://t.me/c/9876543210/100"), 1)
+        self.assertNotIn("https://t.me/c/9876543210/101", digest)
+        self.assertNotIn("https://t.me/c/9876543210/102", digest)
 
     async def test_materials_survive_worker_boundary_in_topics_and_links(self):
         chats = [

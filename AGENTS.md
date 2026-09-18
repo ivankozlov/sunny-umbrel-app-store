@@ -276,6 +276,11 @@ content, receiver keys, or rendered runtime configuration.
   added to the worker request. TNN deletes messages after 24 hours, so a Telegram
   permalink alone loses access to the material. This adds no Telegram requests;
   links already deleted before the daily fetch cannot be recovered.
+- Task 238 (`0.2.15` candidate): each topic uses the earliest available source
+  permalink among all `refs` (minimum valid ordinal, not model ordering), retaining
+  every direct material URL from those refs. A direct material can itself be a
+  Telegram URL; do not discard it as an extra source permalink. The separate links
+  section and collector wire version stay unchanged.
 - Every chat returning empty lists is an answer, not a failure — the prompt
   explicitly allows "nothing notable today", and the issue then says so in one
   line. An empty `chats` array is a failure: the model walked no chat at all.

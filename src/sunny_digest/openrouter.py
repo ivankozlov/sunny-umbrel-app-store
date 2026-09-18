@@ -118,6 +118,15 @@ def _clean(value: Any, limit: int) -> str:
     return text[:limit]
 
 
+def _ref_number(ref: Any) -> Optional[int]:
+    """Валидный сквозной номер сообщения из ответа модели."""
+    if isinstance(ref, bool):
+        return None
+    if isinstance(ref, str) and ref.isdigit():
+        ref = int(ref)
+    return ref if isinstance(ref, int) else None
+
+
 def _source_links(sources: Dict[int, str], material_urls: Dict[int, List[str]],
                   ref: Any) -> List[str]:
     """Прямые ссылки на материалы, затем ссылка на сообщение-источник.
@@ -125,15 +134,29 @@ def _source_links(sources: Dict[int, str], material_urls: Dict[int, List[str]],
     `isinstance(True, int)` — истина, поэтому bool отсекается явно: `ref: true`
     иначе дал бы ссылку на ПЕРВОЕ сообщение прогона. Строку с цифрами принимаем
     (модели легко отдают "12" вместо 12), всё остальное — не источник."""
-    if isinstance(ref, bool):
-        return []
-    if isinstance(ref, str) and ref.isdigit():
-        ref = int(ref)
-    if not isinstance(ref, int):
+    ref = _ref_number(ref)
+    if ref is None:
         return []
     urls = list(material_urls.get(ref, []))
     if ref in sources:
         urls.append(sources[ref])
+    return list(dict.fromkeys(urls))
+
+
+def _topic_links(sources: Dict[int, str], material_urls: Dict[int, List[str]],
+                 refs: List[Any]) -> List[str]:
+    """Материалы всех refs и один самый ранний доступный source permalink."""
+    urls: List[str] = []
+    source_ref = None
+    for ref in refs:
+        number = _ref_number(ref)
+        if number is None:
+            continue
+        urls.extend(material_urls.get(number, []))
+        if number in sources and (source_ref is None or number < source_ref):
+            source_ref = number
+    if source_ref is not None:
+        urls.append(sources[source_ref])
     return list(dict.fromkeys(urls))
 
 
@@ -187,12 +210,8 @@ def render_digest(
                 lines.append(summary)
             refs = topic.get("refs") or []
             if isinstance(refs, list):
-                seen_links = set()
-                for ref in refs[:5]:
-                    for link in _source_links(sources, material_urls or {}, ref):
-                        if link not in seen_links:
-                            lines.append(link)
-                            seen_links.add(link)
+                lines.extend(_topic_links(
+                    sources, material_urls or {}, refs))
             lines.append("")
 
         link_lines = []
