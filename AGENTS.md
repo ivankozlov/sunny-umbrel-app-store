@@ -281,6 +281,11 @@ content, receiver keys, or rendered runtime configuration.
   every direct material URL from those refs. A direct material can itself be a
   Telegram URL; do not discard it as an extra source permalink. The separate links
   section and collector wire version stay unchanged.
+- Link roles (25.09.2026): the parent marks only the selected source permalink as
+  `[Сообщение](URL)`. Materials remain standalone URLs, including external `t.me/c/`
+  links; the worker cannot infer their role from a Telegram hostname or position.
+  Deduplicate by the original URL before marking the source. No extra fetch or
+  model input is needed. Public release status is in `README.md`.
 - Every chat returning empty lists is an answer, not a failure — the prompt
   explicitly allows "nothing notable today", and the issue then says so in one
   line. An empty `chats` array is a failure: the model walked no chat at all.

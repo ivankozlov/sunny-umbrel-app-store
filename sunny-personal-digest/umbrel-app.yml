@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Chats
-version: "0.2.15"
+version: "0.2.16"
 tagline: One daily digest and morning read receipts for selected chats
 description: >-
   Resolves message links for only the explicitly selected Telegram groups.
@@ -20,9 +20,9 @@ description: >-
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  Each digest topic links to its earliest referenced Telegram message.
-  Direct links to articles and other materials from all referenced messages
-  are preserved and deduplicated. The daily schedule, sender-name restoration,
+  The selected source post in each digest topic is now labelled «Сообщение».
+  Direct links to articles and other materials remain standalone full URLs,
+  including Telegram links. The daily schedule, sender-name restoration,
   mention badges, and collector wire protocol 0.2.1 are unchanged.
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store

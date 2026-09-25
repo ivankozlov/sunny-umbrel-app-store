@@ -856,6 +856,8 @@ class TestBugDigestMaterialLinksProductionPath20260914(unittest.IsolatedAsyncioT
         self.assertIn("https://example.org/first", digest)
         self.assertIn("https://t.me/other_channel/77", digest)
         self.assertEqual(digest.count("https://t.me/c/9876543210/100"), 1)
+        self.assertIn('[Сообщение](https://t.me/c/9876543210/100)', digest)
+        self.assertNotIn('[Сообщение](https://t.me/other_channel/77)', digest)
         self.assertNotIn("https://t.me/c/9876543210/101", digest)
         self.assertNotIn("https://t.me/c/9876543210/102", digest)
 
@@ -882,6 +884,7 @@ class TestBugDigestMaterialLinksProductionPath20260914(unittest.IsolatedAsyncioT
                 self.assertEqual(section.count(url), 1)
                 self.assertLess(section.index(url), section.index("https://t.me/"))
             self.assertEqual(section.count("https://t.me/c/9876543210/91"), 1)
+            self.assertIn('[Сообщение](https://t.me/c/9876543210/91)', section)
         self.assertIn("Алиса", digest)
         request = json.loads(worker.stdin.data)
         for local_only in (*chats[1].messages[0].material_urls, "9876543210", "Алиса"):

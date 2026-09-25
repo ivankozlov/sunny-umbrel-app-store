@@ -69,6 +69,12 @@ that exact index digest. The owner confirmed the device Update to `0.2.15` on
 gate carries wire version `0.2.1`, which does not independently prove the app version.
 The owner confirmed the daily-mode checks and closed task 244 on 2026-09-14.
 
+`0.2.16` is prepared as a disabled Phase-A package. The parent labels only the
+selected source permalink as «Сообщение»; direct material links, including other
+Telegram links, remain standalone full URLs. The matching Sunny worker renders
+materials with destination labels. Wire version stays `0.2.1`. Publication and
+the enabling commit are pending.
+
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.15` have public multi-arch images.
 **Update** and uninstall/reinstall therefore have a public source again. The owner

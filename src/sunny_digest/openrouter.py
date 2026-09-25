@@ -138,9 +138,7 @@ def _source_links(sources: Dict[int, str], material_urls: Dict[int, List[str]],
     if ref is None:
         return []
     urls = list(material_urls.get(ref, []))
-    if ref in sources:
-        urls.append(sources[ref])
-    return list(dict.fromkeys(urls))
+    return _mark_source_link(urls, sources.get(ref))
 
 
 def _topic_links(sources: Dict[int, str], material_urls: Dict[int, List[str]],
@@ -155,9 +153,16 @@ def _topic_links(sources: Dict[int, str], material_urls: Dict[int, List[str]],
         urls.extend(material_urls.get(number, []))
         if number in sources and (source_ref is None or number < source_ref):
             source_ref = number
-    if source_ref is not None:
-        urls.append(sources[source_ref])
-    return list(dict.fromkeys(urls))
+    return _mark_source_link(urls, sources.get(source_ref))
+
+
+def _mark_source_link(urls: List[str], source: Optional[str]) -> List[str]:
+    # 25.09: материал тоже бывает ссылкой в Telegram, включая приватный чат.
+    # Только родитель знает происхождение URL; hostname не доказывает source.
+    links = list(dict.fromkeys(url for url in urls if url != source))
+    if source:
+        links.append(f"[Сообщение]({source})")
+    return links
 
 
 def _restore_sender_names(value: Any, names: Dict[str, str]) -> Any:
@@ -178,8 +183,8 @@ def render_digest(
     Ссылки подставляет КОД по порядковым номерам: модель их не пишет и
     Telegram-идентификаторов не видит. Номер вне карты источников молча
     отбрасывается — выдуманная моделью ссылка не должна дойти до Ивана.
-    Ссылка стоит отдельной строкой: доставка снимает markdown, а голый URL
-    Telegram делает кликабельным сам."""
+    Материалы стоят отдельными URL-строками, source — именованной ссылкой
+    «Сообщение». Sunny превращает их в нативные Telegram entities."""
     if not isinstance(parsed, dict) or set(parsed) != {"chats"}:
         raise OpenRouterError("OpenRouter digest JSON has unexpected fields")
     chats = parsed["chats"]
