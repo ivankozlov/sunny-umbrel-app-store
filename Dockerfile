@@ -1,6 +1,6 @@
 FROM docker.io/metacubex/mihomo:v1.19.29@sha256:e1d7dadaa9368a52d420d65007e0e0d87cb148d292faa67326eda3fef5757f59 AS mihomo
 
-FROM python:3.12.13-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
+FROM python:3.14.7-slim-bookworm@sha256:82bc3c539b8813ada9d68c63b40158fa002f7f33de9bf3312a3dfdc0620dff56
 
 ARG APP_VERSION=0.2.16
 LABEL org.opencontainers.image.source="https://github.com/ivankozlov/sunny-umbrel-app-store" \
