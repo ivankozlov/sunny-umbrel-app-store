@@ -9,6 +9,7 @@ import uuid
 import base64
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import sunny_digest.collector as collector_module
@@ -28,6 +29,7 @@ from sunny_digest.contracts import (
 from sunny_digest.ipc import SCHEDULER_TICK_S
 from sunny_digest.models import (
     DialogCandidate,
+    DigestChat,
     FetchResult,
     PeerSpec,
     SelectedMessage,
@@ -35,11 +37,22 @@ from sunny_digest.models import (
 from sunny_digest.settings import (
     CONSENT_SCOPE,
     CREDENTIALS_SCHEMA,
+    LEGACY_OPUS_48_MODEL,
+    OPUS_55_MODEL,
     SETTINGS_SCHEMA,
     load_credentials,
 )
 from sunny_digest.contracts import supergroup_link_prefix
-from sunny_digest.prompting import DIGEST_SKIP_NOTE_HEAD, DIGEST_TRUNCATION_NOTE
+from sunny_digest.prompting import (
+    DIGEST_SKIP_NOTE_HEAD,
+    DIGEST_TRUNCATION_NOTE,
+    PROMPT_PREFIX_BYTES,
+    message_row_bytes,
+    prompt_size,
+    render_digest_prompt,
+)
+from sunny_digest.telegram_gateway import TelethonGateway
+from sunny_digest.version import MAX_PROMPT_BYTES
 from sunny_digest.storage import (
     Paths,
     atomic_write_bytes,
@@ -363,15 +376,19 @@ class FakeGateway:
         return self.boundary[chat_id]
 
     async def fetch(self, _session, peer, chat_id, start, cutoff,
-                    not_before_at=None, max_prompt_bytes=None, chat_title=None):
+                    not_before_at=None, max_prompt_bytes=None, chat_title=None,
+                    prefix_messages=(), defer_oversized_first=False):
         if peer.telegram_chat_id() != chat_id:
             raise AssertionError("wrong daily peer")
         self.fetch_calls.append({
             "chat_id": chat_id, "start": start, "cutoff": cutoff,
             "not_before": not_before_at, "budget": max_prompt_bytes,
-            "title": chat_title,
+            "title": chat_title, "prefix": list(prefix_messages),
+            "defer_oversized_first": defer_oversized_first,
         })
         result = self.fetches[chat_id]
+        if isinstance(result, list):
+            result = result.pop(0)
         if isinstance(result, BaseException):
             raise result
         return result
@@ -1158,6 +1175,35 @@ class TestBugLiveVPNRepair20260814(unittest.IsolatedAsyncioTestCase):
                     await collector.replace_vpn(
                         "https://subscription.example/precondition-secret")
                 self.assertIsNone(collector._vpn_repair_task)
+
+    async def test_init_migrates_valid_legacy_model_but_keeps_invalid_lock_recoverable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            settings = read_json(paths.settings)
+            settings["openrouter_model"] = LEGACY_OPUS_48_MODEL
+            atomic_write_json(paths.settings, settings)
+
+            Collector(
+                paths,
+                vpn_runtime_factory=lambda private: FakeVPNRuntime(private),
+                clock=lambda: NOW,
+            )
+
+            self.assertEqual(read_json(paths.settings)["openrouter_model"], OPUS_55_MODEL)
+            paths.chat_locked.unlink()
+            settings = read_json(paths.settings)
+            settings["openrouter_model"] = LEGACY_OPUS_48_MODEL
+            atomic_write_json(paths.settings, settings)
+            recovered = Collector(
+                paths,
+                vpn_runtime_factory=lambda private: FakeVPNRuntime(private),
+                clock=lambda: NOW,
+            )
+            status = await recovered.public_status()
+            self.assertEqual(status["phase"], "error")
+            self.assertEqual(
+                read_json(paths.settings)["openrouter_model"], LEGACY_OPUS_48_MODEL)
 
     async def test_repair_tests_at_most_eight_deduplicated_candidates(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -4493,7 +4539,7 @@ class TestBugDigestExtendedChat20260825(unittest.IsolatedAsyncioTestCase):
                 [call["start"] for call in gateway.fetch_calls], [1500, 8300])
             text = transport.digest_uploads[0]["digest"]
             self.assertTrue(text.startswith(DIGEST_SKIP_NOTE_HEAD), text[:120])
-            self.assertIn(f"{TITLES[0]}: сообщения 901–1500", text)
+            self.assertIn(f"{TITLES[0]}: диапазон ID 901–1500", text)
             # Про чат, вошедший в набор этим выпуском, предупреждения нет.
             self.assertNotIn(TITLES[1], text.split("\n\n")[0])
             self.assertIn("Общий дайджест", text)
@@ -4516,3 +4562,387 @@ class TestBugDigestExtendedChat20260825(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 transport.digest_uploads[0]["digest"], "Общий дайджест")
+
+
+class TestBugDigestFairPromptBudget20260927(unittest.IsolatedAsyncioTestCase):
+    """261: свободная доля тихих чатов не должна старить хвост активного.
+
+    Регресс воспроизводит недостаток равного деления: активный чат упирается
+    в свою долю при свободном месте тихого. Metadata seq27–33 этому
+    соответствуют (34–54 выбранных строки у одного chat_index и нули у
+    нескольких других), но не доказывают содержимое старого ID-диапазона.
+    Первый проход остаётся равным;
+    второй расходует только неиспользованный общий бюджет поровну между теми,
+    кого gateway действительно остановил на лимите.
+    """
+
+    def _message(self, message_id, text):
+        return SelectedMessage(message_id, 7, NOW, text)
+
+    @staticmethod
+    def _selector_gateway(rows):
+        """Настоящий selector на локальном Telethon transport без сети."""
+        class SelectorClient:
+            async def connect(self):
+                pass
+
+            async def disconnect(self):
+                pass
+
+            async def is_user_authorized(self):
+                return True
+
+            async def get_messages(self, peer, **kwargs):
+                if kwargs["offset_date"] < NOW:
+                    return []
+                chat_rows = rows[peer.telegram_chat_id()]
+                return [chat_rows[-1]] if chat_rows else []
+
+            def iter_messages(self, peer, **kwargs):
+                selected = [
+                    row for row in rows[peer.telegram_chat_id()]
+                    if kwargs["min_id"] < row.id < kwargs["max_id"]
+                ]
+
+                async def iterator():
+                    for row in selected[:kwargs["limit"]]:
+                        yield row
+
+                return iterator()
+
+        class SelectorUtils:
+            @staticmethod
+            def get_peer_id(peer_id):
+                return peer_id
+
+        class SelectorGateway(TelethonGateway):
+            def __init__(self):
+                super().__init__(12345, "a" * 32, {
+                    "proxy_type": "socks5", "addr": "127.0.0.1",
+                    "port": 7891, "rdns": True,
+                })
+                self.client = SelectorClient()
+
+            def _client(self, _session):
+                return self.client
+
+            def _input_peer(self, peer):
+                return peer
+
+            def _modules(self):
+                return None, SelectorUtils, None, None, None, None, None
+
+            async def snapshot_peer_tops(self, _session, selected):
+                return ({chat_id: 0 for chat_id, _ in selected}, [])
+
+            async def acknowledge_reads(self, _session, targets):
+                return [chat_id for chat_id, _, _ in targets], []
+
+        return SelectorGateway()
+
+    async def test_busy_first_and_last_reclaim_quiet_chat_share_without_order_bias(self):
+        for busy_index in (0, 1):
+            with self.subTest(busy_index=busy_index), tempfile.TemporaryDirectory() as temporary:
+                paths = make_paths(Path(temporary))
+                seed_locked(paths, watch_phase="active")
+                gateway = FakeGateway(paths)
+                busy_id = CHAT_IDS[busy_index]
+                quiet_id = CHAT_IDS[1 - busy_index]
+                first = FetchResult(101, [self._message(101, "первая")], True)
+                first_messages = list(first.messages)
+                refill = FetchResult(102, [self._message(102, "вторая")])
+                gateway.fetches = {
+                    busy_id: [first, refill],
+                    quiet_id: FetchResult(200, []),
+                }
+                transport = FakeTransport(paths, gate(digest_due=True))
+
+                result = await collector_for(paths, gateway, transport).run_once()
+
+                self.assertEqual(result["last_result"], "uploaded_digest")
+                calls = [row for row in gateway.fetch_calls if row["chat_id"] == busy_id]
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(calls[1]["start"], 101)
+                self.assertEqual(calls[1]["prefix"], first_messages)
+                # Вторая выборка получает всю реально свободную долю тихого
+                # чата, но только после его равного первого прохода.
+                used = prompt_size(first_messages, TITLES[busy_index]) - PROMPT_PREFIX_BYTES
+                expected = (prompt_size(first_messages, TITLES[busy_index])
+                            + MAX_PROMPT_BYTES - PROMPT_PREFIX_BYTES - used)
+                self.assertEqual(calls[1]["budget"], expected)
+                payload = transport.digest_uploads[0]
+                busy_range = next(row for row in payload["chat_ranges"]
+                                  if row["chat_id"] == busy_id)
+                self.assertEqual(busy_range["through_message_id"], 102)
+                self.assertEqual(busy_range["message_count"], 2)
+
+    async def test_two_busy_chats_split_the_free_budget_equally(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            first = {
+                chat_id: FetchResult(100 + index, [self._message(100 + index, title)], True)
+                for index, (chat_id, title) in enumerate(zip(CHAT_IDS, TITLES))
+            }
+            gateway.fetches = {
+                chat_id: [first[chat_id], FetchResult(200 + index, [])]
+                for index, chat_id in enumerate(CHAT_IDS)
+            }
+            transport = FakeTransport(paths, gate(digest_due=True))
+
+            result = await collector_for(paths, gateway, transport).run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            refills = [row for row in gateway.fetch_calls if row["prefix"]]
+            self.assertEqual(len(refills), 2)
+            added = [
+                row["budget"] - prompt_size(row["prefix"], row["title"])
+                for row in refills
+            ]
+            used_rows = sum(
+                prompt_size(first[chat_id].messages, title) - PROMPT_PREFIX_BYTES
+                for chat_id, title in zip(CHAT_IDS, TITLES)
+            )
+            expected = (
+                MAX_PROMPT_BYTES - PROMPT_PREFIX_BYTES - used_rows - 1
+            ) // len(CHAT_IDS)
+            self.assertEqual(added, [expected, expected])
+
+    async def test_deferred_chat_keeps_its_initial_share_before_extra_split(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            row_budget = (
+                MAX_PROMPT_BYTES - PROMPT_PREFIX_BYTES - 1
+            ) // len(CHAT_IDS)
+            almost_full = self._message(1, "x" * (row_budget - 512))
+            gateway.fetches = {
+                # A отложил свою первую строку, B израсходовал почти всю
+                # первую долю. Без резерва A получил бы лишь half extra.
+                CHAT_IDS[0]: [
+                    FetchResult(0, [], True),
+                    FetchResult(1, [self._message(1, "целая строка")]),
+                ],
+                CHAT_IDS[1]: [
+                    FetchResult(1, [almost_full], True),
+                    FetchResult(2, [self._message(2, "хвост")]),
+                ],
+            }
+            transport = FakeTransport(paths, gate(digest_due=True))
+
+            result = await collector_for(paths, gateway, transport).run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            refill_calls = gateway.fetch_calls[2:]
+            self.assertEqual([row["chat_id"] for row in refill_calls], CHAT_IDS)
+            self.assertGreaterEqual(
+                refill_calls[0]["budget"], PROMPT_PREFIX_BYTES + row_budget)
+            self.assertEqual(refill_calls[0]["prefix"], [])
+            self.assertEqual(refill_calls[1]["prefix"], [almost_full])
+
+    async def test_all_deferred_chats_refill_their_reserved_share_without_extra(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            row_budget = (
+                MAX_PROMPT_BYTES - PROMPT_PREFIX_BYTES - 1
+            ) // len(CHAT_IDS)
+            gateway.fetches = {
+                chat_id: [
+                    FetchResult(0, [], True),
+                    FetchResult(index + 1, [self._message(index + 1, title)]),
+                ]
+                for index, (chat_id, title) in enumerate(zip(CHAT_IDS, TITLES))
+            }
+            transport = FakeTransport(paths, gate(digest_due=True))
+
+            result = await collector_for(paths, gateway, transport).run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            refill_calls = gateway.fetch_calls[2:]
+            self.assertEqual(len(refill_calls), len(CHAT_IDS))
+            self.assertEqual(
+                [row["budget"] for row in refill_calls],
+                [PROMPT_PREFIX_BYTES + row_budget] * len(CHAT_IDS),
+            )
+            self.assertLessEqual(
+                sum(row["budget"] - PROMPT_PREFIX_BYTES
+                    for row in refill_calls) + 1,
+                MAX_PROMPT_BYTES - PROMPT_PREFIX_BYTES,
+            )
+
+    async def test_second_fetch_failure_never_stages_or_acknowledges_partial_issue(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            gateway = FakeGateway(paths)
+            gateway.fetches = {
+                CHAT_IDS[0]: [
+                    FetchResult(101, [self._message(101, "первая")], True),
+                    RuntimeError("refill failed"),
+                ],
+                CHAT_IDS[1]: FetchResult(200, []),
+            }
+            transport = FakeTransport(paths, gate(digest_due=True))
+
+            result = await collector_for(paths, gateway, transport).run_once()
+
+            self.assertEqual(result["last_result"], "error")
+            self.assertEqual(result["last_error_type"], "RuntimeError")
+            self.assertEqual(transport.digest_uploads, [])
+            self.assertFalse(paths.pending.exists())
+            self.assertFalse(paths.acknowledged.exists())
+
+    async def test_refill_refuses_when_trusted_gate_window_has_closed(self):
+        """261: refill не может начать Telegram-запрос после accept_until."""
+        class WindowClosingGateway(FakeGateway):
+            async def fetch(self, *args, **kwargs):
+                result = await super().fetch(*args, **kwargs)
+                if len(self.fetch_calls) == 1:
+                    clock[0] += 11
+                return result
+
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            clock = [1_000.0]
+            gateway = WindowClosingGateway(paths)
+            gateway.fetches = {
+                CHAT_IDS[0]: [
+                    FetchResult(0, [], True),
+                    FetchResult(1, [self._message(1, "не читать")]),
+                ],
+                CHAT_IDS[1]: FetchResult(0, []),
+            }
+            transport = FakeTransport(paths, gate(
+                digest_due=True,
+                server_time="2026-08-04T06:44:50Z",
+                prepare_not_before="2026-08-04T08:00:00+03:00",
+                accept_until="2026-08-04T09:45:00+03:00",
+            ))
+            collector = collector_for(paths, gateway, transport)
+            collector.monotonic = lambda: clock[0]
+
+            result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "error")
+            self.assertEqual(result["last_error_type"], "RuntimeError")
+            self.assertEqual(len(gateway.fetch_calls), 2)
+            self.assertEqual(transport.digest_uploads, [])
+            self.assertFalse(paths.pending.exists())
+            self.assertFalse(paths.acknowledged.exists())
+
+    async def test_real_selector_refills_busy_chat_without_losing_whole_rows(self):
+        """Настоящий Telethon selector дочитывает busy+empty до общего лимита."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            busy_id, empty_id = CHAT_IDS
+            # Первая строка больше равной доли, но весь чат помещается в
+            # общий лимит. Старый selector обрезал бы её ДО refill и признал
+            # курсор; quiet чат пуст, поэтому новый проход обязан забрать
+            # строку целиком, не создавая второго фонового цикла.
+            first_text = "первая целая строка " + "x" * 50_000
+            busy_rows = [
+                SimpleNamespace(
+                    id=1, peer_id=busy_id, message=first_text,
+                    date=NOW, sender_id=7, sender=None, post_author=None,
+                    entities=None,
+                ),
+                *[
+                SimpleNamespace(
+                    id=index, peer_id=busy_id, message=(f"строка-{index} " + "x" * 850),
+                    date=NOW, sender_id=7, sender=None, post_author=None, entities=None,
+                )
+                for index in range(2, 22)
+                ],
+            ]
+            gateway = self._selector_gateway({busy_id: busy_rows, empty_id: []})
+            legacy_budget = max(1024, PROMPT_PREFIX_BYTES + (
+                MAX_PROMPT_BYTES - PROMPT_PREFIX_BYTES) // len(CHAT_IDS))
+            legacy = await gateway.fetch(
+                "session", PEERS[0], busy_id, 0, NOW,
+                not_before_at=NOW - timedelta(hours=72),
+                max_prompt_bytes=legacy_budget, chat_title=TITLES[0],
+                defer_oversized_first=True,
+            )
+            self.assertTrue(legacy.budget_exhausted)
+            self.assertEqual(legacy.messages, [])
+            self.assertEqual(legacy.through_message_id, 0)
+            transport = FakeTransport(paths, gate(digest_due=True))
+            digest_calls = []
+            collector = collector_for(paths, gateway, transport, digest_calls)
+
+            result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            selected = digest_calls[0][0]
+            self.assertEqual(len(selected), 1)
+            self.assertEqual(
+                [row.message_id for row in selected[0].messages],
+                list(range(1, 22)),
+            )
+            self.assertEqual(selected[0].messages[0].text, first_text)
+            self.assertTrue(all(not row.text.endswith("[обрезано]")
+                                for row in selected[0].messages))
+            rendered = render_digest_prompt(selected)
+            self.assertLessEqual(len(rendered.encode("utf-8")), MAX_PROMPT_BYTES)
+            payload = transport.digest_uploads[0]
+            busy_range = next(row for row in payload["chat_ranges"]
+                              if row["chat_id"] == busy_id)
+            self.assertEqual(busy_range["through_message_id"], 21)
+            self.assertEqual(busy_range["message_count"], 21)
+
+    async def test_real_selector_refills_tail_after_nonempty_prefix(self):
+        """Бывший 261: целый хвост идёт после уже выбранных строк."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            busy_id, empty_id = CHAT_IDS
+            busy_rows = [
+                SimpleNamespace(
+                    id=index, peer_id=busy_id,
+                    message=f"строка-{index} " + "x" * 850,
+                    date=NOW, sender_id=7, sender=None, post_author=None,
+                    entities=None,
+                )
+                for index in range(1, 71)
+            ]
+            gateway = self._selector_gateway({busy_id: busy_rows, empty_id: []})
+            transport = FakeTransport(paths, gate(digest_due=True))
+            digest_calls = []
+
+            result = await collector_for(paths, gateway, transport, digest_calls).run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            selected = digest_calls[0][0]
+            self.assertEqual(
+                [row.message_id for row in selected[0].messages],
+                list(range(1, 71)),
+            )
+            self.assertTrue(all(not row.text.endswith("[обрезано]")
+                                for row in selected[0].messages))
+            self.assertLessEqual(
+                len(render_digest_prompt(selected).encode("utf-8")),
+                MAX_PROMPT_BYTES,
+            )
+
+    def test_render_budget_counts_newline_between_chat_rows_exactly(self):
+        first = self._message(1, "первый")
+        second = self._message(2, "второй")
+        chats = [
+            DigestChat(TITLES[0], [first]),
+            DigestChat(TITLES[1], [second]),
+        ]
+        rendered = render_digest_prompt(chats).encode("utf-8")
+        expected = (
+            PROMPT_PREFIX_BYTES
+            + len(message_row_bytes(first, "participant-1", TITLES[0], 1))
+            + 1
+            + len(message_row_bytes(second, "participant-1", TITLES[1], 2))
+        )
+        self.assertEqual(len(rendered), expected)
+        self.assertLessEqual(len(rendered), MAX_PROMPT_BYTES)

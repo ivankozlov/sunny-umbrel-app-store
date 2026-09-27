@@ -9,9 +9,12 @@ from pathlib import Path
 from sunny_digest.models import DialogCandidate, PeerSpec, validate_chat_title
 from sunny_digest.settings import (
     CONSENT_SCOPE,
+    LEGACY_OPUS_48_MODEL,
+    OPUS_55_MODEL,
     SETTINGS_SCHEMA,
     consent_active,
     load_settings,
+    migrate_opus_48_model,
     normalize_known_host,
     validate_configure,
 )
@@ -193,6 +196,57 @@ class LockedChatsV2Tests(unittest.TestCase):
             ]
             self._locked(paths, chats)
             self.assertEqual(load_settings(paths)["chats"], chats)
+
+    def test_opus_48_migration_preserves_locked_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = Paths(root / "config", root / "private", root / "runtime",
+                          root / "runtime" / "control.sock")
+            paths.ensure()
+            chats = [{"chat_id": -123, "title": "B",
+                      "peer": PeerSpec("chat", 123, None).as_dict(),
+                      "initial_message_id": 0}]
+            self._locked(paths, chats)
+            value = __import__("json").loads(paths.settings.read_text())
+            value["openrouter_model"] = LEGACY_OPUS_48_MODEL
+            atomic_write_json(paths.settings, value)
+            artifacts = {
+                paths.pending: b'{"digest":"pending"}\n',
+                paths.acknowledged: b'{"digest":"acknowledged"}\n',
+                paths.monitor_pending: b'{"monitor":"pending"}\n',
+                paths.watch_state: b'{"history":"unchanged"}\n',
+            }
+            for path, raw in artifacts.items():
+                atomic_write_bytes(path, raw)
+
+            migrated = migrate_opus_48_model(paths)
+
+            self.assertEqual(migrated["openrouter_model"], OPUS_55_MODEL)
+            persisted = load_settings(paths)
+            self.assertEqual(persisted["openrouter_model"], OPUS_55_MODEL)
+            self.assertEqual(persisted["chats"], chats)
+            self.assertEqual(persisted["source_id"], value["source_id"])
+            self.assertEqual(persisted["upload"], value["upload"])
+            self.assertEqual({path: path.read_bytes() for path in artifacts}, artifacts)
+
+    def test_opus_48_migration_keeps_custom_model_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = Paths(root / "config", root / "private", root / "runtime",
+                          root / "runtime" / "control.sock")
+            paths.ensure()
+            chats = [{"chat_id": -123, "title": "B",
+                      "peer": PeerSpec("chat", 123, None).as_dict(),
+                      "initial_message_id": 0}]
+            self._locked(paths, chats)
+            before = paths.settings.read_bytes()
+
+            first = migrate_opus_48_model(paths)
+            second = migrate_opus_48_model(paths)
+
+            self.assertEqual(first["openrouter_model"], "anthropic/example")
+            self.assertEqual(second, first)
+            self.assertEqual(paths.settings.read_bytes(), before)
 
     def test_v2_locked_settings_reject_invalid_chat_sets_and_v1(self):
         base = {"chat_id": -123, "title": "B",

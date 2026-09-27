@@ -185,9 +185,10 @@ def parse_message_link(value: Any) -> Tuple[str, Any]:
 
 def _truncate_first_to_budget(message: SelectedMessage,
                               max_prompt_bytes: int,
-                              chat_title: Optional[str]) -> SelectedMessage:
+                              chat_title: Optional[str],
+                              prefix_messages: Sequence[SelectedMessage] = ()) -> SelectedMessage:
     """Fit one anomalously large row into the caller's per-chat budget."""
-    if prompt_size([message], chat_title) <= max_prompt_bytes:
+    if prompt_size(list(prefix_messages) + [message], chat_title) <= max_prompt_bytes:
         return message
     suffix = "\n[обрезано]"
     low, high = 0, len(message.text)
@@ -198,7 +199,8 @@ def _truncate_first_to_budget(message: SelectedMessage,
         candidate = SelectedMessage(
             message.message_id, message.sender_id, message.sent_at,
             candidate_text, message.sender_name, message.material_urls)
-        if prompt_size([candidate], chat_title) <= max_prompt_bytes:
+        if (prompt_size(list(prefix_messages) + [candidate], chat_title)
+                <= max_prompt_bytes):
             best = candidate_text
             low = middle + 1
         else:
@@ -746,16 +748,24 @@ class TelethonGateway:
                     from_message_id_exclusive: int, cutoff_at: datetime,
                     not_before_at: Optional[datetime] = None,
                     max_prompt_bytes: int = MAX_PROMPT_BYTES,
-                    chat_title: Optional[str] = None) -> FetchResult:
+                    chat_title: Optional[str] = None,
+                    prefix_messages: Sequence[SelectedMessage] = (),
+                    defer_oversized_first: bool = False) -> FetchResult:
         if not_before_at is not None and not_before_at.tzinfo is None:
             raise ValueError("Telegram lower time boundary must be timezone-aware")
         if (type(max_prompt_bytes) is not int
                 or not 0 < max_prompt_bytes <= MAX_PROMPT_BYTES):
             raise ValueError("Telegram prompt budget is invalid")
+        if type(defer_oversized_first) is not bool:
+            raise ValueError("Telegram first-row deferral is invalid")
         _, utils, _, _, _, _, _ = self._modules()
         client = self._client(session_text)
         await client.connect()
         through = from_message_id_exclusive
+        # Второй fair-проход получает уже выбранные тем же чатом строки
+        # только в памяти процесса. Иначе budget считал бы новую порцию как
+        # независимый prompt и общий предел можно было бы превысить.
+        prefix = list(prefix_messages)
         selected: List[SelectedMessage] = []
         not_before = (
             not_before_at.astimezone(timezone.utc)
@@ -813,17 +823,24 @@ class TelethonGateway:
                     ),
                     material_urls=_message_material_urls(message),
                 )
-                if prompt_size(selected + [candidate], chat_title) > max_prompt_bytes:
-                    if selected:
+                if (prompt_size(prefix + selected + [candidate], chat_title)
+                        > max_prompt_bytes):
+                    if prefix or selected or defer_oversized_first:
                         # Do not advance across text omitted from the bounded
                         # prompt; a later due run resumes from this message —
                         # for as long as the tail stays younger than that run's
                         # lower boundary. A tail that outlives the window is
                         # skipped instead, and the issue says so out loud
-                        # (`digest_skip_note`).
-                        break
+                        # (`digest_skip_note`). Refill's `prefix` means this
+                        # is not the first row of the complete prompt: cutting
+                        # it would acknowledge text which the model never saw
+                        # intact. Первый fair-проход также может отложить
+                        # единственную большую строку: refill либо поместит
+                        # её целиком в общий бюджет, либо честно обрежет как
+                        # аномально большую строку.
+                        return FetchResult(through, selected, budget_exhausted=True)
                     candidate = _truncate_first_to_budget(
-                        candidate, max_prompt_bytes, chat_title)
+                        candidate, max_prompt_bytes, chat_title, prefix)
                 selected.append(candidate)
                 through = max(through, message_id)
             return FetchResult(through, selected)

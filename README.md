@@ -56,31 +56,36 @@ and mixed-case schemes; its runtime hash was verified on 2026-09-18. All nine ou
 parts of the September 15–18 issues were sent, direct URLs survived delivery and
 no Participant-N aliases remained. Task 235 is closed; task 238 now also requests
 one source permalink per topic.
-`0.2.15` was published on 2026-09-18 for task 238: each topic keeps the earliest
-available referenced message (minimum valid ordinal, independent of model ref order)
-and all deduplicated direct material URLs from the same references. The separate
-materials section and wire version `0.2.1` are unchanged. The protected Publish image
-workflow built source `ff3bb13` with `APP_VERSION=0.2.15`; anonymous verification
-confirmed the public multi-arch index digest
-`sha256:bb4ee4a1c6588cfeb75d30bd4da817fcd8a37081f8eb9c5f37ae4f4b9f95f70f`, both
-architectures, and their version/source labels. Store enable commit `ab59c4d` pins
-that exact index digest. The owner confirmed the device Update to `0.2.15` on
-2026-09-18; the first digest after that update has not yet been verified. The receiver
-gate carries wire version `0.2.1`, which does not independently prove the app version.
+`0.2.15`, published on 2026-09-18, keeps the earliest available referenced
+message (minimum valid ordinal, independent of model ref order) and all deduplicated
+direct material URLs from the same references. The separate materials section and
+wire version `0.2.1` are unchanged. The owner confirmed the device Update on
+2026-09-18. The first issue after the update (`seq=25`, 2026-09-19) passed the
+live gate: all nine topics had exactly one source permalink, direct materials
+were retained, no Participant-N alias remained, and all three parts were sent.
+Task 238 is closed.
+Store enable commit `ab59c4d` pins the anonymously verified amd64/arm64 index
+`sha256:bb4ee4a1c6588cfeb75d30bd4da817fcd8a37081f8eb9c5f37ae4f4b9f95f70f`.
+Publish workflow `35396194913` succeeded after the owner's manual environment approval;
+release package checks and all 315 tests passed.
 The owner confirmed the daily-mode checks and closed task 244 on 2026-09-14.
 
-`0.2.16` is prepared as a disabled Phase-A package. The parent labels only the
-selected source permalink as «Сообщение»; direct material links, including other
-Telegram links, remain standalone full URLs. The matching Sunny worker renders
-materials with destination labels. Wire version stays `0.2.1`. Publication and
-the enabling commit are pending.
+`0.2.16`, published on 2026-09-25, labels the selected
+source permalink of each digest topic as «Сообщение»; direct material links,
+including other Telegram links, remain standalone full URLs. The collector wire
+version remains `0.2.1`.
+
+`0.2.17` is prepared as a disabled Phase-A package. Busy chats can reclaim unused
+prompt space from quiet chats during the same daily run. Skip notices describe
+Telegram ID ranges, which are not message counts. On startup, the exact persisted
+Opus 4.8 model is migrated to Opus 5.5 without resetting delivery state. Other
+configured models remain unchanged. Publication and device Update are pending.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.15` have public multi-arch images.
-**Update** and uninstall/reinstall therefore have a public source again. The owner
-confirmed the device now runs public `0.2.15` on 2026-09-18; the first following digest
-has not yet been verified. Its update from `0.2.9` to `0.2.10` exercised the real recreate/pull path and preserved
-state. Docker image pruning remains out of bounds without a separate destructive
+**Update** and uninstall/reinstall therefore have a public source again. The device now
+runs public `0.2.15` according to the owner; its update from `0.2.9` to `0.2.10` exercised
+the real recreate/pull path and preserved state. Docker image pruning remains out of bounds without a separate destructive
 approval and a concrete need, and a future distribution closure could remove the public
 source again. The `umbrel/` subtree of private source
 repository `ivankozlov/sunny/main` deliberately remains a disabled, placeholder-pinned
@@ -355,10 +360,10 @@ activation screens.
 Anonymous umbrelOS install/update requires both a public Store repository and a
 public `ghcr.io/ivankozlov/sunny-personal-digest` image. Both surfaces were closed on
 2026-08-14 and reopened on 2026-08-17 by an explicit owner decision; `v0.2.6`
-through `v0.2.14` were published and enabled from there. Reopening stays an
+through `v0.2.15` were published and enabled from there. Reopening stays an
 explicit, per-release decision — never republish silently.
 
-Every release follows this exact sequence, as `0.2.5` did and `0.2.6`–`0.2.14` did
+Every release follows this exact sequence, as `0.2.5` did and `0.2.6`–`0.2.15` did
 after it: disabled source first, the protected `Publish image` workflow with
 `bootstrap_empty_package=false`, independent public OCI verification for
 `linux/amd64` and `linux/arm64`, and only then the exact digest pin plus

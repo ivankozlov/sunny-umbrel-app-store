@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import sunny_digest.telegram_gateway as gateway_module
-from sunny_digest.models import DigestChat, PeerSpec
+from sunny_digest.models import DigestChat, PeerSpec, SelectedMessage
 from sunny_digest.prompting import prompt_size, render_digest_prompt
 from sunny_digest.mihomo import MIHOMO_SOCKS_HOST, MIHOMO_SOCKS_PORT
 from sunny_digest.telegram_gateway import (
@@ -832,6 +832,100 @@ class TestBugTrustedLookback20260810(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.messages, [])
         self.assertEqual(result.through_message_id, 6)
+
+    async def test_sparse_ids_and_empty_rows_advance_cursor_without_budget_exhaustion(self):
+        """261: ID-диапазон не является числом содержательных сообщений.
+
+        Telegram IDs могут иметь большие дыры и пустые/service rows. Такой
+        проход двигает курсор, но не помечается как ограниченный prompt-ом;
+        возможный старый boundary skip остаётся отдельным фактом, который
+        без чтения истории по одним ID установить нельзя.
+        """
+        boundary = CUTOFF - timedelta(hours=72)
+        client = FakeClient([
+            message(6, text="", sent_at=boundary),
+            message(100, text="содержательное", sent_at=boundary),
+        ], upper_id=100)
+        result = await GatewayUnderTest(client).fetch(
+            "session", PeerSpec("channel", 100123, 998877), CHAT_ID,
+            5, CUTOFF, not_before_at=boundary,
+        )
+        self.assertEqual([row.message_id for row in result.messages], [100])
+        self.assertEqual(result.through_message_id, 100)
+        self.assertFalse(result.budget_exhausted)
+
+    async def test_budget_exhaustion_is_reported_without_advancing_past_omitted_text(self):
+        first_text = "первое " * 40
+        client = FakeClient([
+            message(6, text=first_text),
+            message(7, text="второе " * 40),
+        ], upper_id=7)
+        budget = prompt_size([
+            SelectedMessage(6, 7, CUTOFF, first_text.strip()),
+        ])
+        result = await GatewayUnderTest(client).fetch(
+            "session", PeerSpec("channel", 100123, 998877), CHAT_ID,
+            5, CUTOFF, max_prompt_bytes=budget,
+        )
+        self.assertEqual([row.message_id for row in result.messages], [6])
+        self.assertEqual(result.through_message_id, 6)
+        self.assertTrue(result.budget_exhausted)
+
+    async def test_refill_never_truncates_first_new_row_after_a_prefix(self):
+        """261: prefix уже занимает prompt, значит новый ряд не первый."""
+        prefix_text = "уже выбрано " * 4000
+        next_text = "новая строка не должна быть обрезана " * 500
+        prefix = SelectedMessage(6, 7, CUTOFF, prefix_text.strip())
+        client = FakeClient([message(7, text=next_text)], upper_id=7)
+        result = await GatewayUnderTest(client).fetch(
+            "session", PeerSpec("channel", 100123, 998877), CHAT_ID,
+            6, CUTOFF, max_prompt_bytes=prompt_size([prefix]),
+            prefix_messages=[prefix],
+        )
+        self.assertEqual(result.messages, [])
+        self.assertEqual(result.through_message_id, 6)
+        self.assertTrue(result.budget_exhausted)
+
+    async def test_fair_pass_defers_first_row_until_refill_can_fit_it(self):
+        text = "x" * 50_000
+        client = FakeClient([message(6, text=text)], upper_id=6)
+        gateway = GatewayUnderTest(client)
+        fair_budget = prompt_size([]) + 2_000
+
+        deferred = await gateway.fetch(
+            "session", PeerSpec("channel", 100123, 998877), CHAT_ID,
+            5, CUTOFF, max_prompt_bytes=fair_budget,
+            defer_oversized_first=True,
+        )
+        self.assertEqual(deferred.messages, [])
+        self.assertEqual(deferred.through_message_id, 5)
+        self.assertTrue(deferred.budget_exhausted)
+
+        refill = await gateway.fetch(
+            "session", PeerSpec("channel", 100123, 998877), CHAT_ID,
+            deferred.through_message_id, CUTOFF,
+        )
+        self.assertEqual([row.message_id for row in refill.messages], [6])
+        self.assertEqual(refill.messages[0].text, text)
+        self.assertEqual(refill.through_message_id, 6)
+
+    async def test_refill_truncates_row_that_exceeds_the_whole_prompt(self):
+        text = "я" * (MAX_PROMPT_BYTES * 2)
+        client = FakeClient([message(6, text=text)], upper_id=6)
+        gateway = GatewayUnderTest(client)
+
+        deferred = await gateway.fetch(
+            "session", PeerSpec("channel", 100123, 998877), CHAT_ID,
+            5, CUTOFF, max_prompt_bytes=prompt_size([]) + 2_000,
+            defer_oversized_first=True,
+        )
+        refill = await gateway.fetch(
+            "session", PeerSpec("channel", 100123, 998877), CHAT_ID,
+            deferred.through_message_id, CUTOFF,
+        )
+        self.assertEqual(refill.through_message_id, 6)
+        self.assertTrue(refill.messages[0].text.endswith("[обрезано]"))
+        self.assertLessEqual(prompt_size(refill.messages), MAX_PROMPT_BYTES)
 
 
 if __name__ == "__main__":

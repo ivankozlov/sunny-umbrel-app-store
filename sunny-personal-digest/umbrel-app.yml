@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Chats
-version: "0.2.16"
+version: "0.2.17"
 tagline: One daily digest and morning read receipts for selected chats
 description: >-
   Resolves message links for only the explicitly selected Telegram groups.
@@ -20,10 +20,11 @@ description: >-
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  The selected source post in each digest topic is now labelled «Сообщение».
-  Direct links to articles and other materials remain standalone full URLs,
-  including Telegram links. The daily schedule, sender-name restoration,
-  mention badges, and collector wire protocol 0.2.1 are unchanged.
+  Busy chats can use the prompt space left unused by quiet chats within the
+  existing daily window. Skipped history is labelled as an ID range rather
+  than a message count. Existing Opus 4.8 settings migrate to Opus 5.5 without
+  resetting Telegram, pending deliveries, or read receipts. The collector
+  wire protocol remains 0.2.1.
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store
 dependencies: []

@@ -33,6 +33,8 @@ from .prompting import (
     digest_skip_note,
     fit_by_lines,
     prepend_digest_note,
+    prompt_size,
+    render_digest_prompt,
 )
 from .openrouter_tunnel import OpenRouterTunnel, generate_openrouter_key
 from .settings import (
@@ -42,6 +44,7 @@ from .settings import (
     consent_active,
     load_credentials,
     load_settings,
+    migrate_opus_48_model,
     new_source_id,
     save_initial_config,
     validate_consent_expiry,
@@ -556,6 +559,10 @@ class Collector:
         if self.paths.settings.exists():
             try:
                 settings = load_settings(self.paths)
+                # Миграция допускается только после полной проверки канона.
+                # Иначе несоответствие durable lock-маркера превращало
+                # конструктор в отказ до status/recovery (task 259).
+                settings = migrate_opus_48_model(self.paths)
                 status.update(
                     phase=settings["phase"],
                     configured=True,
@@ -2659,11 +2666,22 @@ class Collector:
 
         cutoff = parse_utc(gate["server_time"], "server_time")
         not_before = cutoff - self._digest_lookback(gate, acknowledged)
-        per_chat_budget = max(1024, PROMPT_PREFIX_BYTES + (
-            MAX_PROMPT_BYTES - PROMPT_PREFIX_BYTES) // len(chats))
+        # Равные доли сразу резервируют максимум межчатовых разделителей.
+        # Иначе deferred-первая строка позже могла бы получить долю, которая
+        # в точном общем prompt уже не помещается.
+        per_chat_row_budget = max(1024, (
+            MAX_PROMPT_BYTES - PROMPT_PREFIX_BYTES - max(0, len(chats) - 1)
+        ) // len(chats))
+        per_chat_budget = PROMPT_PREFIX_BYTES + per_chat_row_budget
         digest_chats: List[DigestChat] = []
         ranges: List[Dict[str, int]] = []
         skipped: List[tuple] = []
+        selected_messages: Dict[int, List[Any]] = {}
+        # Первый проход всегда даёт всем чатам одинаковую долю. Только потом
+        # свободное место тихих чатов возвращается тем, кого реально
+        # ограничил prompt budget: порядок locked chat set не должен решать,
+        # кто заберёт весь лимит.
+        budget_exhausted: List[tuple[int, Dict[str, Any], PeerSpec]] = []
         for chat, cursor in zip(chats, gate["digest"]["cursors"]):
             peer = PeerSpec.from_dict(chat["peer"])
             start = cursor["through_message_id"]
@@ -2703,7 +2721,7 @@ class Collector:
                 gateway.fetch(
                     session, peer, chat["chat_id"], effective, cutoff,
                     not_before_at=not_before, max_prompt_bytes=per_chat_budget,
-                    chat_title=chat["title"],
+                    chat_title=chat["title"], defer_oversized_first=True,
                 ),
                 TELEGRAM_FETCH_TIMEOUT_S,
             )
@@ -2720,10 +2738,100 @@ class Collector:
                 "message_count": len(fetched.messages),
             })
             if fetched.messages:
+                range_index = len(ranges) - 1
+                selected_messages[range_index] = fetched.messages
                 digest_chats.append(DigestChat(
                     chat["title"], fetched.messages,
                     supergroup_link_prefix(chat["chat_id"]),
                 ))
+            if fetched.budget_exhausted:
+                budget_exhausted.append((len(ranges) - 1, chat, peer))
+
+        # `prompt_size` с sentinel-нумерацией консервативнее итогового
+        # `render_digest_prompt`, поэтому остаток нельзя перепродать даже
+        # при двузначных n. Повторный fetch строго ограничен тем же daily
+        # cutoff и timeout; он не выполняется вне уже разрешённого выпуска.
+        used_rows = sum(
+            prompt_size(messages, chats[range_index]["title"])
+            - PROMPT_PREFIX_BYTES
+            for range_index, messages in selected_messages.items()
+        )
+        # Отдельные `prompt_size` уже учитывают переводы между строками
+        # одного чата. При сборке общего prompt между непустыми чатами есть
+        # ещё один `\n`; не вычесть его здесь — перепродать байт и выйти за
+        # точный общий предел после refill.
+        inter_chat_newlines = max(0, len(selected_messages) - 1)
+        # Отложенная первая строка не израсходовала свою fair-долю, но не
+        # отдала её busy соседу: refill должен сначала вернуть этот резерв
+        # самому чату. Он также добавит хотя бы обрезанную строку, поэтому
+        # резервируем будущие межчатовые разделители. exact guard ниже
+        # остаётся последним барьером.
+        deferred_chat_count = sum(
+            range_index not in selected_messages
+            for range_index, _, _ in budget_exhausted
+        )
+        refill_inter_chat_newlines = (
+            max(0, len(selected_messages) + deferred_chat_count - 1)
+            - inter_chat_newlines
+        )
+        free_rows = (
+            MAX_PROMPT_BYTES - PROMPT_PREFIX_BYTES - used_rows
+            - inter_chat_newlines - refill_inter_chat_newlines
+            - deferred_chat_count * per_chat_row_budget
+        )
+        if budget_exhausted:
+            refill_share = max(0, free_rows) // len(budget_exhausted)
+            for range_index, chat, peer in budget_exhausted:
+                existing = selected_messages.get(range_index, [])
+                reserved_share = per_chat_row_budget if not existing else 0
+                if reserved_share + refill_share <= 0:
+                    continue
+                refill_budget = (
+                    prompt_size(existing, chat["title"])
+                    + refill_share
+                    + reserved_share
+                )
+                before = ranges[range_index]["through_message_id"]
+                await self._assert_active(
+                    revoked, source_id, chat_ids,
+                    self._generated_at(gate, gate_received_mono),
+                )
+                refill_generated_at = self._generated_at(
+                    gate, gate_received_mono)
+                if refill_generated_at >= parse_utc(
+                        gate["digest"]["accept_until"], "accept_until"):
+                    raise RuntimeError("digest refill exceeded receiver window")
+                refill = await self._bounded_external(
+                    gateway.fetch(
+                        session, peer, chat["chat_id"], before, cutoff,
+                        not_before_at=not_before, max_prompt_bytes=refill_budget,
+                        chat_title=chat["title"], prefix_messages=existing,
+                    ),
+                    TELEGRAM_FETCH_TIMEOUT_S,
+                )
+                await self._assert_active(
+                    revoked, source_id, chat_ids,
+                    self._generated_at(gate, gate_received_mono),
+                )
+                if refill.through_message_id < before:
+                    raise RuntimeError("Telegram digest cursor moved backwards")
+                ranges[range_index]["through_message_id"] = refill.through_message_id
+                ranges[range_index]["message_count"] += len(refill.messages)
+                if refill.messages:
+                    if existing:
+                        existing.extend(refill.messages)
+                    else:
+                        existing = refill.messages
+                        selected_messages[range_index] = existing
+                        digest_chats.append(DigestChat(
+                            chat["title"], existing,
+                            supergroup_link_prefix(chat["chat_id"]),
+                        ))
+
+        if digest_chats:
+            # Guard is deliberately exact rather than inferred from the
+            # allocator: a future row-format change must fail closed here.
+            render_digest_prompt(digest_chats)
 
         total = sum(row["message_count"] for row in ranges)
         llm_usage = None

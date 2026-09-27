@@ -24,6 +24,8 @@ CONSENT_SCOPE = (
 MAX_CONSENT_DAYS = 90
 _HOST = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{1,158}$")
+LEGACY_OPUS_48_MODEL = "anthropic/claude-opus-4.8"
+OPUS_55_MODEL = "anthropic/claude-opus-5.5"
 
 
 def _validate_host(host: Any) -> str:
@@ -202,6 +204,22 @@ def load_settings(paths: Paths) -> Dict[str, Any]:
     elif value["phase"] == "chat_locked":
         raise ValueError("unlocked settings phase is invalid")
     return value
+
+
+def migrate_opus_48_model(paths: Paths) -> Dict[str, Any]:
+    """Единственная согласованная смена locked OpenRouter model для задачи 259.
+
+    Сначала валидируем весь канон, затем атомарно меняем только model. Набор
+    чатов, source_id, consent и endpoint сохраняют значения; отдельные файлы
+    ключей и состояния доставки не записываются.
+    """
+    value = load_settings(paths)
+    if value["openrouter_model"] != LEGACY_OPUS_48_MODEL:
+        return value
+    updated = dict(value)
+    updated["openrouter_model"] = OPUS_55_MODEL
+    atomic_write_json(paths.settings, updated)
+    return updated
 
 
 def load_credentials(paths: Paths) -> Dict[str, Any]:

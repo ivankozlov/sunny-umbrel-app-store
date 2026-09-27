@@ -27,6 +27,7 @@ from .version import MAX_DIGEST_CHARS
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPUS_55_MODEL = "anthropic/claude-opus-5.5"
 NOTHING_NOTABLE = "За сутки в чатах не было ничего существенного."
 # Запрос обязан идти через DO: прямой путь из домашней сети отбивает фильтр
 # (`Access denied by security policy`), а через VLESS-туннель Cloudflare
@@ -300,7 +301,7 @@ def blocking_fetch_response(
     prompt: str, model: str, api_key: str,
 ) -> Dict[str, Any]:
     """Запрос к OpenRouter: структура ответа и безопасная usage-сводка."""
-    request_body = canonical_json_bytes({
+    payload = {
         "model": model,
         "provider": {
             "zdr": True,
@@ -310,12 +311,16 @@ def blocking_fetch_response(
             {"role": "system", "content": "You summarize only the supplied selected-groups text."},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0,
         # Выпуск стал длиннее одного сообщения Telegram: 16 384 токена
         # адаптивное мышление Opus съедало почти целиком.
         "max_tokens": 32_768,
         "response_format": {"type": "json_object"},
-    })
+    }
+    # Opus 5.5 принимает только default sampling. Остальные маршруты сохраняют
+    # прежний детерминированный режим, чтобы миграция не меняла их выпуск.
+    if model != OPUS_55_MODEL:
+        payload["temperature"] = 0
+    request_body = canonical_json_bytes(payload)
     request = urllib.request.Request(
         OPENROUTER_URL,
         data=request_body,

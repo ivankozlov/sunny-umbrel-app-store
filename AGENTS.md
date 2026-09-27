@@ -101,7 +101,11 @@ content, receiver keys, or rendered runtime configuration.
   end-to-end reachability check, and locked-state repair is not a substitute for
   completing that login.
 - Changing the Telegram account, OpenRouter key/model, or upload endpoint
-  requires factory reset. The chat set is the one exception, and only forward:
+  requires factory reset. Task 259 is one narrow, already approved exception:
+  startup migrates only the exact persisted model ID
+  `anthropic/claude-opus-4.8` to `anthropic/claude-opus-5.5` without factory
+  reset; do not generalize it to another model, credential, account or endpoint.
+  The chat set is the other exception, and only forward:
   it may be EXTENDED without a new epoch, never shrunk or reordered. The server
   decides — `deploy/extend_chat_set.sh` adds the chat to the receiver config,
   seeds a zero cursor in both vectors and marks it pending — and the app merely
@@ -214,7 +218,12 @@ content, receiver keys, or rendered runtime configuration.
   budget and then outlived the window, and the wire shows nothing (the range is declared from
   the receiver's cursor). Such a skip must be announced in the issue itself — a
   `[пропущено старше окна выпуска]` header placed FIRST, because trimming always eats the
-  tail. A chat still at cursor zero gets no warning: what it skips is its own prior history.
+  tail. Task 261 keeps the first allocation fair, then gives unused space from
+  quiet chats to budget-exhausted chats in at most one more fetch per chat,
+  under the same window/boundary/timeout; it does not weaken the 72-hour rule.
+  The displayed bounds are Telegram message IDs, never a count of substantive
+  messages: deleted, service and empty rows can be inside them. A chat still at
+  cursor zero gets no warning: what it skips is its own prior history.
 - Until 2026-09-13 the watcher scanned every message ID after its own frozen
   cursor and detected mentions only from Telegram's native `mentioned` flag; a
   mention-bearing range was marked read only after its event batch had a durable
@@ -276,7 +285,7 @@ content, receiver keys, or rendered runtime configuration.
   added to the worker request. TNN deletes messages after 24 hours, so a Telegram
   permalink alone loses access to the material. This adds no Telegram requests;
   links already deleted before the daily fetch cannot be recovered.
-- Task 238 (released in `0.2.15`): each topic uses the earliest available source
+- Task 238 (`0.2.15`, published 2026-09-18): each topic uses the earliest available source
   permalink among all `refs` (minimum valid ordinal, not model ordering), retaining
   every direct material URL from those refs. A direct material can itself be a
   Telegram URL; do not discard it as an extra source permalink. The separate links
@@ -285,7 +294,7 @@ content, receiver keys, or rendered runtime configuration.
   `[Сообщение](URL)`. Materials remain standalone URLs, including external `t.me/c/`
   links; the worker cannot infer their role from a Telegram hostname or position.
   Deduplicate by the original URL before marking the source. No extra fetch or
-  model input is needed. Public release status is in `README.md`.
+  model input is needed. Deployment status is in `../docs/PERSONAL_DIGEST.md`.
 - Every chat returning empty lists is an answer, not a failure — the prompt
   explicitly allows "nothing notable today", and the issue then says so in one
   line. An empty `chats` array is a failure: the model walked no chat at all.

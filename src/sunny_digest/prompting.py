@@ -234,10 +234,14 @@ def _utf16_units(value: str) -> int:
 
 
 def digest_skip_note(rows: List[tuple]) -> str:
-    """Строка предупреждения о хвосте, который выпуск не стал читать."""
+    """Строка предупреждения о хвосте, который выпуск не стал читать.
+
+    Это границы Telegram message ID, а не счётчик содержательных сообщений:
+    в диапазоне могут быть service/пустые/удалённые записи и дыры ID.
+    """
     lines = [DIGEST_SKIP_NOTE_HEAD]
     for title, first, last in rows:
-        lines.append(f"{title}: сообщения {first}–{last}")
+        lines.append(f"{title}: диапазон ID {first}–{last}")
     return "\n".join(lines)
 
 

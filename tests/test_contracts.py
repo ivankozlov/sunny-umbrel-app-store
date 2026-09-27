@@ -419,6 +419,28 @@ class ContractTests(unittest.TestCase):
             "upstream_cost": 0.70,
         })
 
+    def test_opus_55_request_omits_sampling_but_keeps_required_contract(self):
+        with patch("urllib.request.OpenerDirector.open", return_value=FakeResponse(
+                content={"chats": []})) as opened:
+            blocking_fetch_response(
+                "bounded prompt", "anthropic/claude-opus-5.5", "secret")
+        request = opened.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["model"], "anthropic/claude-opus-5.5")
+        self.assertNotIn("temperature", payload)
+        self.assertEqual(payload["provider"], {
+            "zdr": True,
+            "data_collection": "deny",
+        })
+        self.assertEqual(payload["max_tokens"], 32_768)
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+
+        with patch("urllib.request.OpenerDirector.open", return_value=FakeResponse(
+                content={"chats": []})) as opened:
+            blocking_fetch_response("bounded prompt", "anthropic/example", "secret")
+        previous_route = json.loads(opened.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(previous_route["temperature"], 0)
+
     def test_digest_boundary_counts_telegram_utf16_units(self):
         ranges = [
             {"chat_id": chat_id, "from_message_id_exclusive": 0,
@@ -640,7 +662,7 @@ class TestBugOpusDigestBudget20260814(unittest.TestCase):
     def test_opus_request_has_explicit_reasoning_safe_output_budget(self):
         with patch("urllib.request.OpenerDirector.open",
                    return_value=FakeResponse("Готово")) as urlopen:
-            _blocking_digest([], "anthropic/claude-opus-4.8", "secret")
+            _blocking_digest([], "anthropic/claude-opus-5.5", "secret")
 
         body = json.loads(urlopen.call_args.args[0].data)
         self.assertGreaterEqual(body["max_tokens"], 16_384)

@@ -103,6 +103,10 @@ class SelectedMessage:
 class FetchResult:
     through_message_id: int
     messages: List[SelectedMessage]
+    # `True` только когда следующий текстовый ряд не влез в переданный
+    # prompt budget. Пустые/service/старые ряды курсор продвигают, но
+    # ограничением бюджета не считаются.
+    budget_exhausted: bool = False
 
 
 @dataclass(frozen=True)
