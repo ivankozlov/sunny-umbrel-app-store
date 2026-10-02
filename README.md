@@ -75,11 +75,20 @@ source permalink of each digest topic as «Сообщение»; direct material
 including other Telegram links, remain standalone full URLs. The collector wire
 version remains `0.2.1`.
 
-`0.2.17` is prepared as a disabled Phase-A package. Busy chats can reclaim unused
+`0.2.17`, published on 2026-09-27, lets busy chats reclaim unused
 prompt space from quiet chats during the same daily run. Skip notices describe
 Telegram ID ranges, which are not message counts. On startup, the exact persisted
 Opus 4.8 model is migrated to Opus 5.5 without resetting delivery state. Other
-configured models remain unchanged. Publication and device Update are pending.
+configured models remain unchanged.
+
+`0.2.18` is prepared as a disabled Phase-A package. On 2026-10-02 thirteen daily
+attempts reached the model and were billed, yet no digest was built and the status
+showed only `OpenRouterError`: the killable worker exited with status 1 on any
+failure. The worker now returns a sanitized failure code (exit status 3), and the
+status keeps the last digest failure across idle ticks — code, HTTP status or
+finish reason, output tokens, provider and generation id, never answer text or the
+provider message. The collector wire version remains `0.2.1`. Publication and
+device Update are pending.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.15` have public multi-arch images.

@@ -166,6 +166,49 @@ def _render_openrouter_key(public_key: Any) -> str:
         f'<code>{_escape(value)}</code>')
 
 
+_FAILURE_LABEL = re.compile(r"[a-z][a-z0-9_]{0,31}(:[A-Za-z0-9_.-]{1,64})?")
+_DIGEST_FAILURE_FIELDS = (
+    # (ключ, подпись, форма значения) — значения приходят по IPC и
+    # санитизируются здесь заново, как и остальные поля статуса.
+    ("code", "код", re.compile(r"[a-z][a-z0-9_]{0,31}")),
+    ("http_status", "HTTP", None),
+    ("finish_reason", "finish", re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,31}")),
+    ("native_finish_reason", "native",
+     re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,31}")),
+    ("detail", "где", re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")),
+    ("completion_tokens", "выходных токенов", None),
+    ("provider", "провайдер", re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._/()-]{0,47}")),
+    ("generation_id", "id генерации", re.compile(r"[A-Za-z0-9_-]{1,96}")),
+)
+
+
+def _render_digest_failure(value: Any) -> str:
+    """Последний отказ выпуска: только служебные поля, без текста ответа.
+
+    02.10.2026 выпуск не собрался 13 попыток подряд, а интерфейс показывал
+    лишь `OpenRouterError`; здесь видно, где именно он упал."""
+    if not isinstance(value, dict):
+        return ""
+    error = value.get("error_type")
+    if not (isinstance(error, str)
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", error)):
+        return ""
+    at = value.get("at")
+    at = (at[:25] if isinstance(at, str)
+          and re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", at) else "—")
+    parts = [error]
+    for key, label, pattern in _DIGEST_FAILURE_FIELDS:
+        item = value.get(key)
+        if pattern is None:
+            if (isinstance(item, int) and not isinstance(item, bool)
+                    and 0 <= item <= 10_000_000):
+                parts.append(f"{label}: {item}")
+        elif isinstance(item, str) and pattern.fullmatch(item):
+            parts.append(f"{label}: {item}")
+    return (f'<dt>Последний отказ выпуска</dt><dd><code>{_escape(at)}</code> '
+            f'{_escape(" · ".join(parts))}</dd>')
+
+
 def _render_recent_runs(rows: Any) -> str:
     """Журнал последних прогонов: время, исход, тип ошибки, счётчики.
 
@@ -200,7 +243,10 @@ def _render_recent_runs(rows: Any) -> str:
         repeated = f" ×{int(repeated)}" if isinstance(repeated, int) and repeated > 1 else ""
         failed = row.get("failed_chat_count")
         failed = f", ошибок peer: {int(failed)}" if isinstance(failed, int) and failed else ""
-        suffix = f" — {_escape(error)}" if error else ""
+        detail = row.get("error_detail")
+        detail = (f" ({detail})" if error and isinstance(detail, str)
+                  and _FAILURE_LABEL.fullmatch(detail) else "")
+        suffix = f" — {_escape(error)}{_escape(detail)}" if error else ""
         items.append(
             f"<li><code>{_escape(at)}</code> {_escape(result)}{_escape(repeated)}"
             f"{suffix}{_escape(failed)}</li>")
@@ -379,6 +425,7 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
         if read_ack_error:
             read_ack = f"{read_ack} — {read_ack_error}"
         recent_rows = _render_recent_runs(status.get("recent_runs"))
+        failure_row = _render_digest_failure(status.get("last_digest_failure"))
         repair_state_value = status.get("vpn_repair_state")
         repair_state = (
             repair_state_value
@@ -432,7 +479,7 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
   <dt>Pending monitor</dt><dd>{"да" if status.get("pending_monitor_upload") else "нет"}</dd>
   <dt>Pending digest</dt><dd>{"да" if status.get("pending_digest_upload") else "нет"}</dd>
   <dt>Ошибки peer</dt><dd>{_escape(status.get("failed_chat_count") or 0)}</dd>
-  <dt>Последний результат</dt><dd>{result}</dd>{error_row}
+  <dt>Последний результат</dt><dd>{result}</dd>{error_row}{failure_row}
   <dt>Пометка прочитанным</dt><dd>{_escape(read_ack)}</dd>
   <dt>Проверка нового VPN</dt><dd>{_escape(repair_state)}</dd>
   <dt>Проверено маршрутов</dt><dd>{repair_attempted}</dd>

@@ -142,6 +142,22 @@ content, receiver keys, or rendered runtime configuration.
   repeat count — is kept in the status and rendered in the UI. It carries no
   message text, chat titles, or senders, and is sanitized like every other
   status field.
+- Since `0.2.18` every OpenRouter failure carries a closed failure code
+  (`sanitize_failure` in `openrouter.py`): `http_error`, `finish_reason`,
+  `content_not_json`, `structure_invalid` with its location, `no_chats` and the
+  rest, plus only service fields — HTTP status, finish and native finish
+  reason, output tokens, provider, generation id. On 2026-10-02 thirteen
+  attempts reached the model and were billed, yet the status said only
+  `OpenRouterError`: the killable worker exited 1 on any failure, so an HTTP
+  refusal, a model refusal and a malformed answer looked identical and the cause
+  was never established. The worker now writes `{"failure": ...}` and exits
+  `WORKER_FAILURE_EXIT` (3); parent-side render failures, including unexpected
+  exceptions, are classified and enriched with the generation id from the
+  worker's `meta`. Never put the answer text, the provider's error message or
+  `metadata.raw` into the failure: they can echo the prompt. The status keeps
+  `last_digest_failure` across idle ticks (reset and manual revocation clear
+  it), and the journal records only the `code:detail` label so identical
+  failures still collapse.
 - The web service never mounts `data/private` or `data/config`. Setup credentials
   necessarily transit its authenticated form and memory, but it does not persist
   them; its only disk view is redacted runtime state and the narrow Unix socket.

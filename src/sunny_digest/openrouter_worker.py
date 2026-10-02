@@ -5,7 +5,9 @@ import sys
 
 from .openrouter import (
     MAX_WORKER_REQUEST_BYTES,
+    WORKER_FAILURE_EXIT,
     WORKER_SCHEMA,
+    OpenRouterError,
     blocking_fetch_response,
 )
 from .storage import canonical_json_bytes
@@ -30,7 +32,16 @@ def main() -> int:
                 or not isinstance(model, str) or not 1 <= len(model) <= 160
                 or not isinstance(api_key, str) or not 16 <= len(api_key) <= 512):
             return 2
-        response = blocking_fetch_response(prompt, model, api_key)
+        try:
+            response = blocking_fetch_response(prompt, model, api_key)
+        except OpenRouterError as exc:
+            # Наружу — только уже санитизированный код отказа и служебные
+            # поля (HTTP-статус, finish_reason, id генерации), без текста
+            # исключения: так родитель отличает отказ модели от HTTP-ошибки.
+            sys.stdout.buffer.write(
+                canonical_json_bytes({"failure": exc.failure}) + b"\n")
+            sys.stdout.buffer.flush()
+            return WORKER_FAILURE_EXIT
         sys.stdout.buffer.write(
             canonical_json_bytes(response) + b"\n")
         sys.stdout.buffer.flush()

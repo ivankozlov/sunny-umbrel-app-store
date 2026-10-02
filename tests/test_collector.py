@@ -27,6 +27,7 @@ from sunny_digest.contracts import (
     mention_event_id,
 )
 from sunny_digest.ipc import SCHEDULER_TICK_S
+from sunny_digest.openrouter import OpenRouterError
 from sunny_digest.models import (
     DialogCandidate,
     DigestChat,
@@ -3395,6 +3396,118 @@ class TestBugEndlessPartialReadAck20260913(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(collector._read_ack_attempts)
 
 
+class TestBugDigestFailureDiagnostics20261002(unittest.IsolatedAsyncioTestCase):
+    """Отказ выпуска обязан остаться видимым до вечера.
+
+    02.10.2026 выпуск не собрался 13 попыток подряд, статус показывал одно
+    `OpenRouterError`, а к моменту, когда пришёл `missing_daily_digest`,
+    остаток суток уже затирал тиками `idle` даже его. Здесь последний отказ
+    выпуска несёт код и служебные поля и переживает пустые тики, а журнал
+    прогонов получает метку `код:уточнение`, не ломая схлопывание."""
+
+    async def _fail(self, paths, exc):
+        async def failing_digest(*_args):
+            raise exc
+
+        collector = collector_for(
+            paths, FakeGateway(paths), FakeTransport(paths, gate(digest_due=True)))
+        collector.digest_function = failing_digest
+        return collector, await collector.run_once()
+
+    async def test_failure_detail_reaches_status_and_survives_idle_ticks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            collector, result = await self._fail(paths, OpenRouterError(
+                "did not finish", "finish_reason", finish_reason="length",
+                completion_tokens=32768, generation_id="gen-abc"))
+
+            self.assertEqual(result["last_error_type"], "OpenRouterError")
+            self.assertEqual(result["last_digest_failure"], {
+                "at": NOW.isoformat(), "error_type": "OpenRouterError",
+                "code": "finish_reason", "finish_reason": "length",
+                "completion_tokens": 32768, "generation_id": "gen-abc"})
+            self.assertEqual(result["recent_runs"][-1]["error_detail"],
+                             "finish_reason:length")
+            self.assertNotIn("last_error_detail", result)
+
+            idle = collector._write_status(
+                last_run_at=NOW.isoformat(), last_result="idle",
+                last_error_type=None)
+            self.assertIsNone(idle["last_error_type"])
+            self.assertEqual(idle["last_digest_failure"],
+                             result["last_digest_failure"])
+            self.assertIsNone(idle["recent_runs"][-1]["error_detail"])
+            reread = await collector_for(
+                paths, FakeGateway(paths), FakeTransport(paths, gate())
+            ).public_status()
+            self.assertEqual(reread["last_digest_failure"],
+                             result["last_digest_failure"])
+
+    async def test_identical_failures_with_different_generations_collapse(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            collector = collector_for(
+                paths, FakeGateway(paths), FakeTransport(paths, gate()))
+            for index in range(3):
+                collector._write_status(
+                    last_run_at=NOW.isoformat(), last_result="error",
+                    last_error_type="OpenRouterError",
+                    last_error_detail="structure_invalid:top_fields",
+                    last_digest_failure={"error_type": "OpenRouterError",
+                                         "generation_id": f"gen-{index}"})
+            status = collector._write_status(
+                last_run_at=NOW.isoformat(), last_result="error",
+                last_error_type="OpenRouterError",
+                last_error_detail="http_error:402")
+            errors = [row for row in status["recent_runs"]
+                      if row["result"] == "error"]
+            self.assertEqual([row.get("repeated") for row in errors], [3, None])
+            self.assertEqual(errors[-1]["error_detail"], "http_error:402")
+
+    async def test_reset_and_manual_revocation_drop_previous_failure(self):
+        """Отказ принадлежит прежней конфигурации, как и журнал (ревью
+        02.10.2026): иначе следующий владелец видел бы id генерации и
+        провайдера чужого ключа OpenRouter."""
+        exits = {
+            "revoke_and_reset": lambda collector: collector.revoke_and_reset(),
+            "acknowledge_manual_revocation":
+                lambda collector: collector.acknowledge_manual_revocation(),
+        }
+        for name, finish in exits.items():
+            with self.subTest(exit=name), \
+                    tempfile.TemporaryDirectory() as temporary:
+                paths = make_paths(Path(temporary))
+                seed_locked(paths, watch_phase="active")
+                collector, failed = await self._fail(paths, OpenRouterError(
+                    "http", "http_error", http_status=402,
+                    generation_id="gen-old"))
+                self.assertIsNotNone(failed["last_digest_failure"])
+                if name == "acknowledge_manual_revocation":
+                    atomic_write_json(paths.revocation_warning, {
+                        "schema": "sunny.personal-chats.revocation-warning.v1",
+                        "warning": "TelegramLogoutUnconfirmed",
+                        "created_at": "2026-08-04T05:30:00Z",
+                    })
+                result = await finish(collector)
+                self.assertIsNone(result["last_digest_failure"])
+                self.assertIsNone(read_json(paths.status)["last_digest_failure"])
+                later = collector._write_status(last_result="idle",
+                                                last_error_type=None)
+                self.assertIsNone(later["last_digest_failure"])
+
+    async def test_non_openrouter_failure_is_recorded_without_code(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            _collector, result = await self._fail(
+                paths, RuntimeError("Telegram digest cursor moved backwards"))
+            self.assertEqual(result["last_digest_failure"], {
+                "at": NOW.isoformat(), "error_type": "RuntimeError"})
+            self.assertIsNone(result["recent_runs"][-1]["error_detail"])
+
+
 class TestRecentRunsJournal20260817(unittest.IsolatedAsyncioTestCase):
     """Журнал прогонов в интерфейсе.
 
@@ -3447,7 +3560,8 @@ class TestRecentRunsJournal20260817(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(failures[-1]["at"], "2026-08-17T10:00:00+00:00")
             self.assertEqual(
                 set(failures[-1]) - {"repeated"},
-                {"at", "result", "error_type", "message_count", "failed_chat_count"},
+                {"at", "result", "error_type", "error_detail", "message_count",
+                 "failed_chat_count"},
             )
 
     async def test_distinct_outcomes_are_bounded_and_status_stays_small(self):

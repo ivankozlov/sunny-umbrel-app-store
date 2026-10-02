@@ -27,7 +27,7 @@ from .mihomo import (
     MihomoRuntime,
     render_mihomo_config,
 )
-from .openrouter import create_digest
+from .openrouter import OpenRouterError, create_digest, failure_label
 from .prompting import (
     PROMPT_PREFIX_BYTES,
     digest_skip_note,
@@ -629,6 +629,7 @@ class Collector:
                     "last_message_count", "last_through_message_id",
                     "failed_chat_count", "recent_runs",
                     "read_ack_result", "read_ack_error_type",
+                    "last_digest_failure",
                 ):
                     if key in previous:
                         status[key] = previous[key]
@@ -682,7 +683,7 @@ class Collector:
             "phone_masked", "dialogs", "selection_id", "last_run_at", "last_result",
             "last_error_type", "last_message_count", "last_through_message_id",
             "failed_chat_count", "revocation_required", "recent_runs",
-            "read_ack_result", "read_ack_error_type",
+            "read_ack_result", "read_ack_error_type", "last_digest_failure",
             "openrouter_public_key",
             "vpn_configured", "vpn_ready", "vpn_migration_required",
             "vpn_repairing", "vpn_repair_state", "vpn_repair_attempted",
@@ -720,6 +721,9 @@ class Collector:
             "at": changes.get("last_run_at") or self.clock().isoformat(),
             "result": changes.get("last_result"),
             "error_type": changes.get("last_error_type"),
+            # Только метка `код:уточнение` (без id генерации и токенов), чтобы
+            # одинаковые отказы по-прежнему схлопывались в одну запись.
+            "error_detail": changes.get("last_error_detail"),
             "message_count": changes.get("last_message_count"),
             "failed_chat_count": changes.get("failed_chat_count"),
         }
@@ -729,8 +733,8 @@ class Collector:
         # редкая ошибка вытесняется ещё до того, как её увидят. Счётчики
         # входят в ключ намеренно: тик, где отвалились все peer'ы, обязан
         # порвать серию, иначе он исчезнет ровно как раньше.
-        collapse_keys = ("result", "error_type", "message_count",
-                         "failed_chat_count")
+        collapse_keys = ("result", "error_type", "error_detail",
+                         "message_count", "failed_chat_count")
         if kept and all(kept[-1].get(key) == entry[key] for key in collapse_keys):
             last = dict(kept[-1])
             count = last.get("repeated")
@@ -1677,6 +1681,7 @@ class Collector:
             # следующий владелец не должен видеть историю предыдущей.
             recent_runs=[], failed_chat_count=None,
             read_ack_result=None, read_ack_error_type=None,
+            last_digest_failure=None,
         )
         return result
 
@@ -1717,6 +1722,7 @@ class Collector:
                 last_error_type=None,
                 revocation_required=False,
                 read_ack_result=None, read_ack_error_type=None,
+                last_digest_failure=None,
             )
 
     async def renew_consent(self, expires_at: Any) -> Dict[str, Any]:
@@ -2405,6 +2411,16 @@ class Collector:
         except Exception as exc:
             digest_error = type(exc).__name__
             changes["last_result"] = "error"
+            # Тип исключения один на все отказы OpenRouter: 02.10.2026 за ним
+            # не было видно, что модель отвечала, а выпуск отбраковывался.
+            # Последний отказ выпуска переживает пустые тики остатка суток.
+            failure = exc.failure if isinstance(exc, OpenRouterError) else None
+            changes["last_error_detail"] = failure_label(failure)
+            changes["last_digest_failure"] = {
+                "at": self.clock().isoformat(),
+                "error_type": digest_error,
+                **(failure or {}),
+            }
         else:
             changes["last_result"] = result
             changes["last_message_count"] = message_count

@@ -52,8 +52,78 @@ WORKER_TERMINATE_GRACE_S = 2.0
 _SENDER_ALIAS = re.compile(r"(?<![\w-])participant-[1-9][0-9]*(?![\w-])", re.IGNORECASE)
 
 
+# Код отказа выпуска для статуса и журнала прогонов. 02.10.2026 тринадцать
+# попыток подряд дошли до модели и были оплачены (~$0,18 каждая), но выпуск
+# не собрался, а в статусе стояло только `OpenRouterError`: воркер на любой
+# ошибке выходил с кодом 1, и HTTP-отказ, отказ модели и битая структура
+# были неразличимы. Здесь — только служебные метаданные: ни текста ответа,
+# ни сообщения провайдера, ни промпта.
+WORKER_FAILURE_EXIT = 3
+FAILURE_CODES = frozenset({
+    "http_error", "provider_error", "transport_error", "response_too_large",
+    "response_invalid", "finish_reason", "content_not_json",
+    "structure_invalid", "no_chats", "text_invalid", "prompt_too_large",
+    "worker_request_too_large", "worker_pipes", "worker_timeout",
+    "worker_failed", "worker_response_invalid", "usage_invalid",
+    "unclassified",
+})
+_FAILURE_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,31}\Z")
+_FAILURE_DETAIL = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
+_FAILURE_PROVIDER = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._/()-]{0,47}\Z")
+_GENERATION_ID = re.compile(r"[A-Za-z0-9_-]{1,96}\Z")
+
+
+def _bounded_int(value: Any, low: int, high: int) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if low <= value <= high else None
+
+
+def _matching(value: Any, pattern: re.Pattern) -> Optional[str]:
+    return value if isinstance(value, str) and pattern.match(value) else None
+
+
+def sanitize_failure(value: Any) -> Optional[Dict[str, Any]]:
+    """Закрытый набор полей отказа; всё непрошедшее проверку отбрасывается.
+
+    Значения приходят от провайдера и через границу воркера, поэтому каждое
+    поле сверяется с формой, а неизвестные ключи молча выпадают."""
+    if not isinstance(value, dict) or value.get("code") not in FAILURE_CODES:
+        return None
+    checked = {
+        "http_status": _bounded_int(value.get("http_status"), 100, 599),
+        "finish_reason": _matching(value.get("finish_reason"), _FAILURE_TOKEN),
+        "native_finish_reason": _matching(
+            value.get("native_finish_reason"), _FAILURE_TOKEN),
+        "detail": _matching(value.get("detail"), _FAILURE_DETAIL),
+        "provider": _matching(value.get("provider"), _FAILURE_PROVIDER),
+        "completion_tokens": _bounded_int(
+            value.get("completion_tokens"), 0, 10_000_000),
+        "generation_id": _matching(value.get("generation_id"), _GENERATION_ID),
+    }
+    failure = {"code": value["code"]}
+    failure.update((key, item) for key, item in checked.items() if item is not None)
+    return failure
+
+
+def failure_label(failure: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Короткая стабильная метка для журнала: код и одно уточнение.
+
+    Число токенов и id генерации сюда не входят намеренно: они различаются
+    от попытки к попытке, и одинаковые отказы перестали бы схлопываться."""
+    if not failure:
+        return None
+    extra = (failure.get("http_status") or failure.get("finish_reason")
+             or failure.get("detail"))
+    return f"{failure['code']}:{extra}" if extra else failure["code"]
+
+
 class OpenRouterError(RuntimeError):
-    pass
+    def __init__(self, message: str, code: str = "unclassified",
+                 **facts: Any) -> None:
+        super().__init__(message)
+        self.failure: Dict[str, Any] = (
+            sanitize_failure({**facts, "code": code}) or {"code": "unclassified"})
 
 
 class DigestText(str):
@@ -114,7 +184,9 @@ def _utf16_units(value: str) -> int:
 def _clean(value: Any, limit: int) -> str:
     """Строка из ответа модели: обрезаем и чистим, но не доверяем длине."""
     if not isinstance(value, str):
-        raise OpenRouterError("OpenRouter digest field is not text")
+        raise OpenRouterError(
+            "OpenRouter digest field is not text", "structure_invalid",
+            detail="field")
     text = " ".join(value.split())
     return text[:limit]
 
@@ -187,26 +259,36 @@ def render_digest(
     Материалы стоят отдельными URL-строками, source — именованной ссылкой
     «Сообщение». Sunny превращает их в нативные Telegram entities."""
     if not isinstance(parsed, dict) or set(parsed) != {"chats"}:
-        raise OpenRouterError("OpenRouter digest JSON has unexpected fields")
+        raise OpenRouterError(
+            "OpenRouter digest JSON has unexpected fields", "structure_invalid",
+            detail="top_fields")
     chats = parsed["chats"]
     if not isinstance(chats, list):
-        raise OpenRouterError("OpenRouter digest chats are invalid")
+        raise OpenRouterError(
+            "OpenRouter digest chats are invalid", "structure_invalid",
+            detail="chats")
 
     blocks = []
     for chat in chats:
         if not isinstance(chat, dict) or set(chat) - {"chat", "topics", "links"}:
-            raise OpenRouterError("OpenRouter digest chat is invalid")
+            raise OpenRouterError(
+                "OpenRouter digest chat is invalid", "structure_invalid",
+                detail="chat")
         title = _clean(chat.get("chat", ""), 160)
         names = (sender_names or {}).get(title, {})
         topics = chat.get("topics") or []
         links = chat.get("links") or []
         if not isinstance(topics, list) or not isinstance(links, list):
-            raise OpenRouterError("OpenRouter digest sections are invalid")
+            raise OpenRouterError(
+                "OpenRouter digest sections are invalid", "structure_invalid",
+                detail="sections")
 
         lines = []
         for topic in topics:
             if not isinstance(topic, dict):
-                raise OpenRouterError("OpenRouter digest topic is invalid")
+                raise OpenRouterError(
+                    "OpenRouter digest topic is invalid", "structure_invalid",
+                    detail="topic")
             topic_title = _clean(
                 _restore_sender_names(topic.get("title", ""), names), 200)
             lines.append(f"▸ {topic_title}")
@@ -223,7 +305,9 @@ def render_digest(
         link_lines = []
         for row in links:
             if not isinstance(row, dict):
-                raise OpenRouterError("OpenRouter digest link is invalid")
+                raise OpenRouterError(
+                    "OpenRouter digest link is invalid", "structure_invalid",
+                    detail="link")
             note = _clean(
                 _restore_sender_names(row.get("note", ""), names), 400)
             entry = _clean(
@@ -249,7 +333,7 @@ def render_digest(
         # ночным `missing_daily_digest` вместо честного тихого дня. Но пустой
         # `chats` — уже не ответ: модель не прошла ни по одному чату.
         if not chats:
-            raise OpenRouterError("OpenRouter digest has no chats")
+            raise OpenRouterError("OpenRouter digest has no chats", "no_chats")
         return NOTHING_NOTABLE
     text = "\n\n".join(blocks).strip()
     if _utf16_units(text) <= MAX_DIGEST_CHARS:
@@ -259,7 +343,7 @@ def render_digest(
     # Ронять из-за этого весь выпуск — худший исход, чем отдать начало.
     fitted = fit_by_lines(text, _utf16_units, MAX_DIGEST_CHARS)
     if fitted is None:
-        raise OpenRouterError("OpenRouter digest text is invalid")
+        raise OpenRouterError("OpenRouter digest text is invalid", "text_invalid")
     return fitted
 
 
@@ -267,7 +351,8 @@ def _prompt(chats: List[DigestChat]) -> str:
     try:
         return render_digest_prompt(chats)
     except ValueError as exc:
-        raise OpenRouterError("prompt exceeds bounded input size") from exc
+        raise OpenRouterError(
+            "prompt exceeds bounded input size", "prompt_too_large") from exc
 
 
 def _usage_summary(value: Any) -> Dict[str, Any]:
@@ -338,29 +423,116 @@ def blocking_fetch_response(
     try:
         with opener.open(request, timeout=90) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        # Раньше URLError: HTTPError — его подкласс. Код ответа и имя
+        # провайдера — служебные; тело ошибки (message, metadata.raw) может
+        # пересказывать запрос и наружу не уходит.
+        raise OpenRouterError(
+            "OpenRouter returned an HTTP error", "http_error",
+            http_status=exc.code, provider=_http_error_provider(exc)) from None
     except (urllib.error.URLError, TimeoutError, http.client.HTTPException,
             OSError) as exc:
         # http.client.HTTPException и OSError тоже: упавший ssh-туннель рвёт
         # соединение как RemoteDisconnected/ConnectionReset, а это не URLError —
         # без них отказ канала улетал бы наружу необёрнутым и попадал в статус
         # чужим типом вместо OpenRouterError.
-        raise OpenRouterError(f"OpenRouter transport failed: {type(exc).__name__}") from None
+        raise OpenRouterError(
+            f"OpenRouter transport failed: {type(exc).__name__}",
+            "transport_error", detail=type(exc).__name__) from None
     if len(raw) > MAX_RESPONSE_BYTES:
-        raise OpenRouterError("OpenRouter response exceeds size limit")
+        raise OpenRouterError(
+            "OpenRouter response exceeds size limit", "response_too_large")
     try:
         body: Dict[str, Any] = json.loads(raw.decode("utf-8"))
-        choices = body["choices"]
-        choice = choices[0]
-        if choice.get("finish_reason") != "stop":
-            raise OpenRouterError("OpenRouter response did not finish cleanly")
+        if not isinstance(body, dict):
+            raise TypeError
+    except (TypeError, ValueError, UnicodeDecodeError):
+        raise OpenRouterError(
+            "OpenRouter response shape is invalid", "response_invalid") from None
+    facts = _response_facts(body)
+    error = body.get("error")
+    if isinstance(error, dict) and "choices" not in body:
+        raise OpenRouterError(
+            "OpenRouter returned an error body", "provider_error",
+            http_status=error.get("code"),
+            provider=_error_provider(error), **facts)
+    try:
+        choice = body["choices"][0]
+        finish_reason = choice.get("finish_reason")
+        if finish_reason != "stop":
+            raise OpenRouterError(
+                "OpenRouter response did not finish cleanly", "finish_reason",
+                finish_reason=finish_reason,
+                native_finish_reason=choice.get("native_finish_reason"),
+                **facts)
         content = choice["message"]["content"]
-        parsed = json.loads(content)
-        usage = _usage_summary(body.get("usage"))
+        if not isinstance(content, str):
+            raise TypeError
     except OpenRouterError:
         raise
-    except (KeyError, IndexError, TypeError, ValueError, UnicodeDecodeError):
-        raise OpenRouterError("OpenRouter response shape is invalid") from None
-    return {"answer": parsed, "usage": usage}
+    except (KeyError, IndexError, TypeError, AttributeError):
+        raise OpenRouterError(
+            "OpenRouter response shape is invalid", "response_invalid",
+            **facts) from None
+    try:
+        parsed = json.loads(content)
+    except ValueError:
+        raise OpenRouterError(
+            "OpenRouter answer is not JSON", "content_not_json", **facts) from None
+    usage = _usage_summary(body.get("usage"))
+    meta = {key: facts[key] for key in ("generation_id", "provider")
+            if key in facts}
+    return {"answer": parsed, "usage": usage, "meta": meta}
+
+
+def _response_facts(body: Dict[str, Any]) -> Dict[str, Any]:
+    """id генерации, провайдер и число выходных токенов — без содержимого.
+
+    По id генерации владелец ключа найдёт запрос в OpenRouter, а число
+    токенов отличает отказ модели (единицы) от обрезанного выпуска."""
+    usage = body.get("usage")
+    failure = sanitize_failure({
+        "code": "unclassified",
+        "generation_id": body.get("id"),
+        "provider": body.get("provider"),
+        "completion_tokens": (
+            usage.get("completion_tokens") if isinstance(usage, dict) else None),
+    }) or {}
+    failure.pop("code", None)
+    return failure
+
+
+def _error_provider(error: Dict[str, Any]) -> Optional[str]:
+    metadata = error.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    return _matching(metadata.get("provider_name"), _FAILURE_PROVIDER)
+
+
+def _http_error_provider(exc: urllib.error.HTTPError) -> Optional[str]:
+    try:
+        raw = exc.read(16 * 1024)
+        body = json.loads(raw.decode("utf-8"))
+        error = body.get("error") if isinstance(body, dict) else None
+        return _error_provider(error) if isinstance(error, dict) else None
+    except Exception:
+        return None
+    finally:
+        try:
+            exc.close()
+        except Exception:
+            pass
+
+
+def _worker_failure(raw: bytes) -> Dict[str, Any]:
+    """Классифицированный отказ, который воркер отдал вместо ответа."""
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        value = None
+    failure = (sanitize_failure(value.get("failure"))
+               if isinstance(value, dict) and set(value) == {"failure"} else None)
+    return failure or {"code": "worker_response_invalid"}
 
 
 def blocking_fetch_answer(prompt: str, model: str, api_key: str) -> Any:
@@ -375,7 +547,8 @@ def _render_and_validate(parsed: Any, chats: List[DigestChat]) -> str:
     try:
         validate_digest_text(digest, allow_empty=False)
     except ValueError as exc:
-        raise OpenRouterError("OpenRouter digest text is invalid") from exc
+        raise OpenRouterError(
+            "OpenRouter digest text is invalid", "text_invalid") from exc
     return digest
 
 
@@ -418,7 +591,8 @@ async def _cleanup_failed_worker(
 
 async def _bounded_worker_exchange(process: Any, request: bytes) -> bytes:
     if process.stdin is None or process.stdout is None:
-        raise OpenRouterError("OpenRouter worker pipes are unavailable")
+        raise OpenRouterError(
+            "OpenRouter worker pipes are unavailable", "worker_pipes")
     process.stdin.write(request)
     await process.stdin.drain()
     process.stdin.close()
@@ -435,7 +609,9 @@ async def _bounded_worker_exchange(process: Any, request: bytes) -> bytes:
         chunks.append(chunk)
         size += len(chunk)
         if size > MAX_RESPONSE_BYTES:
-            raise OpenRouterError("OpenRouter worker response exceeds size limit")
+            raise OpenRouterError(
+                "OpenRouter worker response exceeds size limit",
+                "response_too_large")
     await process.wait()
     return b"".join(chunks)
 
@@ -453,7 +629,9 @@ async def create_digest(chats: List[DigestChat], model: str, api_key: str,
         "api_key": api_key,
     }) + b"\n"
     if len(request) > MAX_WORKER_REQUEST_BYTES:
-        raise OpenRouterError("OpenRouter worker request exceeds size limit")
+        raise OpenRouterError(
+            "OpenRouter worker request exceeds size limit",
+            "worker_request_too_large")
     process = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "sunny_digest.openrouter_worker",
         stdin=asyncio.subprocess.PIPE,
@@ -470,10 +648,13 @@ async def create_digest(chats: List[DigestChat], model: str, api_key: str,
         if cancelled in done and revoked.is_set():
             raise asyncio.CancelledError
         if exchange not in done:
-            raise OpenRouterError("OpenRouter worker timed out")
+            raise OpenRouterError("OpenRouter worker timed out", "worker_timeout")
         raw = exchange.result()
+        if process.returncode == WORKER_FAILURE_EXIT:
+            raise OpenRouterError(
+                "OpenRouter request failed", **_worker_failure(raw))
         if process.returncode != 0:
-            raise OpenRouterError("OpenRouter worker failed")
+            raise OpenRouterError("OpenRouter worker failed", "worker_failed")
     except BaseException:
         # Reset can signal revocation and cancel this task almost together.
         # Repeated cancellation must not strand a worker containing the API key
@@ -495,17 +676,45 @@ async def create_digest(chats: List[DigestChat], model: str, api_key: str,
     try:
         response = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        raise OpenRouterError("OpenRouter worker response is invalid") from None
-    if (not isinstance(response, dict)
-            or set(response) not in ({"answer"}, {"answer", "usage"})):
-        raise OpenRouterError("OpenRouter worker response is invalid")
+        raise OpenRouterError(
+            "OpenRouter worker response is invalid",
+            "worker_response_invalid") from None
+    if (not isinstance(response, dict) or "answer" not in response
+            or not set(response) <= {"answer", "usage", "meta"}):
+        raise OpenRouterError(
+            "OpenRouter worker response is invalid", "worker_response_invalid")
     # Сборка текста и подстановка ссылок — здесь, а не в воркере: только у
     # родителя есть карта «номер → сообщение», и она никуда не уезжает.
-    digest = _render_and_validate(response["answer"], chats)
+    try:
+        try:
+            digest = _render_and_validate(response["answer"], chats)
+        except OpenRouterError:
+            raise
+        except Exception:
+            # Ответ модели произволен: `"²".isdigit()` истинно, а `int("²")`
+            # падает ValueError (ревью 02.10.2026). Любой сбой сборки — это
+            # отбракованный оплаченный ответ, и классифицироваться он обязан
+            # так же, иначе статус снова покажет голый тип без id генерации.
+            raise OpenRouterError(
+                "OpenRouter digest could not be rendered", "structure_invalid",
+                detail="render_error") from None
+    except OpenRouterError as exc:
+        # Отказ проверки структуры — уже после оплаченного ответа модели:
+        # id генерации и число токенов нужны, чтобы найти его у провайдера.
+        meta = response.get("meta")
+        usage = response.get("usage")
+        exc.failure = sanitize_failure({
+            **(meta if isinstance(meta, dict) else {}),
+            "completion_tokens": (usage.get("completion_tokens")
+                                  if isinstance(usage, dict) else None),
+            **exc.failure,
+        }) or exc.failure
+        raise
     if "usage" not in response:
         return digest
     try:
         usage = validate_llm_usage(response["usage"])
     except ValueError as exc:
-        raise OpenRouterError("OpenRouter worker usage is invalid") from exc
+        raise OpenRouterError(
+            "OpenRouter worker usage is invalid", "usage_invalid") from exc
     return DigestText(digest, usage)

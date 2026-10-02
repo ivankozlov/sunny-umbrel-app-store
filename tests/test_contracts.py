@@ -7,6 +7,7 @@ import ssl
 import json
 import os
 import unittest
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -26,8 +27,12 @@ from sunny_digest.contracts import (
 from sunny_digest.models import DigestChat, SelectedMessage
 from sunny_digest.storage import canonical_json_bytes
 from sunny_digest.openrouter import (
+    OPENROUTER_URL,
+    WORKER_FAILURE_EXIT,
     WORKER_SCHEMA,
     OpenRouterError,
+    failure_label,
+    sanitize_failure,
     _blocking_digest,
     _prompt,
     blocking_fetch_response,
@@ -1017,6 +1022,223 @@ class TestBugOpenRouterSecondCancellation20260812(
 
         self.assertTrue(worker.killed)
         self.assertIsNotNone(worker.returncode)
+
+
+
+class FakeRawResponse(FakeResponse):
+    """Ответ OpenRouter с произвольным телом — для веток отказа."""
+
+    def __init__(self, body):
+        self.raw = (body if isinstance(body, bytes)
+                    else json.dumps(body).encode("utf-8"))
+
+
+class FakeFailingWorker(FakeAnsweringWorker):
+    """Воркер, вернувший классифицированный отказ вместо ответа."""
+
+    def __init__(self, raw, returncode=WORKER_FAILURE_EXIT):
+        super().__init__({"chats": []})
+        self.raw = raw
+        self.code = returncode
+
+    async def read(self, limit):
+        chunk = await super().read(limit)
+        self.returncode = self.code
+        return chunk
+
+    async def wait(self):
+        self.returncode = self.code
+        return self.code
+
+
+class TestBugDigestFailureDiagnostics20261002(unittest.IsolatedAsyncioTestCase):
+    """Отказ выпуска обязан быть различим в статусе.
+
+    02.10.2026 тринадцать попыток подряд дошли до модели и были оплачены,
+    но выпуск не собрался, а статус показывал одно `OpenRouterError`:
+    воркер на любой ошибке выходил с кодом 1, и HTTP-отказ, отказ модели и
+    битая структура были неразличимы. Причину установить не удалось. Код
+    отказа несёт только служебные поля — ни текста ответа, ни сообщения
+    провайдера, ни промпта."""
+
+    PROMPT_SECRET = "секретный текст переписки"
+
+    def _fetch_failure(self, response):
+        with patch("urllib.request.OpenerDirector.open", return_value=response):
+            with self.assertRaises(OpenRouterError) as caught:
+                blocking_fetch_response(
+                    self.PROMPT_SECRET, "anthropic/claude-opus-5.5", "secret")
+        return caught.exception.failure
+
+    def test_http_error_keeps_status_and_provider_but_not_message(self):
+        body = json.dumps({"error": {
+            "code": 402, "message": f"echo: {self.PROMPT_SECRET}",
+            "metadata": {"provider_name": "Amazon Bedrock",
+                         "raw": self.PROMPT_SECRET},
+        }}).encode("utf-8")
+        error = urllib.error.HTTPError(
+            OPENROUTER_URL, 402, "Payment Required",
+            email.message.Message(), io.BytesIO(body))
+        with patch("urllib.request.OpenerDirector.open", side_effect=error):
+            with self.assertRaises(OpenRouterError) as caught:
+                blocking_fetch_response(
+                    self.PROMPT_SECRET, "anthropic/claude-opus-5.5", "secret")
+        failure = caught.exception.failure
+        self.assertEqual(failure, {
+            "code": "http_error", "http_status": 402,
+            "provider": "Amazon Bedrock"})
+        self.assertNotIn(self.PROMPT_SECRET, json.dumps(failure, ensure_ascii=False))
+        self.assertEqual(failure_label(failure), "http_error:402")
+
+    def test_unfinished_answer_keeps_finish_reasons_and_generation(self):
+        failure = self._fetch_failure(FakeRawResponse({
+            "id": "gen-1759390000-abcDEF",
+            "provider": "Amazon Bedrock",
+            "choices": [{
+                "finish_reason": "content_filter",
+                "native_finish_reason": "refusal",
+                "message": {"content": self.PROMPT_SECRET},
+            }],
+            "usage": {"completion_tokens": 12},
+        }))
+        self.assertEqual(failure, {
+            "code": "finish_reason", "finish_reason": "content_filter",
+            "native_finish_reason": "refusal", "provider": "Amazon Bedrock",
+            "completion_tokens": 12, "generation_id": "gen-1759390000-abcDEF",
+        })
+        self.assertEqual(failure_label(failure), "finish_reason:content_filter")
+
+    def test_non_json_answer_and_error_body_are_classified(self):
+        failure = self._fetch_failure(FakeRawResponse({
+            "id": "gen-x", "choices": [{
+                "finish_reason": "stop", "message": {"content": "не JSON"}}],
+        }))
+        self.assertEqual(failure, {"code": "content_not_json",
+                                   "generation_id": "gen-x"})
+        failure = self._fetch_failure(FakeRawResponse({"error": {
+            "code": 502, "message": self.PROMPT_SECRET,
+            "metadata": {"provider_name": "Google"}}}))
+        self.assertEqual(failure, {"code": "provider_error",
+                                   "http_status": 502, "provider": "Google"})
+        failure = self._fetch_failure(FakeRawResponse(b"<html>"))
+        self.assertEqual(failure, {"code": "response_invalid"})
+
+    def test_successful_response_carries_only_safe_meta(self):
+        with patch("urllib.request.OpenerDirector.open", return_value=FakeRawResponse({
+                "id": "gen-ok", "provider": "Amazon Bedrock\nInjected",
+                "choices": [{"finish_reason": "stop",
+                             "message": {"content": json.dumps({"chats": []})}}],
+        })):
+            response = blocking_fetch_response(
+                "prompt", "anthropic/claude-opus-5.5", "secret")
+        # имя провайдера с переводом строки не проходит форму и выпадает
+        self.assertEqual(response["meta"], {"generation_id": "gen-ok"})
+
+    def test_sanitizer_drops_unknown_fields_and_bad_values(self):
+        self.assertIsNone(sanitize_failure({"code": "made_up"}))
+        self.assertIsNone(sanitize_failure("http_error"))
+        self.assertEqual(sanitize_failure({
+            "code": "http_error", "http_status": True, "message": "text",
+            "finish_reason": "<script>", "completion_tokens": -1,
+            "generation_id": "gen/../x", "detail": "ok_detail",
+        }), {"code": "http_error", "detail": "ok_detail"})
+
+    async def test_worker_failure_crosses_the_boundary_classified(self):
+        failure = {"code": "finish_reason", "finish_reason": "length",
+                   "completion_tokens": 32768, "generation_id": "gen-w"}
+        worker = FakeFailingWorker(
+            canonical_json_bytes({"failure": failure}) + b"\n")
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   return_value=worker):
+            with self.assertRaises(OpenRouterError) as caught:
+                await create_digest(
+                    TestBugDigestLinksProductionPath20260818.CHATS,
+                    "anthropic/claude-opus-5.5", "sk-or-test-secret",
+                    asyncio.Event())
+        self.assertEqual(caught.exception.failure, failure)
+
+    async def test_garbled_or_plain_worker_failure_is_still_classified(self):
+        for raw, code, expected in (
+                (b"{\"failure\": {\"code\": \"invented\"}}\n",
+                 WORKER_FAILURE_EXIT, "worker_response_invalid"),
+                (b"", 1, "worker_failed")):
+            worker = FakeFailingWorker(raw, returncode=code)
+            with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                       return_value=worker):
+                with self.assertRaises(OpenRouterError) as caught:
+                    await create_digest(
+                        TestBugDigestLinksProductionPath20260818.CHATS,
+                        "anthropic/claude-opus-5.5", "sk-or-test-secret",
+                        asyncio.Event())
+            self.assertEqual(caught.exception.failure, {"code": expected})
+
+    async def test_parent_side_structure_failure_keeps_generation_meta(self):
+        worker = FakeAnsweringWorker(
+            {"chats": [], "summary": "лишнее поле"},
+            usage={"prompt_tokens": 30000, "completion_tokens": 40,
+                   "reasoning_tokens": None, "cost": 0.18,
+                   "upstream_cost": 0.18})
+        response = json.loads(worker.raw)
+        response["meta"] = {"generation_id": "gen-p", "provider": "Google"}
+        worker.raw = canonical_json_bytes(response) + b"\n"
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   return_value=worker):
+            with self.assertRaises(OpenRouterError) as caught:
+                await create_digest(
+                    TestBugDigestLinksProductionPath20260818.CHATS,
+                    "anthropic/claude-opus-5.5", "sk-or-test-secret",
+                    asyncio.Event())
+        self.assertEqual(caught.exception.failure, {
+            "code": "structure_invalid", "detail": "top_fields",
+            "completion_tokens": 40, "generation_id": "gen-p",
+            "provider": "Google"})
+
+    async def test_unexpected_render_crash_is_still_classified(self):
+        """`"²".isdigit()` истинно, а `int("²")` падает ValueError (ревью
+        02.10.2026): такой ref не должен уводить отказ мимо классификации."""
+        answer = {"chats": [{"chat": "Рабочий чат", "topics": [
+            {"title": "Тема", "summary": "s", "refs": ["²"]}], "links": []}]}
+        worker = FakeAnsweringWorker(answer, usage={
+            "prompt_tokens": 10, "completion_tokens": 7,
+            "reasoning_tokens": None, "cost": 0.1, "upstream_cost": 0.1})
+        response = json.loads(worker.raw)
+        response["meta"] = {"generation_id": "gen-r"}
+        worker.raw = canonical_json_bytes(response) + b"\n"
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   return_value=worker):
+            with self.assertRaises(OpenRouterError) as caught:
+                await create_digest(
+                    TestBugDigestLinksProductionPath20260818.CHATS,
+                    "anthropic/claude-opus-5.5", "sk-or-test-secret",
+                    asyncio.Event())
+        self.assertEqual(caught.exception.failure, {
+            "code": "structure_invalid", "detail": "render_error",
+            "completion_tokens": 7, "generation_id": "gen-r"})
+
+    def test_real_worker_emits_failure_without_exception_text(self):
+        from sunny_digest import openrouter_worker
+
+        request = canonical_json_bytes({
+            "schema": WORKER_SCHEMA, "prompt": "prompt",
+            "model": "anthropic/claude-opus-5.5",
+            "api_key": "sk-or-test-secret-0000",
+        }) + b"\n"
+        stdout = io.BytesIO()
+
+        def refuse(*_args):
+            raise OpenRouterError(
+                f"provider said {self.PROMPT_SECRET}", "http_error",
+                http_status=429)
+
+        with patch.object(openrouter_worker, "blocking_fetch_response", refuse), \
+                patch("sys.stdin", io.TextIOWrapper(io.BytesIO(request))), \
+                patch("sys.stdout", io.TextIOWrapper(stdout)):
+            code = openrouter_worker.main()
+            written = stdout.getvalue()
+        self.assertEqual(code, WORKER_FAILURE_EXIT)
+        self.assertNotIn(self.PROMPT_SECRET.encode("utf-8"), written)
+        self.assertEqual(json.loads(written), {
+            "failure": {"code": "http_error", "http_status": 429}})
 
 
 if __name__ == "__main__":

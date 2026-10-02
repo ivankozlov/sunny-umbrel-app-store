@@ -449,6 +449,53 @@ class TestBugOnlinePresenceUi20260913(unittest.TestCase):
             self.assertIn("ещё не выполнялась — CollectorError", page)
 
 
+class TestBugDigestFailureRendering20261002(unittest.TestCase):
+    """Последний отказ выпуска виден в интерфейсе — только служебные поля.
+
+    02.10.2026 выпуск не собрался 13 попыток подряд, а интерфейс показывал
+    одно `OpenRouterError`: причину установить не удалось."""
+
+    def _page(self, failure=None, runs=None):
+        value = status("chat_locked")
+        value["last_digest_failure"] = failure
+        value["recent_runs"] = runs or []
+        return render_status(value, "a" * 64)
+
+    def test_failure_fields_are_rendered(self):
+        page = self._page({
+            "at": "2026-10-02T05:43:30+00:00", "error_type": "OpenRouterError",
+            "code": "finish_reason", "finish_reason": "content_filter",
+            "native_finish_reason": "refusal", "completion_tokens": 12,
+            "provider": "Amazon Bedrock", "generation_id": "gen-17-abc",
+        }, runs=[{"at": "2026-10-02T05:43:30+00:00", "result": "error",
+                  "error_type": "OpenRouterError",
+                  "error_detail": "finish_reason:content_filter"}])
+        self.assertIn("Последний отказ выпуска", page)
+        for text in ("2026-10-02T05:43:30", "код: finish_reason",
+                     "finish: content_filter", "native: refusal",
+                     "выходных токенов: 12", "провайдер: Amazon Bedrock",
+                     "id генерации: gen-17-abc",
+                     "OpenRouterError (finish_reason:content_filter)"):
+            self.assertIn(text, page)
+
+    def test_absent_or_hostile_failure_renders_nothing_unsafe(self):
+        self.assertNotIn("Последний отказ выпуска", self._page(None))
+        self.assertNotIn("Последний отказ выпуска",
+                         self._page({"error_type": "<script>"}))
+        page = self._page({
+            "at": "<img src=x>", "error_type": "OpenRouterError",
+            "code": "<script>", "http_status": "402",
+            "provider": "<b>x</b>", "generation_id": "gen/../../x",
+            "completion_tokens": True,
+        }, runs=[{"at": "2026-10-02T05:43:30+00:00", "result": "error",
+                  "error_type": "OpenRouterError",
+                  "error_detail": "<script>alert(1)</script>"}])
+        self.assertIn("Последний отказ выпуска", page)
+        for hostile in ("<script>", "<img", "<b>", "gen/../", "HTTP:",
+                        "выходных токенов"):
+            self.assertNotIn(hostile, page)
+
+
 class TestRecentRunsRendering20260817(unittest.TestCase):
     """Журнал прогонов виден в интерфейсе и санитизируется как всё остальное."""
 
