@@ -27,7 +27,7 @@ from sunny_digest.contracts import (
     mention_event_id,
 )
 from sunny_digest.ipc import SCHEDULER_TICK_S
-from sunny_digest.openrouter import OpenRouterError
+from sunny_digest.openrouter import FALLBACK_MODEL, DigestText, OpenRouterError
 from sunny_digest.models import (
     DialogCandidate,
     DigestChat,
@@ -42,6 +42,7 @@ from sunny_digest.settings import (
     OPUS_55_MODEL,
     SETTINGS_SCHEMA,
     load_credentials,
+    load_settings,
 )
 from sunny_digest.contracts import supergroup_link_prefix
 from sunny_digest.prompting import (
@@ -498,7 +499,7 @@ class FakeTunnel:
 def collector_for(paths, gateway, transport, digest_calls=None, runtime=None):
     digest_calls = digest_calls if digest_calls is not None else []
 
-    async def digest(chats, model, key, revoked):
+    async def digest(chats, model, key, revoked, *_rest):
         digest_calls.append((chats, model, key, revoked.is_set()))
         return "Общий дайджест"
 
@@ -3506,6 +3507,89 @@ class TestBugDigestFailureDiagnostics20261002(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["last_digest_failure"], {
                 "at": NOW.isoformat(), "error_type": "RuntimeError"})
             self.assertIsNone(result["recent_runs"][-1]["error_detail"])
+
+
+class TestBugOpusRefusalFallback20261003(unittest.IsolatedAsyncioTestCase):
+    """Выпуск запасной модели уходит с её id и пометкой в начале.
+
+    02–03.10.2026 Opus 5.5 отказывался пересказывать переписку; запасная
+    GLM-5.3 собирает выпуск, и Иван должен видеть, что пересказ сделала не
+    обычная модель. В выгрузку — фактическая модель, иначе учёт расходов
+    приписал бы GLM-вызов Opus."""
+
+    async def test_fallback_digest_is_uploaded_with_its_model_and_note(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            transport = FakeTransport(paths, gate(digest_due=True))
+            collector = collector_for(paths, FakeGateway(paths), transport)
+
+            async def fallback_digest(*_args):
+                return DigestText("Общий дайджест", {
+                    "prompt_tokens": 100, "completion_tokens": 20,
+                    "reasoning_tokens": None, "cost": 0.01,
+                    "upstream_cost": 0.01},
+                    model=FALLBACK_MODEL, fallback_after_refusal=True)
+
+            collector.digest_function = fallback_digest
+            result = await collector.run_once()
+
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            payload = transport.digest_uploads[-1]
+            self.assertEqual(payload["model"], "z-ai/glm-5.3")
+            self.assertTrue(payload["digest"].startswith(
+                "[выпуск собран запасной моделью GLM-5.3:"))
+            self.assertIn("Общий дайджест", payload["digest"])
+
+    async def test_fallback_gate_rechecks_receiver_window(self):
+        """Ревью 03.10.2026: перед запасным вызовом одного revoked мало —
+        окно приёмника и согласие могли истечь, пока думал Opus."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            transport = FakeTransport(paths, gate(
+                digest_due=True, server_time="2026-08-04T01:40:00Z"))
+            collector = collector_for(paths, FakeGateway(paths), transport)
+            outcomes = []
+
+            async def refusing_then_late(chats, model, key, revoked,
+                                         before_fallback):
+                await before_fallback()          # внутри окна — проходит
+                outcomes.append("inside")
+                value = transport.value
+                late = (datetime.fromisoformat(
+                    value["digest"]["accept_until"].replace("Z", "+00:00"))
+                    - datetime.fromisoformat(
+                        value["server_time"].replace("Z", "+00:00"))
+                ).total_seconds() + 1
+                self.assertLess(late, 3600)
+                clock = collector.monotonic
+                collector.monotonic = lambda: clock() + late
+                try:
+                    await before_fallback()
+                except RuntimeError as exc:
+                    outcomes.append(str(exc))
+                    raise
+                return "не должно дойти"
+
+            collector.digest_function = refusing_then_late
+            result = await collector.run_once()
+            self.assertEqual(outcomes, [
+                "inside", "digest fallback exceeded receiver window"])
+            self.assertEqual(result["last_result"], "error")
+            self.assertEqual(transport.digest_uploads, [])
+
+    async def test_primary_digest_keeps_the_configured_model(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            transport = FakeTransport(paths, gate(digest_due=True))
+            collector = collector_for(paths, FakeGateway(paths), transport)
+            await collector.run_once()
+            payload = transport.digest_uploads[-1]
+            self.assertEqual(payload["model"],
+                             load_settings(paths)["openrouter_model"])
+            self.assertNotIn("запасной моделью", payload["digest"])
 
 
 class TestRecentRunsJournal20260817(unittest.IsolatedAsyncioTestCase):

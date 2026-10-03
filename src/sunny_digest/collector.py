@@ -27,7 +27,9 @@ from .mihomo import (
     MihomoRuntime,
     render_mihomo_config,
 )
-from .openrouter import OpenRouterError, create_digest, failure_label
+from .openrouter import (
+    FALLBACK_MODEL_LABEL, OpenRouterError, create_digest, failure_label,
+)
 from .prompting import (
     PROMPT_PREFIX_BYTES,
     digest_skip_note,
@@ -98,7 +100,14 @@ TELEGRAM_SETUP_TIMEOUT_S = 90
 TELEGRAM_DIALOG_TIMEOUT_S = 120
 TELEGRAM_FETCH_TIMEOUT_S = 180
 KEYGEN_TIMEOUT_S = 30
-OPENROUTER_TIMEOUT_S = 120
+# Два вызова подряд: отказ основной модели (~10–25 с, 03.10.2026) и запасная;
+# каждый воркер ограничен своими 100 с, общий предел их покрывает.
+OPENROUTER_TIMEOUT_S = 240
+# Пометка в начале выпуска: Иван должен знать, что пересказ сделала не та
+# модель, что обычно, и почему.
+FALLBACK_DIGEST_NOTE = (
+    f"[выпуск собран запасной моделью {FALLBACK_MODEL_LABEL}: "
+    "основная модель отказалась пересказывать переписку]")
 # Глубина журнала прогонов в интерфейсе. Двадцати записей со схлопыванием
 # повторов хватает, чтобы увидеть ночное окно целиком; статус при этом
 # остаётся в пределах 16 КБ, которыми ограничено его чтение.
@@ -2851,6 +2860,7 @@ class Collector:
 
         total = sum(row["message_count"] for row in ranges)
         llm_usage = None
+        model_used = settings["openrouter_model"]
         if total == 0:
             digest = ""
         else:
@@ -2859,6 +2869,17 @@ class Collector:
             # сторожить и переподнимать. Падение туннеля роняет попытку —
             # DIRECT fallback'а нет намеренно, иначе запрос ушёл бы мимо DO и
             # молча упёрся в фильтр, как это было до 18.08.
+            async def before_fallback() -> None:
+                # Перед запасной моделью — та же проверка, что перед refill:
+                # согласие по доверенному времени, набор чатов и окно приёмника.
+                await self._assert_active(
+                    revoked, source_id, chat_ids,
+                    self._generated_at(gate, gate_received_mono),
+                )
+                if self._generated_at(gate, gate_received_mono) >= parse_utc(
+                        gate["digest"]["accept_until"], "accept_until"):
+                    raise RuntimeError("digest fallback exceeded receiver window")
+
             tunnel = self.tunnel_factory(self.paths, settings["upload"])
             await tunnel.start()
             try:
@@ -2866,14 +2887,22 @@ class Collector:
                     self.digest_function(
                         digest_chats, settings["openrouter_model"],
                         credentials["openrouter_api_key"], revoked,
+                        before_fallback,
                     ),
                     OPENROUTER_TIMEOUT_S,
                 )
                 digest = str(digest_result)
                 llm_usage = getattr(digest_result, "llm_usage", None)
+                # В выгрузку — модель, которая реально собрала выпуск: после
+                # отказа основной это запасная (03.10.2026). Приёмник и скилл
+                # проверяют только форму токена, списка моделей у них нет.
+                model_used = getattr(digest_result, "model", None) or model_used
                 tunnel.ensure_alive()
             finally:
                 await tunnel.stop()
+            if getattr(digest_result, "fallback_after_refusal", False):
+                digest = prepend_digest_note(
+                    digest, FALLBACK_DIGEST_NOTE, MAX_DIGEST_CHARS)
         if skipped:
             digest = prepend_digest_note(
                 digest, digest_skip_note(skipped), MAX_DIGEST_CHARS)
@@ -2885,7 +2914,7 @@ class Collector:
                         if llm_usage is not None else {})
         payload = build_digest_upload(
             source_id=source_id, gate=gate, chat_ranges=ranges, digest=digest,
-            model=settings["openrouter_model"],
+            model=model_used,
             generated_at=self._generated_at(gate, gate_received_mono),
             **usage_kwargs,
         )
@@ -2901,13 +2930,13 @@ class Collector:
             digest = self._fit_digest(digest, limit, lambda text: len(
                 canonical_digest_bytes(build_digest_upload(
                     source_id=source_id, gate=gate, chat_ranges=ranges,
-                    digest=text, model=settings["openrouter_model"],
+                    digest=text, model=model_used,
                     generated_at=self._generated_at(gate, gate_received_mono),
                     **usage_kwargs,
                 ))))
             payload = build_digest_upload(
                 source_id=source_id, gate=gate, chat_ranges=ranges,
-                digest=digest, model=settings["openrouter_model"],
+                digest=digest, model=model_used,
                 generated_at=self._generated_at(gate, gate_received_mono),
                 **usage_kwargs,
             )

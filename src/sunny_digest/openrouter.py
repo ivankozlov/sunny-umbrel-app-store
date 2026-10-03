@@ -10,7 +10,7 @@ import socket
 import ssl
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .contracts import validate_digest_text, validate_llm_usage
 from .openrouter_tunnel import TUNNEL_HOST, TUNNEL_PORT
@@ -28,6 +28,21 @@ from .version import MAX_DIGEST_CHARS
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPUS_55_MODEL = "anthropic/claude-opus-5.5"
+# Запасная модель — только на отказ основной (решение Ивана 03.10.2026).
+# 02–03.10 Opus 5.5 26 попыток подряд отвечал `content_filter`/`refusal` на
+# одну и ту же переписку, а растянутая ретроспектива держала этот кусок в
+# каждом следующем запросе: без второй модели выпусков не было бы вовсе.
+# Модель и хосты зашиты в релиз, а не в настройки: UI их не меняет, factory
+# reset не нужен. Хосты — закрытый список американских и европейских
+# провайдеров (решение Ивана: не китайская юрисдикция); allowlist, а не
+# ignore, чтобы новый хост не проскочил сам. ZDR и data_collection=deny
+# остаются, require_parameters не пускает туда, где нет response_format.
+FALLBACK_MODEL = "z-ai/glm-5.3"
+FALLBACK_MODEL_LABEL = "GLM-5.3"
+FALLBACK_PROVIDERS = (
+    "fireworks", "together", "deepinfra", "baseten", "crusoe", "parasail",
+    "digitalocean", "modal", "mistral", "nebius",
+)
 NOTHING_NOTABLE = "За сутки в чатах не было ничего существенного."
 # Запрос обязан идти через DO: прямой путь из домашней сети отбивает фильтр
 # (`Access denied by security policy`), а через VLESS-туннель Cloudflare
@@ -71,6 +86,7 @@ _FAILURE_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,31}\Z")
 _FAILURE_DETAIL = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
 _FAILURE_PROVIDER = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._/()-]{0,47}\Z")
 _GENERATION_ID = re.compile(r"[A-Za-z0-9_-]{1,96}\Z")
+_FAILURE_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,159}\Z")
 
 
 def _bounded_int(value: Any, low: int, high: int) -> Optional[int]:
@@ -100,10 +116,18 @@ def sanitize_failure(value: Any) -> Optional[Dict[str, Any]]:
         "completion_tokens": _bounded_int(
             value.get("completion_tokens"), 0, 10_000_000),
         "generation_id": _matching(value.get("generation_id"), _GENERATION_ID),
+        "model": _matching(value.get("model"), _FAILURE_MODEL),
     }
     failure = {"code": value["code"]}
     failure.update((key, item) for key, item in checked.items() if item is not None)
     return failure
+
+
+def is_refusal(failure: Optional[Dict[str, Any]]) -> bool:
+    """Модель отказалась отвечать (а не упала связь или структура)."""
+    return bool(failure) and failure.get("code") == "finish_reason" and (
+        failure.get("finish_reason") == "content_filter"
+        or failure.get("native_finish_reason") == "refusal")
 
 
 def failure_label(failure: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -129,11 +153,17 @@ class OpenRouterError(RuntimeError):
 class DigestText(str):
     """Текст выпуска с обезличенной provider-телеметрией одного вызова."""
 
-    llm_usage: Dict[str, Any]
+    llm_usage: Optional[Dict[str, Any]]
+    model: Optional[str]
+    fallback_after_refusal: bool
 
-    def __new__(cls, value: str, llm_usage: Dict[str, Any]):
+    def __new__(cls, value: str, llm_usage: Optional[Dict[str, Any]],
+                model: Optional[str] = None,
+                fallback_after_refusal: bool = False):
         instance = super().__new__(cls, value)
         instance.llm_usage = llm_usage
+        instance.model = model
+        instance.fallback_after_refusal = fallback_after_refusal
         return instance
 
 
@@ -386,12 +416,15 @@ def blocking_fetch_response(
     prompt: str, model: str, api_key: str,
 ) -> Dict[str, Any]:
     """Запрос к OpenRouter: структура ответа и безопасная usage-сводка."""
+    provider: Dict[str, Any] = {
+        "zdr": True,
+        "data_collection": "deny",
+    }
+    if model == FALLBACK_MODEL:
+        provider.update(only=list(FALLBACK_PROVIDERS), require_parameters=True)
     payload = {
         "model": model,
-        "provider": {
-            "zdr": True,
-            "data_collection": "deny",
-        },
+        "provider": provider,
         "messages": [
             {"role": "system", "content": "You summarize only the supplied selected-groups text."},
             {"role": "user", "content": prompt},
@@ -616,15 +649,52 @@ async def _bounded_worker_exchange(process: Any, request: bytes) -> bytes:
     return b"".join(chunks)
 
 
-async def create_digest(chats: List[DigestChat], model: str, api_key: str,
-                        revoked: asyncio.Event) -> str:
+async def create_digest(
+    chats: List[DigestChat], model: str, api_key: str, revoked: asyncio.Event,
+    before_fallback: Optional[Callable[[], Awaitable[None]]] = None,
+) -> str:
     if not chats or not any(chat.messages for chat in chats):
         return ""
     if revoked.is_set():
         raise asyncio.CancelledError
+    prompt = _prompt(chats)
+    try:
+        return await _attempt_digest(chats, prompt, model, api_key, revoked)
+    except OpenRouterError as exc:
+        # Только отказ модели: сбой связи, структуры или таймаут второй
+        # моделью не лечится и должен остаться виден как есть.
+        if model == FALLBACK_MODEL or not is_refusal(exc.failure):
+            raise
+    if revoked.is_set():
+        raise asyncio.CancelledError
+    # Запасной вызов — отдельная внешняя операция к другому получателю:
+    # согласие, набор чатов и окно приёмника проверяются заново, как перед
+    # каждым вызовом Telegram (ревью 03.10.2026). Пока думал Opus, срок
+    # согласия мог истечь, а одного флага revoked для этого мало.
+    if before_fallback is not None:
+        await before_fallback()
+    digest = await _attempt_digest(
+        chats, prompt, FALLBACK_MODEL, api_key, revoked)
+    return DigestText(str(digest), getattr(digest, "llm_usage", None),
+                      model=FALLBACK_MODEL, fallback_after_refusal=True)
+
+
+async def _attempt_digest(chats: List[DigestChat], prompt: str, model: str,
+                          api_key: str, revoked: asyncio.Event) -> str:
+    """Один вызов модели в killable воркере; отказ несёт её id."""
+    try:
+        return await _attempt_digest_inner(chats, prompt, model, api_key, revoked)
+    except OpenRouterError as exc:
+        exc.failure = sanitize_failure({**exc.failure, "model": model}) or exc.failure
+        raise
+
+
+async def _attempt_digest_inner(chats: List[DigestChat], prompt: str,
+                                model: str, api_key: str,
+                                revoked: asyncio.Event) -> str:
     request = canonical_json_bytes({
         "schema": WORKER_SCHEMA,
-        "prompt": _prompt(chats),
+        "prompt": prompt,
         "model": model,
         "api_key": api_key,
     }) + b"\n"

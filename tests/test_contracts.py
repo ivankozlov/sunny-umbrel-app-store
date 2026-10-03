@@ -27,6 +27,8 @@ from sunny_digest.contracts import (
 from sunny_digest.models import DigestChat, SelectedMessage
 from sunny_digest.storage import canonical_json_bytes
 from sunny_digest.openrouter import (
+    FALLBACK_MODEL,
+    FALLBACK_PROVIDERS,
     OPENROUTER_URL,
     WORKER_FAILURE_EXIT,
     WORKER_SCHEMA,
@@ -1155,7 +1157,8 @@ class TestBugDigestFailureDiagnostics20261002(unittest.IsolatedAsyncioTestCase):
                     TestBugDigestLinksProductionPath20260818.CHATS,
                     "anthropic/claude-opus-5.5", "sk-or-test-secret",
                     asyncio.Event())
-        self.assertEqual(caught.exception.failure, failure)
+        self.assertEqual(caught.exception.failure,
+                         {**failure, "model": "anthropic/claude-opus-5.5"})
 
     async def test_garbled_or_plain_worker_failure_is_still_classified(self):
         for raw, code, expected in (
@@ -1170,7 +1173,8 @@ class TestBugDigestFailureDiagnostics20261002(unittest.IsolatedAsyncioTestCase):
                         TestBugDigestLinksProductionPath20260818.CHATS,
                         "anthropic/claude-opus-5.5", "sk-or-test-secret",
                         asyncio.Event())
-            self.assertEqual(caught.exception.failure, {"code": expected})
+            self.assertEqual(caught.exception.failure, {
+                "code": expected, "model": "anthropic/claude-opus-5.5"})
 
     async def test_parent_side_structure_failure_keeps_generation_meta(self):
         worker = FakeAnsweringWorker(
@@ -1191,7 +1195,7 @@ class TestBugDigestFailureDiagnostics20261002(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.failure, {
             "code": "structure_invalid", "detail": "top_fields",
             "completion_tokens": 40, "generation_id": "gen-p",
-            "provider": "Google"})
+            "provider": "Google", "model": "anthropic/claude-opus-5.5"})
 
     async def test_unexpected_render_crash_is_still_classified(self):
         """`"²".isdigit()` истинно, а `int("²")` падает ValueError (ревью
@@ -1213,7 +1217,8 @@ class TestBugDigestFailureDiagnostics20261002(unittest.IsolatedAsyncioTestCase):
                     asyncio.Event())
         self.assertEqual(caught.exception.failure, {
             "code": "structure_invalid", "detail": "render_error",
-            "completion_tokens": 7, "generation_id": "gen-r"})
+            "completion_tokens": 7, "generation_id": "gen-r",
+            "model": "anthropic/claude-opus-5.5"})
 
     def test_real_worker_emits_failure_without_exception_text(self):
         from sunny_digest import openrouter_worker
@@ -1239,6 +1244,161 @@ class TestBugDigestFailureDiagnostics20261002(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(self.PROMPT_SECRET.encode("utf-8"), written)
         self.assertEqual(json.loads(written), {
             "failure": {"code": "http_error", "http_status": 429}})
+
+
+
+class TestBugOpusRefusalFallback20261003(unittest.IsolatedAsyncioTestCase):
+    """Отказ Opus 5.5 обязан переходить на запасную модель.
+
+    02–03.10.2026 Opus 5.5 26 попыток подряд отвечал `content_filter` /
+    `refusal` на одну и ту же переписку (Bedrock, 90 токенов размышления), а
+    растянутая ретроспектива держала этот кусок во всех следующих запросах.
+    Решение Ивана: при отказе — GLM-5.3, только через американские и
+    европейские хосты, с прежними ZDR и data_collection=deny."""
+
+    CHATS = TestBugDigestLinksProductionPath20260818.CHATS
+    ANSWER = {"chats": [{"chat": "Рабочий чат", "topics": [
+        {"title": "Тема", "summary": "Итог", "refs": [1]}], "links": []}]}
+    REFUSAL = {"code": "finish_reason", "finish_reason": "content_filter",
+               "native_finish_reason": "refusal", "completion_tokens": 90,
+               "provider": "Amazon Bedrock"}
+
+    def _refusing(self, failure=None):
+        return FakeFailingWorker(canonical_json_bytes(
+            {"failure": failure or self.REFUSAL}) + b"\n")
+
+    def test_fallback_request_is_pinned_to_allowed_hosts_with_zdr(self):
+        with patch("urllib.request.OpenerDirector.open", return_value=FakeResponse(
+                content={"chats": []})) as opened:
+            blocking_fetch_response("prompt", FALLBACK_MODEL, "secret")
+        payload = json.loads(opened.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(payload["model"], "z-ai/glm-5.3")
+        self.assertEqual(payload["provider"], {
+            "zdr": True, "data_collection": "deny",
+            "only": list(FALLBACK_PROVIDERS), "require_parameters": True})
+        for chinese in ("z-ai", "siliconflow", "novita", "moonshotai",
+                        "alibaba", "deepseek", "tencent"):
+            self.assertNotIn(chinese, payload["provider"]["only"])
+        self.assertEqual(payload["max_tokens"], 32_768)
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+
+        with patch("urllib.request.OpenerDirector.open", return_value=FakeResponse(
+                content={"chats": []})) as opened:
+            blocking_fetch_response(
+                "prompt", "anthropic/claude-opus-5.5", "secret")
+        primary = json.loads(opened.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(primary["provider"],
+                         {"zdr": True, "data_collection": "deny"})
+
+    async def test_refusal_switches_to_fallback_model(self):
+        fallback = FakeAnsweringWorker(self.ANSWER, usage={
+            "prompt_tokens": 100, "completion_tokens": 20,
+            "reasoning_tokens": None, "cost": 0.01, "upstream_cost": 0.01})
+        refusing = self._refusing()
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   side_effect=[refusing, fallback]):
+            digest = await create_digest(
+                self.CHATS, "anthropic/claude-opus-5.5", "sk-or-test-secret",
+                asyncio.Event())
+        self.assertIn("Итог", digest)
+        self.assertEqual(digest.model, FALLBACK_MODEL)
+        self.assertTrue(digest.fallback_after_refusal)
+        self.assertEqual(digest.llm_usage["completion_tokens"], 20)
+        first = json.loads(refusing.stdin.data)
+        second = json.loads(fallback.stdin.data)
+        self.assertEqual(first["model"], "anthropic/claude-opus-5.5")
+        self.assertEqual(second["model"], FALLBACK_MODEL)
+        # тот же промпт: номера `n` и псевдонимы обязаны совпасть с картой
+        self.assertEqual(first["prompt"], second["prompt"])
+
+    async def test_other_failures_do_not_reach_the_fallback(self):
+        for failure in (
+                {"code": "http_error", "http_status": 402},
+                {"code": "finish_reason", "finish_reason": "length"},
+                {"code": "content_not_json"}):
+            calls = []
+
+            def spawn(*_args, **_kwargs):
+                calls.append(1)
+                return self._refusing(failure)
+
+            with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                       side_effect=spawn):
+                with self.assertRaises(OpenRouterError) as caught:
+                    await create_digest(
+                        self.CHATS, "anthropic/claude-opus-5.5",
+                        "sk-or-test-secret", asyncio.Event())
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(caught.exception.failure["model"],
+                             "anthropic/claude-opus-5.5")
+
+    async def test_fallback_refusal_is_reported_without_a_third_call(self):
+        calls = []
+
+        def spawn(*_args, **_kwargs):
+            calls.append(1)
+            return self._refusing()
+
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   side_effect=spawn):
+            with self.assertRaises(OpenRouterError) as caught:
+                await create_digest(
+                    self.CHATS, "anthropic/claude-opus-5.5",
+                    "sk-or-test-secret", asyncio.Event())
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(caught.exception.failure["model"], FALLBACK_MODEL)
+        self.assertEqual(caught.exception.failure["native_finish_reason"],
+                         "refusal")
+
+    async def test_failed_gate_before_fallback_stops_the_second_call(self):
+        calls, gates = [], []
+
+        def spawn(*_args, **_kwargs):
+            calls.append(1)
+            return self._refusing()
+
+        async def expired():
+            gates.append(1)
+            raise RuntimeError("setup consent is expired")
+
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   side_effect=spawn):
+            with self.assertRaisesRegex(RuntimeError, "consent"):
+                await create_digest(
+                    self.CHATS, "anthropic/claude-opus-5.5",
+                    "sk-or-test-secret", asyncio.Event(), expired)
+        self.assertEqual((len(calls), len(gates)), (1, 1))
+
+    async def test_gate_is_not_called_without_a_refusal(self):
+        gates = []
+
+        async def gate():
+            gates.append(1)
+
+        worker = FakeAnsweringWorker(self.ANSWER)
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   return_value=worker):
+            await create_digest(
+                self.CHATS, "anthropic/claude-opus-5.5", "sk-or-test-secret",
+                asyncio.Event(), gate)
+        self.assertEqual(gates, [])
+
+    async def test_revocation_between_attempts_stops_the_fallback(self):
+        revoked = asyncio.Event()
+        calls = []
+
+        def spawn(*_args, **_kwargs):
+            calls.append(1)
+            revoked.set()
+            return self._refusing()
+
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   side_effect=spawn):
+            with self.assertRaises(asyncio.CancelledError):
+                await create_digest(
+                    self.CHATS, "anthropic/claude-opus-5.5",
+                    "sk-or-test-secret", revoked)
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

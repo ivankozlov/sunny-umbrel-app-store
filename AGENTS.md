@@ -105,6 +105,20 @@ content, receiver keys, or rendered runtime configuration.
   startup migrates only the exact persisted model ID
   `anthropic/claude-opus-4.8` to `anthropic/claude-opus-5.5` without factory
   reset; do not generalize it to another model, credential, account or endpoint.
+  The refusal fallback (`0.2.19`, owner's decision of 2026-10-03) is the second:
+  when the configured model answers `content_filter`/`refusal`, the same prompt
+  goes once to the fixed `FALLBACK_MODEL` (`z-ai/glm-5.3`). It is a release
+  constant, not a setting, so the UI cannot change it and no reset is needed.
+  Its request keeps `zdr=true` and `data_collection=deny` and adds
+  `provider.only` — an allowlist of US and European hosts, never an ignore
+  list, so a new host in Chinese jurisdiction cannot slip in — plus
+  `require_parameters=true`. Only a refusal reaches it: transport, HTTP,
+  structure and timeout failures stay visible as they are. The fallback is a
+  second external recipient, so the collector re-checks consent, the chat set
+  and the receiver window (`before_fallback`) right before it, not only the
+  revocation flag. The issue opens
+  with a note naming the fallback, and the upload's `model` is the model that
+  actually wrote it; the three validators check only the token form.
   The chat set is the other exception, and only forward:
   it may be EXTENDED without a new epoch, never shrunk or reordered. The server
   decides — `deploy/extend_chat_set.sh` adds the chat to the receiver config,

@@ -81,14 +81,26 @@ Telegram ID ranges, which are not message counts. On startup, the exact persiste
 Opus 4.8 model is migrated to Opus 5.5 without resetting delivery state. Other
 configured models remain unchanged.
 
-`0.2.18` is prepared as a disabled Phase-A package. On 2026-10-02 thirteen daily
+`0.2.18`, published on 2026-10-02, follows a missed issue: that morning thirteen daily
 attempts reached the model and were billed, yet no digest was built and the status
 showed only `OpenRouterError`: the killable worker exited with status 1 on any
 failure. The worker now returns a sanitized failure code (exit status 3), and the
 status keeps the last digest failure across idle ticks — code, HTTP status or
 finish reason, output tokens, provider and generation id, never answer text or the
-provider message. The collector wire version remains `0.2.1`. Publication and
-device Update are pending.
+provider message. The collector wire version remains `0.2.1`. Store enable commit
+`7bcb55c` pins index digest
+`sha256:e482a79456551e213d7373e8fe654dcadb0b165b14bcc005fb1e1ee84f4c7a57`; the owner
+updated the device the same day.
+
+`0.2.19` is prepared as a disabled Phase-A package. The 0.2.18 status showed that
+Opus 5.5 refused the 2026-10-03 issue (`finish_reason=content_filter`,
+`native_finish_reason=refusal`, Amazon Bedrock) on the same input as the day before,
+and the stretched look-back kept that input in every later request. On a refusal
+only, the same prompt now goes once to the fixed fallback `z-ai/glm-5.3`, pinned by
+`provider.only` to US and European hosts, with `zdr=true`,
+`data_collection=deny` and `require_parameters=true`. The issue opens with a note
+naming the fallback, and the upload carries the model that actually wrote it. The
+collector wire version remains `0.2.1`. Publication and device Update are pending.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.15` have public multi-arch images.
