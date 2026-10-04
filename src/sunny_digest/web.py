@@ -179,6 +179,7 @@ _DIGEST_FAILURE_FIELDS = (
     ("completion_tokens", "выходных токенов", None),
     ("provider", "провайдер", re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._/()-]{0,47}")),
     ("generation_id", "id генерации", re.compile(r"[A-Za-z0-9_-]{1,96}")),
+    ("model", "модель", re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,159}")),
 )
 
 

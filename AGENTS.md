@@ -119,6 +119,12 @@ content, receiver keys, or rendered runtime configuration.
   revocation flag. The issue opens
   with a note naming the fallback, and the upload's `model` is the model that
   actually wrote it; the three validators check only the token form.
+  One model call may take `WORKER_TIMEOUT_S` (210 s since `0.2.20`; 100 s cut
+  off five of six attempts on 2026-10-04, each still billed), with
+  `HTTP_TIMEOUT_S` below it so the worker returns a classified failure, and
+  `OPENROUTER_TIMEOUT_S` above two calls. The collector renews the heartbeat
+  right before the model call: a long tick plus the 300-second pause must stay
+  inside the 900-second health check.
   The chat set is the other exception, and only forward:
   it may be EXTENDED without a new epoch, never shrunk or reordered. The server
   decides — `deploy/extend_chat_set.sh` adds the chat to the receiver config,

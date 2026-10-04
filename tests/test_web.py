@@ -467,6 +467,7 @@ class TestBugDigestFailureRendering20261002(unittest.TestCase):
             "code": "finish_reason", "finish_reason": "content_filter",
             "native_finish_reason": "refusal", "completion_tokens": 12,
             "provider": "Amazon Bedrock", "generation_id": "gen-17-abc",
+            "model": "z-ai/glm-5.3",
         }, runs=[{"at": "2026-10-02T05:43:30+00:00", "result": "error",
                   "error_type": "OpenRouterError",
                   "error_detail": "finish_reason:content_filter"}])
@@ -474,7 +475,7 @@ class TestBugDigestFailureRendering20261002(unittest.TestCase):
         for text in ("2026-10-02T05:43:30", "код: finish_reason",
                      "finish: content_filter", "native: refusal",
                      "выходных токенов: 12", "провайдер: Amazon Bedrock",
-                     "id генерации: gen-17-abc",
+                     "id генерации: gen-17-abc", "модель: z-ai/glm-5.3",
                      "OpenRouterError (finish_reason:content_filter)"):
             self.assertIn(text, page)
 

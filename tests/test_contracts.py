@@ -28,6 +28,8 @@ from sunny_digest.models import DigestChat, SelectedMessage
 from sunny_digest.storage import canonical_json_bytes
 from sunny_digest.openrouter import (
     FALLBACK_MODEL,
+    HTTP_TIMEOUT_S,
+    WORKER_TIMEOUT_S,
     FALLBACK_PROVIDERS,
     OPENROUTER_URL,
     WORKER_FAILURE_EXIT,
@@ -1399,6 +1401,47 @@ class TestBugOpusRefusalFallback20261003(unittest.IsolatedAsyncioTestCase):
                     self.CHATS, "anthropic/claude-opus-5.5",
                     "sk-or-test-secret", revoked)
         self.assertEqual(len(calls), 1)
+
+
+
+class TestBugOpusWorkerTimeout20261004(unittest.IsolatedAsyncioTestCase):
+    """Длинный выпуск Opus не должен упираться в лимит воркера.
+
+    04.10.2026 пять попыток подряд упали `worker_timeout` на 100 с (промпт
+    ~33 тыс. токенов, 5800 выходных плюс размышление), уложилась лишь
+    шестая за 66 с; оборванные генерации оплачены. Лимит поднят до 210 с, а
+    HTTP-таймаут держится ниже, чтобы воркер успел вернуть классифицированный
+    отказ, а не был убит родителем."""
+
+    def test_limits_are_ordered_and_cover_both_attempts(self):
+        from sunny_digest.collector import OPENROUTER_TIMEOUT_S
+
+        self.assertGreaterEqual(WORKER_TIMEOUT_S, 200)
+        self.assertLess(HTTP_TIMEOUT_S, WORKER_TIMEOUT_S)
+        self.assertGreater(OPENROUTER_TIMEOUT_S, 2 * WORKER_TIMEOUT_S)
+
+    def test_request_uses_the_http_timeout(self):
+        with patch("urllib.request.OpenerDirector.open", return_value=FakeResponse(
+                content={"chats": []})) as opened:
+            blocking_fetch_response(
+                "prompt", "anthropic/claude-opus-5.5", "secret")
+        self.assertEqual(opened.call_args.kwargs["timeout"], HTTP_TIMEOUT_S)
+
+    async def test_worker_limit_is_the_named_constant(self):
+        worker = FakeHungWorker()
+        with patch("sunny_digest.openrouter.WORKER_TIMEOUT_S", 0.05), \
+                patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                      return_value=worker):
+            with self.assertRaises(OpenRouterError) as caught:
+                # внешний предел: литерал вместо константы дал бы зелёный,
+                # но долгий тест, а не красный
+                await asyncio.wait_for(create_digest(
+                    TestBugDigestLinksProductionPath20260818.CHATS,
+                    "anthropic/claude-opus-5.5", "sk-or-test-secret",
+                    asyncio.Event()), 5)
+        self.assertEqual(caught.exception.failure, {
+            "code": "worker_timeout", "model": "anthropic/claude-opus-5.5"})
+        self.assertTrue(worker.terminated)
 
 
 if __name__ == "__main__":

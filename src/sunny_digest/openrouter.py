@@ -64,6 +64,14 @@ MAX_WORKER_REQUEST_BYTES = 128 * 1024
 # поэтому message_id и peer_id не попадают даже в подпроцесс.
 WORKER_SCHEMA = "sunny.personal-chats.openrouter-worker.v3"
 WORKER_TERMINATE_GRACE_S = 2.0
+# 04.10.2026 пять попыток подряд упали `worker_timeout` на 100 с: промпт
+# растянутой ретроспективы вырос до ~33 тыс. токенов, а выпуск Opus 5.5 в
+# 5800 выходных токенов плюс размышление писался дольше; уложилась лишь
+# шестая (66 с), и оборванные генерации всё равно оплачены. Удачные выпуски
+# идут 60–70 с — лимит с двойным запасом. HTTP-таймаут (на чтение сокета)
+# ниже предела воркера, чтобы воркер успел вернуть классифицированный отказ.
+WORKER_TIMEOUT_S = 210
+HTTP_TIMEOUT_S = 200
 _SENDER_ALIAS = re.compile(r"(?<![\w-])participant-[1-9][0-9]*(?![\w-])", re.IGNORECASE)
 
 
@@ -454,7 +462,7 @@ def blocking_fetch_response(
     opener = urllib.request.build_opener(
         _TunnelHTTPSHandler(), _RefuseRedirects())
     try:
-        with opener.open(request, timeout=90) as response:
+        with opener.open(request, timeout=HTTP_TIMEOUT_S) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         # Раньше URLError: HTTPError — его подкласс. Код ответа и имя
@@ -712,7 +720,7 @@ async def _attempt_digest_inner(chats: List[DigestChat], prompt: str,
     cancelled = asyncio.create_task(revoked.wait())
     try:
         done, _ = await asyncio.wait(
-            (exchange, cancelled), timeout=100,
+            (exchange, cancelled), timeout=WORKER_TIMEOUT_S,
             return_when=asyncio.FIRST_COMPLETED,
         )
         if cancelled in done and revoked.is_set():

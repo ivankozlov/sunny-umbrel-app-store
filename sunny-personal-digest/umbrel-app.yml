@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Chats
-version: "0.2.19"
+version: "0.2.20"
 tagline: One daily digest and morning read receipts for selected chats
 description: >-
   Resolves message links for only the explicitly selected Telegram groups.
@@ -20,11 +20,11 @@ description: >-
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  When the primary model refuses to summarise the chats, the same prompt is
-  sent once to a fixed fallback model, GLM-5.3, through an allowlist of US and
-  European hosts with zero data retention and data collection denied. Such an
-  issue opens with a note naming the fallback. Other failures are not retried
-  by the fallback. The collector wire protocol remains 0.2.1.
+  A long daily digest no longer hits the 100-second model limit: each model
+  call may now take up to 210 seconds, and the collector heartbeat is renewed
+  before the call so the health check stays green. The status page also shows
+  which model a digest failure came from. The fallback on refusal, schedule
+  and collector wire protocol 0.2.1 are unchanged.
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store
 dependencies: []

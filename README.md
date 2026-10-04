@@ -92,7 +92,7 @@ provider message. The collector wire version remains `0.2.1`. Store enable commi
 `sha256:e482a79456551e213d7373e8fe654dcadb0b165b14bcc005fb1e1ee84f4c7a57`; the owner
 updated the device the same day.
 
-`0.2.19` is prepared as a disabled Phase-A package. The 0.2.18 status showed that
+`0.2.19`, published on 2026-10-03, follows the 0.2.18 status, which showed that
 Opus 5.5 refused the 2026-10-03 issue (`finish_reason=content_filter`,
 `native_finish_reason=refusal`, Amazon Bedrock) on the same input as the day before,
 and the stretched look-back kept that input in every later request. On a refusal
@@ -100,7 +100,19 @@ only, the same prompt now goes once to the fixed fallback `z-ai/glm-5.3`, pinned
 `provider.only` to US and European hosts, with `zdr=true`,
 `data_collection=deny` and `require_parameters=true`. The issue opens with a note
 naming the fallback, and the upload carries the model that actually wrote it. The
-collector wire version remains `0.2.1`. Publication and device Update are pending.
+collector wire version remains `0.2.1`. Store enable commit `8847d9f` pins index digest
+`sha256:fd94248e7812e4f85d0221fc5292cef7e12d76d21826a87c5707499b916a6d4c`; the owner
+updated the device the same day.
+
+`0.2.20` is prepared as a disabled Phase-A package. On 2026-10-04 the issue arrived
+only on the sixth attempt: five attempts failed `worker_timeout` at the 100-second
+worker limit (a ~33k-token prompt and a 5,800-token Opus answer), and the aborted
+generations were still billed. Each model call may now take `WORKER_TIMEOUT_S`
+(210 s) with the HTTP read timeout below it, the whole model step 450 s, and the
+heartbeat is renewed right before the call so a long tick plus the 300-second pause
+stays inside the 900-second health check. The status page now shows the failing
+model. The collector wire version remains `0.2.1`. Publication and device Update
+are pending.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.15` have public multi-arch images.

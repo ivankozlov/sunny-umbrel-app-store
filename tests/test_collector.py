@@ -3579,6 +3579,31 @@ class TestBugOpusRefusalFallback20261003(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["last_result"], "error")
             self.assertEqual(transport.digest_uploads, [])
 
+    async def test_heartbeat_is_fresh_before_the_model_call(self):
+        """04.10.2026: вызов модели может идти до 450 с — heartbeat обязан
+        обновиться перед ним, иначе тик с паузой выйдет за 900 с healthcheck."""
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            transport = FakeTransport(paths, gate(digest_due=True))
+            collector = collector_for(paths, FakeGateway(paths), transport)
+            seen = []
+
+            class HeartbeatEatingTunnel(FakeTunnel):
+                async def start(self):
+                    await super().start()
+                    paths.heartbeat.unlink()
+
+            async def checking_digest(*_args):
+                seen.append(paths.heartbeat.exists())
+                return "Общий дайджест"
+
+            collector.tunnel_factory = HeartbeatEatingTunnel
+            collector.digest_function = checking_digest
+            result = await collector.run_once()
+            self.assertEqual(result["last_result"], "uploaded_digest")
+            self.assertEqual(seen, [True])
+
     async def test_primary_digest_keeps_the_configured_model(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = make_paths(Path(temporary))

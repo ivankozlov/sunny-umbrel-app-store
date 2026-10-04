@@ -100,9 +100,10 @@ TELEGRAM_SETUP_TIMEOUT_S = 90
 TELEGRAM_DIALOG_TIMEOUT_S = 120
 TELEGRAM_FETCH_TIMEOUT_S = 180
 KEYGEN_TIMEOUT_S = 30
-# Два вызова подряд: отказ основной модели (~10–25 с, 03.10.2026) и запасная;
-# каждый воркер ограничен своими 100 с, общий предел их покрывает.
-OPENROUTER_TIMEOUT_S = 240
+# Два вызова подряд: отказ основной модели (03.10.2026) и запасная; каждый
+# воркер ограничен WORKER_TIMEOUT_S (210 с с 04.10.2026), общий предел
+# покрывает оба с запасом на запуск процессов.
+OPENROUTER_TIMEOUT_S = 450
 # Пометка в начале выпуска: Иван должен знать, что пересказ сделала не та
 # модель, что обычно, и почему.
 FALLBACK_DIGEST_NOTE = (
@@ -2883,6 +2884,11 @@ class Collector:
             tunnel = self.tunnel_factory(self.paths, settings["upload"])
             await tunnel.start()
             try:
+                # Вызов модели теперь может идти до 450 с: heartbeat
+                # обновляется перед ним, чтобы тик вместе с паузой 300 с не
+                # вышел за 900 с healthcheck и Umbrel не счёл живой collector
+                # мёртвым (04.10.2026).
+                atomic_write_bytes(self.paths.heartbeat, b"ok\n", 0o600)
                 digest_result = await self._bounded_external(
                     self.digest_function(
                         digest_chats, settings["openrouter_model"],
