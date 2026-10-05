@@ -116,13 +116,25 @@ pins index digest
 `sha256:379bb3dd3eb583ec5bfd9a2584f6d78c4a7f70543009a32dcf29cef23f4e0a49`; the owner
 updated the device the same day.
 
-`0.2.21` is prepared as a disabled Phase-A package. On 2026-10-05 the first attempt
+`0.2.21`, published on 2026-10-05, follows that day's first attempt, which
 failed `content_not_json`: Opus 5.5 finished cleanly with 5,020 tokens that did not
 parse as JSON (Amazon Bedrock) — `response_format: json_object` is a request, not a
 guarantee, for Anthropic models — and the billed issue slipped one tick. The answer
 is now parsed strictly first, then without a markdown fence, then from the first `{`
-to the last `}`; `render_digest` still validates the structure as strictly. The
-collector wire version remains `0.2.1`. Publication and device Update are pending.
+to the last `}`; `render_digest` still validates the structure as strictly, and a
+recovered answer with no topics at all stays `content_not_json`. The collector wire
+version remains `0.2.1`. Store enable commit `6cb7102` pins index digest
+`sha256:210d57f7e8525c65490ac16d5d4ed8991ab9d7da45e4292cc030eb16acf5c27c`; the owner
+updated the device the same day.
+
+`0.2.22` is prepared as a disabled Phase-A package. The 2026-10-06 issue listed all
+37 URLs of one conference post under a single link: since `0.2.14` the parent added
+every direct URL of a referenced message, and the model saw only their count. The
+prompt now carries a numbered list of link labels per message (visible anchor text
+or visible URL, never a hidden target); the model picks at most three main materials
+per topic or link, and the parent adds a single `+N ссылок — в сообщении` line for
+the rest. Notes are trimmed on a word boundary. The collector wire version remains
+`0.2.1`. Publication and device Update are pending.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.15` have public multi-arch images.

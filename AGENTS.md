@@ -325,10 +325,21 @@ content, receiver keys, or rendered runtime configuration.
 - Task 235 (released in `0.2.14`): keep direct HTTP(S) material URLs
   from `MessageEntityUrl` and `MessageEntityTextUrl` in the parent-only
   `SelectedMessage.material_urls`. Decode visible URL offsets against the ORIGINAL
-  UTF-16 message, before stripping whitespace. The prompt gets only `material_count`
-  in addition to the existing text; the parent inserts source URLs before the
-  Telegram permalink for each selected reference. Hidden URL targets must not be
-  added to the worker request. TNN deletes messages after 24 hours, so a Telegram
+  UTF-16 message, before stripping whitespace. Hidden URL targets must not be
+  added to the worker request. Since `0.2.22` (owner's decision of 2026-10-06,
+  after one issue dumped all 37 URLs of a conference post) the prompt gets, per
+  message, a numbered `materials` list of LABELS only — the visible anchor text
+  of a `TextUrl` or the visible URL text itself, never a hidden target — and the
+  model picks at most `MAX_ITEM_MATERIALS` (3) per topic (`{"n","i"}`) or link
+  (`[i]`). The parent inserts only those URLs, accepts a pick only for a message
+  among that item's refs and an existing index, and adds one
+  `+N ссылок — в сообщении` line for the rest before the source permalink ("в
+  исходных сообщениях" when the materials are not in that permalinked message).
+  No pick means no material URLs, never "all of them". The row lists at most
+  `MAX_PROMPT_MATERIALS` (20) labels, and first-row truncation drops the labels
+  before giving up: a row must stay bounded, or a dense post overflows a narrow
+  per-chat share and fails the whole day. Text fields are trimmed on a word
+  boundary with an ellipsis. TNN deletes messages after 24 hours, so a Telegram
   permalink alone loses access to the material. This adds no Telegram requests;
   links already deleted before the daily fetch cannot be recovered.
 - Task 238 (`0.2.15`, published 2026-09-18): each topic uses the earliest available source

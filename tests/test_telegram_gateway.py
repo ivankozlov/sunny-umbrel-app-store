@@ -187,7 +187,7 @@ class TestBugDigestMaterialLinks20260914(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected.material_urls, (url,))
         self.assertLessEqual(prompt_size(result.messages), budget)
         rendered = render_digest_prompt([DigestChat("TNN", result.messages)])
-        self.assertIn('"material_count":1', rendered)
+        self.assertIn('"materials":[{"i":1,"label":', rendered)
         self.assertNotIn(url, rendered)
 
 

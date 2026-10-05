@@ -220,13 +220,91 @@ def _utf16_units(value: str) -> int:
 
 
 def _clean(value: Any, limit: int) -> str:
-    """Строка из ответа модели: обрезаем и чистим, но не доверяем длине."""
+    """Строка из ответа модели: обрезаем и чистим, но не доверяем длине.
+
+    Обрезка — по границе слова и с «…»: 06.10.2026 описание ссылки
+    обрывалось на «CTO Mozi»."""
     if not isinstance(value, str):
         raise OpenRouterError(
             "OpenRouter digest field is not text", "structure_invalid",
             detail="field")
     text = " ".join(value.split())
-    return text[:limit]
+    if len(text) <= limit:
+        return text
+    cut = text[:limit - 1]
+    space = cut.rfind(" ")
+    if space >= limit // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,.;:—-") + "…"
+
+
+# Не больше трёх материалов на тему или ссылку (решение Ивана 06.10.2026):
+# выпуск за 06.10 вывалил под одной ссылкой все 37 URL исходного сообщения.
+MAX_ITEM_MATERIALS = 3
+
+
+def _plural_links(count: int) -> str:
+    tail = count % 100
+    if 11 <= tail <= 14:
+        word = "ссылок"
+    elif count % 10 == 1:
+        word = "ссылка"
+    elif 2 <= count % 10 <= 4:
+        word = "ссылки"
+    else:
+        word = "ссылок"
+    return f"{count} {word}"
+
+
+def _material_index(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        value = int(value)
+    return value if isinstance(value, int) and value >= 1 else None
+
+
+def _selected_materials(
+    material_urls: Dict[int, List[str]], refs: List[int], picks: Any,
+    default_ref: Optional[int] = None,
+) -> tuple[List[str], int, List[int]]:
+    """Выбранные моделью материалы и счёт оставшихся.
+
+    Модель видит у сообщения только подписи с номерами i; адрес подставляет
+    код. Принимаются лишь номера сообщений из refs этого пункта и
+    существующие i — выдуманное молча отбрасывается. Возвращает (выбранные
+    URL, сколько прямых ссылок осталось за кадром, у каких сообщений)."""
+    allowed = [ref for ref in refs if ref in material_urls]
+    chosen: List[str] = []
+    if isinstance(picks, list):
+        for pick in picks:
+            if isinstance(pick, dict):
+                number = _ref_number(pick.get("n"))
+                index = _material_index(pick.get("i"))
+            else:
+                number, index = default_ref, _material_index(pick)
+            if number not in allowed or index is None:
+                continue
+            urls = material_urls[number]
+            if index <= len(urls) and urls[index - 1] not in chosen:
+                chosen.append(urls[index - 1])
+            if len(chosen) >= MAX_ITEM_MATERIALS:
+                break
+    every = list(dict.fromkeys(url for ref in allowed for url in material_urls[ref]))
+    hidden = len([url for url in every if url not in chosen])
+    return chosen, hidden, allowed
+
+
+def _hidden_line(hidden: int, holders: List[int],
+                 source_ref: Optional[int]) -> List[str]:
+    """«+N ссылок — в сообщении» — только когда ссылки ровно в том
+    сообщении, куда ведёт «Сообщение»; иначе честно «в исходных»
+    (ревью 0.2.22: permalink темы — самый ранний ref, материалы — в другом)."""
+    if hidden <= 0:
+        return []
+    where = ("в сообщении" if source_ref is not None and holders == [source_ref]
+             else "в исходных сообщениях")
+    return [f"+{_plural_links(hidden)} — {where}"]
 
 
 def _ref_number(ref: Any) -> Optional[int]:
@@ -239,7 +317,7 @@ def _ref_number(ref: Any) -> Optional[int]:
 
 
 def _source_links(sources: Dict[int, str], material_urls: Dict[int, List[str]],
-                  ref: Any) -> List[str]:
+                  ref: Any, picks: Any = None) -> List[str]:
     """Прямые ссылки на материалы, затем ссылка на сообщение-источник.
 
     `isinstance(True, int)` — истина, поэтому bool отсекается явно: `ref: true`
@@ -248,29 +326,37 @@ def _source_links(sources: Dict[int, str], material_urls: Dict[int, List[str]],
     ref = _ref_number(ref)
     if ref is None:
         return []
-    urls = list(material_urls.get(ref, []))
-    return _mark_source_link(urls, sources.get(ref))
+    urls, hidden, holders = _selected_materials(
+        material_urls, [ref], picks, default_ref=ref)
+    source = sources.get(ref)
+    return _mark_source_link(
+        urls, source, _hidden_line(hidden, holders, ref if source else None))
 
 
 def _topic_links(sources: Dict[int, str], material_urls: Dict[int, List[str]],
-                 refs: List[Any]) -> List[str]:
-    """Материалы всех refs и один самый ранний доступный source permalink."""
-    urls: List[str] = []
+                 refs: List[Any], picks: Any = None) -> List[str]:
+    """До трёх выбранных материалов и один самый ранний source permalink."""
+    numbers: List[int] = []
     source_ref = None
     for ref in refs:
         number = _ref_number(ref)
         if number is None:
             continue
-        urls.extend(material_urls.get(number, []))
+        if number not in numbers:
+            numbers.append(number)
         if number in sources and (source_ref is None or number < source_ref):
             source_ref = number
-    return _mark_source_link(urls, sources.get(source_ref))
+    urls, hidden, holders = _selected_materials(material_urls, numbers, picks)
+    return _mark_source_link(
+        urls, sources.get(source_ref), _hidden_line(hidden, holders, source_ref))
 
 
-def _mark_source_link(urls: List[str], source: Optional[str]) -> List[str]:
+def _mark_source_link(urls: List[str], source: Optional[str],
+                      tail: Optional[List[str]] = None) -> List[str]:
     # 25.09: материал тоже бывает ссылкой в Telegram, включая приватный чат.
     # Только родитель знает происхождение URL; hostname не доказывает source.
     links = list(dict.fromkeys(url for url in urls if url != source))
+    links.extend(tail or [])
     if source:
         links.append(f"[Сообщение]({source})")
     return links
@@ -337,7 +423,7 @@ def render_digest(
             refs = topic.get("refs") or []
             if isinstance(refs, list):
                 lines.extend(_topic_links(
-                    sources, material_urls or {}, refs))
+                    sources, material_urls or {}, refs, topic.get("materials")))
             lines.append("")
 
         link_lines = []
@@ -352,7 +438,8 @@ def render_digest(
                 _restore_sender_names(row.get("title", ""), names), 200)
             link_lines.append(f"• {entry}" + (f" — {note}" if note else ""))
             ref = row.get("ref")
-            for link in _source_links(sources, material_urls or {}, ref):
+            for link in _source_links(
+                    sources, material_urls or {}, ref, row.get("materials")):
                 link_lines.append(f"  {link}")
 
         if not lines and not link_lines:

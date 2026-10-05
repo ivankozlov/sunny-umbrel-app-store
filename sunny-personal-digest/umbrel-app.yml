@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Chats
-version: "0.2.21"
+version: "0.2.22"
 tagline: One daily digest and morning read receipts for selected chats
 description: >-
   Resolves message links for only the explicitly selected Telegram groups.
@@ -20,11 +20,11 @@ description: >-
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  A model answer wrapped in a markdown code block or surrounded by a short
-  sentence is no longer discarded as "not JSON": the JSON object is extracted
-  and then checked exactly as strictly as before. This saves a billed retry
-  and a delayed issue. Models, schedule and collector wire protocol 0.2.1 are
-  unchanged.
+  Digest topics and links no longer dump every URL of a message. The model
+  now sees the labels of a message's links and picks at most three main
+  materials; the rest are counted in one "+N links in the message" line next
+  to the message link. Long notes are cut on a word with an ellipsis. Models,
+  schedule and collector wire protocol 0.2.1 are unchanged.
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store
 dependencies: []

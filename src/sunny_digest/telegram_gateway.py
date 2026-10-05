@@ -190,6 +190,20 @@ def _truncate_first_to_budget(message: SelectedMessage,
     """Fit one anomalously large row into the caller's per-chat budget."""
     if prompt_size(list(prefix_messages) + [message], chat_title) <= max_prompt_bytes:
         return message
+    # Сначала режется текст; если строка не влезает и пустой, уходят подписи
+    # материалов (ревью 0.2.22): до 20 подписей по 80 символов способны
+    # переполнить узкую долю чата, а при `material_count` такого не было.
+    for labels in (message.material_labels, ()):
+        fitted = _fit_text(message, labels, max_prompt_bytes, chat_title,
+                           prefix_messages)
+        if fitted is not None:
+            return fitted
+    raise ValueError("one Telegram message cannot fit the prompt budget")
+
+
+def _fit_text(message: SelectedMessage, labels: Tuple[str, ...],
+              max_prompt_bytes: int, chat_title: Optional[str],
+              prefix_messages: Sequence[SelectedMessage]) -> Optional[SelectedMessage]:
     suffix = "\n[обрезано]"
     low, high = 0, len(message.text)
     best = ""
@@ -198,7 +212,7 @@ def _truncate_first_to_budget(message: SelectedMessage,
         candidate_text = message.text[:middle].rstrip() + suffix
         candidate = SelectedMessage(
             message.message_id, message.sender_id, message.sent_at,
-            candidate_text, message.sender_name, message.material_urls)
+            candidate_text, message.sender_name, message.material_urls, labels)
         if (prompt_size(list(prefix_messages) + [candidate], chat_title)
                 <= max_prompt_bytes):
             best = candidate_text
@@ -206,13 +220,20 @@ def _truncate_first_to_budget(message: SelectedMessage,
         else:
             high = middle - 1
     if not best:
-        raise ValueError("one Telegram message cannot fit the prompt budget")
+        return None
     return SelectedMessage(
         message.message_id, message.sender_id, message.sent_at, best,
-        message.sender_name, message.material_urls)
+        message.sender_name, message.material_urls, labels)
+
+
+MATERIAL_LABEL_UTF16 = 80
 
 
 def _message_material_urls(message: Any) -> Tuple[str, ...]:
+    return _message_materials(message)["material_urls"]
+
+
+def _message_materials(message: Any) -> Dict[str, Tuple[str, ...]]:
     """Прямые HTTP(S)-ссылки из уже полученного сообщения, без запросов.
 
     TNN удаляет сообщения через сутки (задача 235): ссылка на сообщение
@@ -221,23 +242,30 @@ def _message_material_urls(message: Any) -> Tuple[str, ...]:
     """
     raw = str(message.message or "").encode("utf-16-le")
     urls: List[str] = []
+    labels: List[str] = []
     for entity in getattr(message, "entities", None) or ():
         kind = type(entity).__name__
+        if kind not in ("MessageEntityTextUrl", "MessageEntityUrl"):
+            continue
+        offset = getattr(entity, "offset", None)
+        length = getattr(entity, "length", None)
+        visible = None
+        if (isinstance(offset, int) and isinstance(length, int)
+                and offset >= 0 and length > 0
+                and (offset + length) * 2 <= len(raw)):
+            try:
+                visible = raw[offset * 2:(offset + length) * 2].decode("utf-16-le")
+            except UnicodeDecodeError:
+                visible = None
         if kind == "MessageEntityTextUrl":
             url = entity.url
-        elif kind == "MessageEntityUrl":
-            offset, length = entity.offset, entity.length
-            if offset < 0 or length <= 0 or (offset + length) * 2 > len(raw):
+        else:
+            if visible is None:
                 continue
-            try:
-                url = raw[offset * 2:(offset + length) * 2].decode("utf-16-le")
-            except UnicodeDecodeError:
-                continue
+            url = visible
             # Telegram распознаёт и ссылки без схемы: example.org/article.
             if "://" not in url:
                 url = "https://" + url
-        else:
-            continue
         if (not isinstance(url, str) or not url
                 or any(char.isspace() or unicodedata.category(char) in
                        ("Cc", "Cf", "Cs") for char in url)):
@@ -252,7 +280,11 @@ def _message_material_urls(message: Any) -> Tuple[str, ...]:
             continue
         if url not in urls:
             urls.append(url)
-    return tuple(urls)
+            # Подпись — только видимый текст сообщения: скрытый адрес
+            # TextUrl в промпт не уходит (задача 235).
+            label = _clean_text(visible or "", max_utf16_units=MATERIAL_LABEL_UTF16)
+            labels.append(label or "ссылка")
+    return {"material_urls": tuple(urls), "material_labels": tuple(labels)}
 
 
 def _clean_text(value: Any, *, max_utf16_units: Optional[int] = None) -> str:
@@ -821,7 +853,7 @@ class TelethonGateway:
                     sender_name=(
                         sender_name if sender_name != UNKNOWN_SENDER else None
                     ),
-                    material_urls=_message_material_urls(message),
+                    **_message_materials(message),
                 )
                 if (prompt_size(prefix + selected + [candidate], chat_title)
                         > max_prompt_bytes):

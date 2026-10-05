@@ -838,6 +838,7 @@ class TestBugDigestTopicSource20260918(unittest.TestCase):
         sources = {n: f"https://t.me/c/123/{100+n}" for n in range(1, 7)}
         answer = {"chats": [{"chat": "Тест", "topics": [{
             "title": "Тема", "summary": "Суть", "refs": [6, 5, 4, 3, 2, 1],
+            "materials": [{"n": 1, "i": 1}, {"n": 6, "i": 1}],
         }], "links": []}]}
         text = render_digest(answer, sources, material_urls={
             1: ["https://example.org/earliest"],
@@ -857,6 +858,7 @@ class TestBugDigestTopicSource20260918(unittest.TestCase):
                      4: ["https://example.org/a", "https://example.org/b"]}
         answer = {"chats": [{"chat": "Тест", "topics": [{
             "title": "Тема", "summary": "Суть", "refs": [True, 2, "4", 3, "oops"],
+            "materials": [{"n": 2, "i": 1}, {"n": 4, "i": 2}, {"n": 4, "i": 1}],
         }], "links": []}]}
         text = render_digest(answer, sources, material_urls=materials)
         self.assertEqual(text.count("https://t.me/c/123/103"), 1)
@@ -879,6 +881,7 @@ class TestBugDigestMaterialLinksProductionPath20260914(unittest.IsolatedAsyncioT
         ], "https://t.me/c/9876543210")]
         answer = {"chats": [{"chat": "TNN", "topics": [{
             "title": "Тема", "summary": "Суть", "refs": [3, "1", 2],
+            "materials": [{"n": 2, "i": 1}, {"n": 3, "i": 1}],
         }], "links": []}]}
         worker = FakeAnsweringWorker(answer)
         with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
@@ -904,7 +907,9 @@ class TestBugDigestMaterialLinksProductionPath20260914(unittest.IsolatedAsyncioT
         answer = {"chats": [{"chat": "TNN", "topics": [{
             "title": "Исследование", "summary": "participant-1 поделилась статьёй",
             "refs": [2, 2, True, 999],
-        }], "links": [{"title": "Статья", "note": "Разбор", "ref": "2"}]}]}
+            "materials": [{"n": 2, "i": 1}, {"n": 2, "i": 2}, {"n": 999, "i": 1}],
+        }], "links": [{"title": "Статья", "note": "Разбор", "ref": "2",
+                       "materials": [1, "2", 7]}]}]}
         worker = FakeAnsweringWorker(answer)
         with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
                    return_value=worker):
@@ -921,14 +926,16 @@ class TestBugDigestMaterialLinksProductionPath20260914(unittest.IsolatedAsyncioT
         request = json.loads(worker.stdin.data)
         for local_only in (*chats[1].messages[0].material_urls, "9876543210", "Алиса"):
             self.assertNotIn(local_only, request["prompt"])
-        self.assertIn('"material_count":2', request["prompt"])
+        # модели — только номера и подписи; адреса остаются у родителя
+        self.assertIn('"materials":[{"i":1,"label":', request["prompt"])
+        self.assertIn('{"i":2,"label":', request["prompt"])
 
     async def test_material_without_telegram_permalink_and_invalid_refs(self):
         url = "https://example.org/paper"
         chats = [DigestChat("TNN", [SelectedMessage(
             91, 8, NOW, "Исследование", material_urls=(url,))])]
         answer = {"chats": [{"chat": "TNN", "topics": [], "links": [
-            {"title": "Материал", "ref": 1},
+            {"title": "Материал", "ref": 1, "materials": [1]},
             {"title": "Ошибочный номер", "ref": True},
             {"title": "Выдуманный номер", "ref": 999,
              "url": "https://invented.example/paper"},
@@ -1532,6 +1539,138 @@ class TestBugEmptySkeletonInProse20261005(unittest.IsolatedAsyncioTestCase):
     async def test_clean_empty_answer_stays_a_quiet_day(self):
         digest = await self._digest({"generation_id": "gen-c"})
         self.assertIn("ничего существенного", digest)
+
+
+
+class TestBugMaterialFlood20261006(unittest.TestCase):
+    """Не больше трёх выбранных материалов на пункт и счёт остальных.
+
+    06.10.2026 под ссылкой на конференцию DigiTec вывалились все 37 URL
+    исходного сообщения (LinkedIn каждого спикера, сайты компаний,
+    Википедия): код 0.2.14 подставлял каждый прямой URL сообщения, а модель
+    видела лишь их число. Решение Ивана: модель выбирает до трёх главных
+    по подписям, код подставляет адреса и пишет «+N ссылок — в сообщении»."""
+
+    URLS = [f"https://site{i}.example/page" for i in range(1, 38)]
+
+    def _render(self, link):
+        from sunny_digest.openrouter import render_digest
+        answer = {"chats": [{"chat": "Чат", "topics": [], "links": [link]}]}
+        return render_digest(answer, {1: "https://t.me/c/1/2103"},
+                             material_urls={1: self.URLS})
+
+    def test_three_picks_and_a_counted_tail(self):
+        text = self._render({"title": "Конференция", "note": "Зачем идти",
+                             "ref": 1, "materials": [3, 1, 2, 4, 5]})
+        shown = [url for url in self.URLS if url in text]
+        self.assertEqual(shown, [self.URLS[0], self.URLS[1], self.URLS[2]])
+        self.assertIn("+34 ссылки — в сообщении", text)
+        self.assertIn("[Сообщение](https://t.me/c/1/2103)", text)
+        self.assertLess(text.index("+34 ссылки"), text.index("[Сообщение]"))
+
+    def test_no_picks_means_no_flood(self):
+        text = self._render({"title": "Конференция", "ref": 1})
+        self.assertFalse(any(url in text for url in self.URLS))
+        self.assertIn("+37 ссылок — в сообщении", text)
+
+    def test_invented_or_foreign_picks_are_dropped(self):
+        from sunny_digest.openrouter import render_digest
+        answer = {"chats": [{"chat": "Чат", "topics": [{
+            "title": "Тема", "summary": "Суть", "refs": [1],
+            "materials": [{"n": 2, "i": 1}, {"n": 1, "i": 99},
+                          {"n": 1, "i": True}, {"n": 1, "i": "x"}, "junk"],
+        }], "links": []}]}
+        text = render_digest(answer, {1: "https://t.me/c/1/5"}, material_urls={
+            1: ["https://a.example/x"], 2: ["https://b.example/y"]})
+        self.assertNotIn("https://b.example/y", text)
+        self.assertNotIn("https://a.example/x", text)
+        self.assertIn("+1 ссылка — в сообщении", text)
+
+    def test_plural_forms(self):
+        from sunny_digest.openrouter import _plural_links
+        for count, expected in ((1, "1 ссылка"), (2, "2 ссылки"), (5, "5 ссылок"),
+                                (11, "11 ссылок"), (21, "21 ссылка"),
+                                (34, "34 ссылки"), (112, "112 ссылок")):
+            self.assertEqual(_plural_links(count), expected)
+
+    def test_long_note_is_cut_on_a_word_with_ellipsis(self):
+        from sunny_digest.openrouter import _clean
+        cut = _clean("слово " * 100 + "CTO Mozilla", 400)
+        self.assertTrue(cut.endswith("…"))
+        self.assertLessEqual(len(cut), 400)
+        self.assertTrue(cut[:-1].endswith("слово"))
+        self.assertEqual(_clean("коротко", 400), "коротко")
+
+
+class TestBugMaterialLabels20261006(unittest.TestCase):
+    """В промпт уходят подписи материалов, а не скрытые адреса."""
+
+    def test_labels_come_from_visible_text_only(self):
+        from sunny_digest.telegram_gateway import _message_materials
+
+        class Entity:
+            def __init__(self, kind, offset, length, url=None):
+                self.__class__ = type(kind, (), {})
+                self.offset, self.length, self.url = offset, length, url
+
+        text = "Спикер Rev Lebaredian и сайт digitec.am/en-US"
+        hidden = "https://www.linkedin.com/in/revlebaredian/"
+
+        class Message:
+            message = text
+            entities = [
+                Entity("MessageEntityTextUrl", text.index("Rev"), len("Rev Lebaredian"),
+                       url=hidden),
+                Entity("MessageEntityUrl", text.index("digitec"), len("digitec.am/en-US")),
+            ]
+
+        result = _message_materials(Message())
+        self.assertEqual(result["material_urls"],
+                         (hidden, "https://digitec.am/en-US"))
+        self.assertEqual(result["material_labels"],
+                         ("Rev Lebaredian", "digitec.am/en-US"))
+        row = render_digest_prompt([DigestChat("Чат", [SelectedMessage(
+            1, 7, NOW, text, None, result["material_urls"],
+            result["material_labels"])])])
+        self.assertIn('"label":"Rev Lebaredian"', row)
+        self.assertNotIn("linkedin.com", row)
+
+
+
+class TestBugMaterialReview20261006(unittest.TestCase):
+    """Ревью 0.2.22: ограниченная строка промпта и честное «где остальное»."""
+
+    def test_prompt_lists_at_most_twenty_materials(self):
+        urls = tuple(f"https://s{i}.example/p" for i in range(50))
+        row = render_digest_prompt([DigestChat("Чат", [SelectedMessage(
+            1, 7, NOW, "пост", None, urls, tuple("Подпись" for _ in urls))])])
+        self.assertIn('{"i":20,"label":', row)
+        self.assertNotIn('{"i":21,', row)
+
+    def test_dense_post_survives_a_narrow_budget_by_dropping_labels(self):
+        from sunny_digest.telegram_gateway import _truncate_first_to_budget
+        urls = tuple(f"https://s{i}.example/p" for i in range(20))
+        labels = tuple("Очень длинная подпись ссылки " * 3 for _ in urls)
+        message = SelectedMessage(1, 7, NOW, "текст " * 400, None, urls, labels)
+        budget = prompt_size([SelectedMessage(1, 7, NOW, "x", None, urls)]) + 300
+        self.assertGreater(prompt_size([SelectedMessage(
+            1, 7, NOW, "", None, urls, labels)]), budget)
+        fitted = _truncate_first_to_budget(message, budget, None)
+        self.assertLessEqual(prompt_size([fitted]), budget)
+        self.assertEqual(fitted.material_urls, urls)
+        self.assertEqual(fitted.material_labels, ())
+
+    def test_tail_names_the_right_place(self):
+        from sunny_digest.openrouter import render_digest
+        answer = {"chats": [{"chat": "Чат", "topics": [{
+            "title": "Тема", "summary": "Суть", "refs": [1, 2]}], "links": []}]}
+        text = render_digest(answer, {1: "https://t.me/c/1/10",
+                                      2: "https://t.me/c/1/11"},
+                             material_urls={2: ["https://a.example/x"]})
+        self.assertIn("+1 ссылка — в исходных сообщениях", text)
+        same = render_digest(answer, {1: "https://t.me/c/1/10"},
+                             material_urls={1: ["https://a.example/x"]})
+        self.assertIn("+1 ссылка — в сообщении", same)
 
 
 if __name__ == "__main__":
