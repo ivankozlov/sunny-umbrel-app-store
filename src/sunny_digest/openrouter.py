@@ -515,15 +515,47 @@ def blocking_fetch_response(
         raise OpenRouterError(
             "OpenRouter response shape is invalid", "response_invalid",
             **facts) from None
-    try:
-        parsed = json.loads(content)
-    except ValueError:
+    parsed, recovered = _parse_answer_json(content)
+    if parsed is _NOT_JSON:
         raise OpenRouterError(
-            "OpenRouter answer is not JSON", "content_not_json", **facts) from None
+            "OpenRouter answer is not JSON", "content_not_json", **facts)
     usage = _usage_summary(body.get("usage"))
-    meta = {key: facts[key] for key in ("generation_id", "provider")
-            if key in facts}
+    meta: Dict[str, Any] = {key: facts[key] for key in ("generation_id", "provider")
+                            if key in facts}
+    if recovered:
+        meta["recovered"] = True
     return {"answer": parsed, "usage": usage, "meta": meta}
+
+
+_NOT_JSON = object()
+_FENCE = re.compile(r"\A```[A-Za-z0-9_-]*[ \t]*\n(?P<body>.*?)\n?```[ \t]*\Z", re.DOTALL)
+
+
+def _parse_answer_json(content: str) -> tuple[Any, bool]:
+    """JSON ответа модели — строго, затем без обёртки, затем по фигурным скобкам.
+
+    05.10.2026 Opus 5.5 ответил 5020 токенами, которые не разобрались как
+    JSON (`content_not_json`): `response_format: json_object` у моделей
+    Anthropic — просьба, а не гарантия, и ответ бывает обёрнут в markdown-блок
+    или окружён фразой. Попытка оплачена и сдвигала выпуск на тик. Здесь
+    только извлечение: структуру дальше проверяет `render_digest` так же
+    строго, и мусор по-прежнему отбраковывается."""
+    try:
+        return json.loads(content), False
+    except ValueError:
+        pass
+    stripped = content.strip()
+    fenced = _FENCE.match(stripped)
+    candidates = [fenced.group("body")] if fenced else []
+    start, end = stripped.find("{"), stripped.rfind("}")
+    if 0 <= start < end:
+        candidates.append(stripped[start:end + 1])
+    for candidate in candidates:
+        try:
+            return json.loads(candidate), True
+        except ValueError:
+            continue
+    return _NOT_JSON, False
 
 
 def _response_facts(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -766,6 +798,16 @@ async def _attempt_digest_inner(chats: List[DigestChat], prompt: str,
     try:
         try:
             digest = _render_and_validate(response["answer"], chats)
+            meta = response.get("meta")
+            if (digest == NOTHING_NOTABLE and isinstance(meta, dict)
+                    and meta.get("recovered") is True):
+                # Ревью 0.2.21 (05.10.2026): «пустой валидный результат —
+                # худший отказ». Проза вокруг скелета с пустыми разделами
+                # («не могу пересказать… {"chats":[…]}») не должна молча стать
+                # тихим днём; чистый пустой ответ без обёртки по-прежнему законен.
+                raise OpenRouterError(
+                    "OpenRouter answer is an empty skeleton inside prose",
+                    "content_not_json", detail="empty_recovered")
         except OpenRouterError:
             raise
         except Exception:

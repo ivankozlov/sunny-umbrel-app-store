@@ -125,6 +125,16 @@ content, receiver keys, or rendered runtime configuration.
   `OPENROUTER_TIMEOUT_S` above two calls. The collector renews the heartbeat
   right before the model call: a long tick plus the 300-second pause must stay
   inside the 900-second health check.
+- Since `0.2.21` the answer text is parsed strictly, then without a markdown
+  fence, then from the first `{` to the last `}` (`_parse_answer_json`):
+  `response_format: json_object` is only a request for Anthropic models, and on
+  2026-10-05 a clean 5,020-token Opus answer failed `content_not_json`. This is
+  extraction only — `render_digest` keeps validating the structure as strictly,
+  so do not relax those checks to "help" the parser. A recovered answer that
+  renders to all-empty sections is still `content_not_json`
+  (`empty_recovered`): prose around an empty skeleton may be a soft refusal,
+  and an empty valid result must not close the day silently; a clean empty
+  answer without wrapping stays a legitimate quiet day.
   The chat set is the other exception, and only forward:
   it may be EXTENDED without a new epoch, never shrunk or reordered. The server
   decides — `deploy/extend_chat_set.sh` adds the chat to the receiver config,

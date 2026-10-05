@@ -104,15 +104,25 @@ collector wire version remains `0.2.1`. Store enable commit `8847d9f` pins index
 `sha256:fd94248e7812e4f85d0221fc5292cef7e12d76d21826a87c5707499b916a6d4c`; the owner
 updated the device the same day.
 
-`0.2.20` is prepared as a disabled Phase-A package. On 2026-10-04 the issue arrived
+`0.2.20`, published on 2026-10-04, follows that day's issue, which arrived
 only on the sixth attempt: five attempts failed `worker_timeout` at the 100-second
 worker limit (a ~33k-token prompt and a 5,800-token Opus answer), and the aborted
 generations were still billed. Each model call may now take `WORKER_TIMEOUT_S`
 (210 s) with the HTTP read timeout below it, the whole model step 450 s, and the
 heartbeat is renewed right before the call so a long tick plus the 300-second pause
 stays inside the 900-second health check. The status page now shows the failing
-model. The collector wire version remains `0.2.1`. Publication and device Update
-are pending.
+model. The collector wire version remains `0.2.1`. Store enable commit `d24b9bd`
+pins index digest
+`sha256:379bb3dd3eb583ec5bfd9a2584f6d78c4a7f70543009a32dcf29cef23f4e0a49`; the owner
+updated the device the same day.
+
+`0.2.21` is prepared as a disabled Phase-A package. On 2026-10-05 the first attempt
+failed `content_not_json`: Opus 5.5 finished cleanly with 5,020 tokens that did not
+parse as JSON (Amazon Bedrock) — `response_format: json_object` is a request, not a
+guarantee, for Anthropic models — and the billed issue slipped one tick. The answer
+is now parsed strictly first, then without a markdown fence, then from the first `{`
+to the last `}`; `render_digest` still validates the structure as strictly. The
+collector wire version remains `0.2.1`. Publication and device Update are pending.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.15` have public multi-arch images.

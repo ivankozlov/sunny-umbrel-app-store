@@ -28,6 +28,7 @@ from sunny_digest.models import DigestChat, SelectedMessage
 from sunny_digest.storage import canonical_json_bytes
 from sunny_digest.openrouter import (
     FALLBACK_MODEL,
+    render_digest,
     HTTP_TIMEOUT_S,
     WORKER_TIMEOUT_S,
     FALLBACK_PROVIDERS,
@@ -1442,6 +1443,95 @@ class TestBugOpusWorkerTimeout20261004(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.failure, {
             "code": "worker_timeout", "model": "anthropic/claude-opus-5.5"})
         self.assertTrue(worker.terminated)
+
+
+
+class TestBugAnswerNotJson20261005(unittest.TestCase):
+    """Обёрнутый JSON не должен стоить оплаченной попытки.
+
+    05.10.2026 Opus 5.5 ответил 5020 токенами с `finish_reason=stop`, но
+    ответ не разобрался как JSON (`content_not_json`, Amazon Bedrock):
+    выпуск ушёл на следующий тик, генерация оплачена. Извлечение терпимо к
+    markdown-обёртке и окружающей фразе, а структуру по-прежнему строго
+    проверяет `render_digest`."""
+
+    ANSWER = {"chats": [{"chat": "Чат", "topics": [
+        {"title": "Тема", "summary": "Итог { со скобками }", "refs": [1]}],
+        "links": []}]}
+
+    def _fetch(self, content):
+        body = {"id": "gen-j", "choices": [{
+            "finish_reason": "stop", "message": {"content": content}}]}
+        with patch("urllib.request.OpenerDirector.open",
+                   return_value=FakeRawResponse(body)):
+            return blocking_fetch_response(
+                "prompt", "anthropic/claude-opus-5.5", "secret")
+
+    def test_wrapped_answers_are_recovered(self):
+        raw = json.dumps(self.ANSWER, ensure_ascii=False, indent=2)
+        for content in (
+                raw,
+                f"```json\n{raw}\n```",
+                f"```\n{raw}\n```",
+                f"  ```JSON\n{raw}```  ",
+                f"Вот дайджест:\n{raw}\nГотово.",
+                f"Вот дайджест:\n```json\n{raw}\n```\nНадеюсь, полезно."):
+            with self.subTest(content=content[:30]):
+                self.assertEqual(self._fetch(content)["answer"], self.ANSWER)
+
+    def test_unrecoverable_answer_stays_content_not_json(self):
+        for content in ("Не могу помочь.", "```json\n{oops\n```",
+                        "{\"chats\": [", "} перевёрнуто {"):
+            with self.subTest(content=content):
+                with self.assertRaises(OpenRouterError) as caught:
+                    self._fetch(content)
+                self.assertEqual(caught.exception.failure["code"],
+                                 "content_not_json")
+
+    def test_recovery_is_flagged_in_meta(self):
+        raw = json.dumps(self.ANSWER, ensure_ascii=False)
+        self.assertNotIn("recovered", self._fetch(raw)["meta"])
+        self.assertTrue(self._fetch(f"```json\n{raw}\n```")["meta"]["recovered"])
+
+    def test_recovered_answer_is_still_checked_by_structure(self):
+        parsed = self._fetch("Ответ: {\"summary\": \"не та схема\"}")["answer"]
+        with self.assertRaises(OpenRouterError) as caught:
+            render_digest(parsed, {})
+        self.assertEqual(caught.exception.failure["code"], "structure_invalid")
+
+
+
+class TestBugEmptySkeletonInProse20261005(unittest.IsolatedAsyncioTestCase):
+    """Скелет с пустыми разделами в прозе — не тихий день.
+
+    Ревью 0.2.21: «Я не могу пересказывать эти переписки. {"chats":[…пусто…]}»
+    после извлечения по скобкам давал бы «ничего существенного» и закрывал
+    сутки молча. Правило проекта: пустой валидный результат — худший отказ."""
+
+    CHATS = TestBugDigestLinksProductionPath20260818.CHATS
+    SKELETON = {"chats": [{"chat": "Рабочий чат", "topics": [], "links": []}]}
+
+    async def _digest(self, meta):
+        worker = FakeAnsweringWorker(self.SKELETON)
+        response = json.loads(worker.raw)
+        response["meta"] = meta
+        worker.raw = canonical_json_bytes(response) + b"\n"
+        with patch("sunny_digest.openrouter.asyncio.create_subprocess_exec",
+                   return_value=worker):
+            return await create_digest(
+                self.CHATS, "anthropic/claude-opus-5.5", "sk-or-test-secret",
+                asyncio.Event())
+
+    async def test_recovered_empty_skeleton_is_a_failure(self):
+        with self.assertRaises(OpenRouterError) as caught:
+            await self._digest({"generation_id": "gen-e", "recovered": True})
+        self.assertEqual(caught.exception.failure["code"], "content_not_json")
+        self.assertEqual(caught.exception.failure["detail"], "empty_recovered")
+        self.assertEqual(caught.exception.failure["generation_id"], "gen-e")
+
+    async def test_clean_empty_answer_stays_a_quiet_day(self):
+        digest = await self._digest({"generation_id": "gen-c"})
+        self.assertIn("ничего существенного", digest)
 
 
 if __name__ == "__main__":
