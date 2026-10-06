@@ -127,14 +127,28 @@ version remains `0.2.1`. Store enable commit `6cb7102` pins index digest
 `sha256:210d57f7e8525c65490ac16d5d4ed8991ab9d7da45e4292cc030eb16acf5c27c`; the owner
 updated the device the same day.
 
-`0.2.22` is prepared as a disabled Phase-A package. The 2026-10-06 issue listed all
+`0.2.22`, published on 2026-10-05, follows that day's issue, which listed all
 37 URLs of one conference post under a single link: since `0.2.14` the parent added
 every direct URL of a referenced message, and the model saw only their count. The
 prompt now carries a numbered list of link labels per message (visible anchor text
 or visible URL, never a hidden target); the model picks at most three main materials
 per topic or link, and the parent adds a single `+N ссылок — в сообщении` line for
 the rest. Notes are trimmed on a word boundary. The collector wire version remains
-`0.2.1`. Publication and device Update are pending.
+`0.2.1`. Store enable commit `5465ae4` pins index digest
+`sha256:0c3d6bbeba4f650e0c54162bb77e38035b8db72d05be412ae69971b3914f7590`; the owner
+updated the device the same day.
+
+`0.2.23` is prepared as a disabled Phase-A package. It applies the digest guideline
+the owner approved on 2026-10-06 (drafted by three independent designers and a
+judge): dated header, a "Главное" block that only references action/high topics,
+outcome-first titles, one-line summaries, `importance`/`state`/`when` from the model
+with dates rendered only when the date appears in the source text, at most four
+topics per chat and an "Ещё" line, a news feed for chats marked as news, and a
+"💤 Без важного" line. Chat icons, short names and kinds are set in the UI and kept in
+`data/config/chat-display.json`, never in the public source. Rendering stays within
+what the Sunny worker already supports (tier A); bold, quotes and inline labels
+(tier B) need a renderer change and a worker release. The collector wire version
+remains `0.2.1`. Publication and device Update are pending.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.15` have public multi-arch images.

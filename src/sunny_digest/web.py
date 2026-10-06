@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict
 from urllib.parse import parse_qs
 
+from .layout import CHAT_EMOJI, CHAT_KINDS
 from .storage import canonical_json_bytes
 
 
@@ -208,6 +209,46 @@ def _render_digest_failure(value: Any) -> str:
             parts.append(f"{label}: {item}")
     return (f'<dt>Последний отказ выпуска</dt><dd><code>{_escape(at)}</code> '
             f'{_escape(" · ".join(parts))}</dd>')
+
+
+_KIND_LABELS = {"discussion": "обсуждение", "news": "новости"}
+
+
+def _render_chat_display(chats: Any, csrf: str) -> str:
+    """Значок, тип и короткое имя каждого чата для выпуска (гайдлайн 06.10).
+
+    Хранится только на Umbrel: названия чатов не попадают в публичный код."""
+    if not isinstance(chats, list):
+        return ""
+    forms = []
+    for row in chats:
+        if not isinstance(row, dict) or not isinstance(row.get("chat_id"), int):
+            continue
+        display = row.get("display") if isinstance(row.get("display"), dict) else {}
+        emoji_now = display.get("emoji") if display.get("emoji") in CHAT_EMOJI else CHAT_EMOJI[0]
+        kind_now = display.get("kind") if display.get("kind") in CHAT_KINDS else CHAT_KINDS[0]
+        short_now = display.get("short_name") if isinstance(display.get("short_name"), str) else ""
+        emoji_options = "".join(
+            f'<option value="{_escape(value)}"{" selected" if value == emoji_now else ""}>'
+            f'{_escape(value)}</option>' for value in CHAT_EMOJI)
+        kind_options = "".join(
+            f'<option value="{value}"{" selected" if value == kind_now else ""}>'
+            f'{_KIND_LABELS[value]}</option>' for value in CHAT_KINDS)
+        forms.append(f"""
+  <form method="post" class="row">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="set_chat_display">
+    <input type="hidden" name="chat_id" value="{int(row["chat_id"])}">
+    <strong>{_escape(row.get("title"))}</strong>
+    <select name="emoji">{emoji_options}</select>
+    <select name="kind">{kind_options}</select>
+    <input name="short_name" maxlength="34" placeholder="короткое имя" value="{_escape(short_now)}">
+    <button class="secondary" type="submit">Сохранить</button>
+  </form>""")
+    if not forms:
+        return ""
+    return ("<details><summary>Оформление выпуска</summary>"
+            "<p class=\"muted\">Значок и короткое имя чата видны в шапке раздела и в «Главном»; "
+            "тип «новости» включает ленту одной строкой на новость.</p>"
+            + "".join(forms) + "</details>")
 
 
 def _render_recent_runs(rows: Any) -> str:
@@ -426,6 +467,7 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
         if read_ack_error:
             read_ack = f"{read_ack} — {read_ack_error}"
         recent_rows = _render_recent_runs(status.get("recent_runs"))
+        display_forms = _render_chat_display(status.get("chats"), csrf)
         failure_row = _render_digest_failure(status.get("last_digest_failure"))
         repair_state_value = status.get("vpn_repair_state")
         repair_state = (
@@ -487,6 +529,7 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
   <dt>Ошибка замены VPN</dt><dd>{_escape(repair_error)}</dd>
 </dl>
 {recent_rows}
+{display_forms}
 <p class="muted">Добавьте этот публичный ключ в конфигурацию forced-command receiver’а Sunny:</p>
 <code>{_escape(status.get("upload_public_key") or "")}</code>
 <p class="muted">Fingerprint: {_escape(status.get("upload_key_fingerprint") or "—")}</p>
@@ -703,6 +746,16 @@ class Handler(BaseHTTPRequestHandler):
                     raise PermissionError("chat extension was not confirmed")
                 result = self.app.ipc.request(
                     "extend_chats", _one(form, "extension_message_link"))
+            elif action == "set_chat_display":
+                raw_id = _one(form, "chat_id")
+                if not re.fullmatch(r"-[1-9][0-9]{0,18}", raw_id or ""):
+                    raise ValueError("chat_id is invalid")
+                result = self.app.ipc.request("set_chat_display", {
+                    "chat_id": int(raw_id),
+                    "emoji": _one(form, "emoji"),
+                    "kind": _one(form, "kind"),
+                    "short_name": _one(form, "short_name") or None,
+                })
             elif action == "renew_consent":
                 if _one(form, "confirm_renew") != "yes":
                     raise PermissionError("consent renewal was not confirmed")

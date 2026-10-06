@@ -326,7 +326,7 @@ content, receiver keys, or rendered runtime configuration.
   from `MessageEntityUrl` and `MessageEntityTextUrl` in the parent-only
   `SelectedMessage.material_urls`. Decode visible URL offsets against the ORIGINAL
   UTF-16 message, before stripping whitespace. Hidden URL targets must not be
-  added to the worker request. Since `0.2.22` (owner's decision of 2026-10-06,
+  added to the worker request. Since `0.2.22` (owner's decision of 2026-10-05,
   after one issue dumped all 37 URLs of a conference post) the prompt gets, per
   message, a numbered `materials` list of LABELS only — the visible anchor text
   of a `TextUrl` or the visible URL text itself, never a hidden target — and the
@@ -352,6 +352,32 @@ content, receiver keys, or rendered runtime configuration.
   links; the worker cannot infer their role from a Telegram hostname or position.
   Deduplicate by the original URL before marking the source. No extra fetch or
   model input is needed. Deployment status is in `../docs/PERSONAL_DIGEST.md`.
+- Digest layout guideline (`0.2.23`, approved by the owner on 2026-10-06 after
+  calling the 2026-10-05 issue "фарш"; drafted by three independent designers and a
+  judge): `layout.py` renders it, the model only selects and words. Notices first;
+  then a dated header "☀️ Чаты · <weekday, day month>" with chat/topic counts and
+  "ещё N свёрнуто"; "⚡ Главное" — at most 4 lines, only for existing topics with
+  importance action/high, at most 2 per chat, ordered by code; chat sections in the
+  locked chat order, heading "<emoji> <name> · N" glued to its first topic (no blank
+  line, so the Sunny splitter can never leave it dangling); at most 4 topics per
+  chat, overflow and `low` go to one "Ещё:" line; topic block "▸|⚡ title", one
+  summary line, material lines, "+N ссылок", `[Сообщение](…)`, no blank lines
+  inside; chats of kind news render a one-line-per-item feed (max 8, "+ ещё N
+  новостей — в канале", a picked material stays before the permalink because TNN
+  deletes posts after a day); a chat with only minor items renders its heading
+  and one "Ещё" line, never silence — an all-low day must not become "nothing
+  notable" or a false `empty_recovered`; chats with nothing render only in "💤 Без
+  важного". Model chat names are matched case/space/punctuation-insensitively and
+  one entry is never shown under two chats; a topic `id` repeated in the issue is
+  ambiguous and never feeds "Главное"; `demoted_count` from the model means topics
+  it dropped entirely, the code adds what it folded itself. A
+  `when` date is shown only when that day and month appear in the referenced
+  message text — the model must not turn "в субботу" into a date. Above
+  `VOLUME_SOFT_LIMIT` normal-topic summaries are dropped first. Chat emoji, kind and
+  short name come from `data/config/chat-display.json`, set in the UI from a closed
+  palette and wiped by factory reset; never hard-code chat titles or icons in this
+  public source. Tier B (bold, blockquote/expandable details, inline labelled
+  links) needs a new Sunny renderer and a worker release — not in this package.
 - Every chat returning empty lists is an answer, not a failure — the prompt
   explicitly allows "nothing notable today", and the issue then says so in one
   line. An empty `chats` array is a failure: the model walked no chat at all.

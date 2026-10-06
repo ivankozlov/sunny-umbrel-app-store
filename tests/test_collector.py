@@ -3553,7 +3553,7 @@ class TestBugOpusRefusalFallback20261003(unittest.IsolatedAsyncioTestCase):
             outcomes = []
 
             async def refusing_then_late(chats, model, key, revoked,
-                                         before_fallback):
+                                         before_fallback, *_layout):
                 await before_fallback()          # внутри окна — проходит
                 outcomes.append("inside")
                 value = transport.value
@@ -3615,6 +3615,68 @@ class TestBugOpusRefusalFallback20261003(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["model"],
                              load_settings(paths)["openrouter_model"])
             self.assertNotIn("запасной моделью", payload["digest"])
+
+
+class TestChatDisplay20261006(unittest.IsolatedAsyncioTestCase):
+    """Значки чатов из UI: хранятся локально и доходят до раскладки выпуска."""
+
+    async def test_display_is_saved_shown_and_used_in_the_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            transport = FakeTransport(paths, gate(digest_due=True))
+            collector = collector_for(paths, FakeGateway(paths), transport)
+            seen = []
+
+            async def capturing(chats, model, key, revoked, before_fallback, layout):
+                seen.append(layout)
+                return "Общий дайджест"
+
+            collector.digest_function = capturing
+            status = await collector.set_chat_display({
+                "chat_id": CHAT_IDS[0], "emoji": "🏛", "kind": "news",
+                "short_name": " Клуб "})
+            self.assertEqual(status["last_result"], "chat_display_saved")
+            shown = {row["chat_id"]: row["display"] for row in status["chats"]}
+            self.assertEqual(shown[CHAT_IDS[0]],
+                             {"emoji": "🏛", "kind": "news", "short_name": "Клуб"})
+            self.assertEqual(shown[CHAT_IDS[1]]["emoji"], "💬")
+            await collector.run_once()
+            layout = seen[-1]
+            self.assertEqual([meta.emoji for meta in layout.chats], ["🏛", "💬"])
+            self.assertEqual(layout.chats[0].kind, "news")
+            self.assertEqual(layout.chats[0].short_name, "Клуб")
+            self.assertEqual(layout.digest_date.isoformat(),
+                             transport.value["digest"]["digest_date"])
+
+    async def test_bad_input_is_refused_and_broken_file_falls_back(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            collector = collector_for(
+                paths, FakeGateway(paths), FakeTransport(paths, gate()))
+            for data in (
+                    {"chat_id": -1, "emoji": "🏛", "kind": "news", "short_name": None},
+                    {"chat_id": CHAT_IDS[0], "emoji": "<b>", "kind": "news",
+                     "short_name": None},
+                    {"chat_id": CHAT_IDS[0], "emoji": "🏛"}):
+                with self.subTest(data=data), self.assertRaises(ValueError):
+                    await collector.set_chat_display(data)
+            paths.chat_display.write_text("{broken", encoding="utf-8")
+            status = await collector.public_status()
+            self.assertEqual({row["display"]["emoji"] for row in status["chats"]}, {"💬"})
+
+    async def test_reset_removes_display_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            collector = collector_for(
+                paths, FakeGateway(paths), FakeTransport(paths, gate()))
+            await collector.set_chat_display({
+                "chat_id": CHAT_IDS[0], "emoji": "🏛", "kind": "discussion",
+                "short_name": None})
+            self.assertTrue(paths.chat_display.exists())
+            self.assertIn(paths.chat_display, paths.reset_files())
 
 
 class TestRecentRunsJournal20260817(unittest.IsolatedAsyncioTestCase):

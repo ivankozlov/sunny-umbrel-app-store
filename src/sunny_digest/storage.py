@@ -129,6 +129,12 @@ class Paths:
         return self.config_dir / "settings.json"
 
     @property
+    def chat_display(self) -> Path:
+        # Значки, тип и короткие имена чатов для выпуска (гайдлайн 06.10.2026).
+        # Только локально: в публичный код названия чатов попадать не должны.
+        return self.config_dir / "chat-display.json"
+
+    @property
     def known_hosts(self) -> Path:
         return self.config_dir / "known_hosts"
 
@@ -224,6 +230,7 @@ class Paths:
     def reset_files(self) -> tuple[Path, ...]:
         return (
             self.settings,
+            self.chat_display,
             self.known_hosts,
             self.pending,
             self.acknowledged,

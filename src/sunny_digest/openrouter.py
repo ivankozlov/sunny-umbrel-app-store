@@ -14,9 +14,11 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .contracts import validate_digest_text, validate_llm_usage
 from .openrouter_tunnel import TUNNEL_HOST, TUNNEL_PORT
+from .layout import VOLUME_SOFT_LIMIT, ChatMeta, DigestLayout, render_layout
 from .models import DigestChat
 from .prompting import (
     digest_material_urls,
+    digest_message_texts,
     digest_sender_names,
     digest_sources,
     fit_by_lines,
@@ -222,7 +224,7 @@ def _utf16_units(value: str) -> int:
 def _clean(value: Any, limit: int) -> str:
     """Строка из ответа модели: обрезаем и чистим, но не доверяем длине.
 
-    Обрезка — по границе слова и с «…»: 06.10.2026 описание ссылки
+    Обрезка — по границе слова и с «…»: 05.10.2026 описание ссылки
     обрывалось на «CTO Mozi»."""
     if not isinstance(value, str):
         raise OpenRouterError(
@@ -238,8 +240,8 @@ def _clean(value: Any, limit: int) -> str:
     return cut.rstrip(" ,.;:—-") + "…"
 
 
-# Не больше трёх материалов на тему или ссылку (решение Ивана 06.10.2026):
-# выпуск за 06.10 вывалил под одной ссылкой все 37 URL исходного сообщения.
+# Не больше трёх материалов на тему или ссылку (решение Ивана 05.10.2026):
+# выпуск за 05.10 вывалил под одной ссылкой все 37 URL исходного сообщения.
 MAX_ITEM_MATERIALS = 3
 
 
@@ -369,20 +371,28 @@ def _restore_sender_names(value: Any, names: Dict[str, str]) -> Any:
         lambda match: names.get(match.group(0).lower(), match.group(0)), value)
 
 
+def _chat_key(title: str) -> str:
+    return " ".join("".join(
+        char if char.isalnum() else " " for char in title.casefold()).split())
+
+
 def render_digest(
     parsed: Any,
     sources: Dict[int, str],
     sender_names: Optional[Dict[str, Dict[str, str]]] = None,
     material_urls: Optional[Dict[int, List[str]]] = None,
+    layout: Optional[DigestLayout] = None,
+    message_texts: Optional[Dict[int, str]] = None,
 ) -> str:
     """Собрать текст выпуска из структурированного ответа.
 
     Ссылки подставляет КОД по порядковым номерам: модель их не пишет и
     Telegram-идентификаторов не видит. Номер вне карты источников молча
     отбрасывается — выдуманная моделью ссылка не должна дойти до Ивана.
-    Материалы стоят отдельными URL-строками, source — именованной ссылкой
-    «Сообщение». Sunny превращает их в нативные Telegram entities."""
-    if not isinstance(parsed, dict) or set(parsed) != {"chats"}:
+    Раскладку (шапка, «Главное», порядок и значки чатов, бюджеты, «Ещё»,
+    тихие чаты) считает `layout.render_layout` по гайдлайну 06.10.2026."""
+    if (not isinstance(parsed, dict) or "chats" not in parsed
+            or not set(parsed) <= {"chats", "lead", "demoted_count"}):
         raise OpenRouterError(
             "OpenRouter digest JSON has unexpected fields", "structure_invalid",
             detail="top_fields")
@@ -391,80 +401,117 @@ def render_digest(
         raise OpenRouterError(
             "OpenRouter digest chats are invalid", "structure_invalid",
             detail="chats")
-
-    blocks = []
+    if not chats:
+        # Пустые списки у каждого чата — ответ («ничего стоящего»), а пустой
+        # `chats` — уже не ответ: модель не прошла ни по одному чату.
+        raise OpenRouterError("OpenRouter digest has no chats", "no_chats")
+    entries: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
     for chat in chats:
-        if not isinstance(chat, dict) or set(chat) - {"chat", "topics", "links"}:
+        if not isinstance(chat, dict) or set(chat) - {
+                "chat", "topics", "links", "quiet", "more"}:
             raise OpenRouterError(
                 "OpenRouter digest chat is invalid", "structure_invalid",
                 detail="chat")
         title = _clean(chat.get("chat", ""), 160)
-        names = (sender_names or {}).get(title, {})
         topics = chat.get("topics") or []
         links = chat.get("links") or []
         if not isinstance(topics, list) or not isinstance(links, list):
             raise OpenRouterError(
                 "OpenRouter digest sections are invalid", "structure_invalid",
                 detail="sections")
-
-        lines = []
         for topic in topics:
             if not isinstance(topic, dict):
                 raise OpenRouterError(
                     "OpenRouter digest topic is invalid", "structure_invalid",
                     detail="topic")
-            topic_title = _clean(
-                _restore_sender_names(topic.get("title", ""), names), 200)
-            lines.append(f"▸ {topic_title}")
-            summary = _clean(
-                _restore_sender_names(topic.get("summary", ""), names), 4000)
-            if summary:
-                lines.append(summary)
-            refs = topic.get("refs") or []
-            if isinstance(refs, list):
-                lines.extend(_topic_links(
-                    sources, material_urls or {}, refs, topic.get("materials")))
-            lines.append("")
-
-        link_lines = []
         for row in links:
             if not isinstance(row, dict):
                 raise OpenRouterError(
                     "OpenRouter digest link is invalid", "structure_invalid",
                     detail="link")
-            note = _clean(
-                _restore_sender_names(row.get("note", ""), names), 400)
-            entry = _clean(
-                _restore_sender_names(row.get("title", ""), names), 200)
-            link_lines.append(f"• {entry}" + (f" — {note}" if note else ""))
-            ref = row.get("ref")
-            for link in _source_links(
-                    sources, material_urls or {}, ref, row.get("materials")):
-                link_lines.append(f"  {link}")
+        key = _chat_key(title)
+        if key not in entries:
+            order.append(title)
+            entries[key] = {"topics": [], "links": [], "more": []}
+        merged = entries[key]
+        merged["topics"].extend(topics)
+        merged["links"].extend(links)
+        if isinstance(chat.get("more"), list):
+            merged["more"].extend(chat["more"])
 
-        if not lines and not link_lines:
-            continue
-        block = [f"**{title}**", ""] if title else []
-        block.extend(lines)
-        if link_lines:
-            block.append("📎 Ссылки и материалы")
-            block.extend(link_lines)
-            block.append("")
-        blocks.append("\n".join(block).strip())
+    metas = list(layout.chats) if layout is not None else []
+    # Сопоставление без учёта регистра, пробелов и знаков: модель любит
+    # снимать эмодзи и кавычки из названия, и чат уходил сразу в «💤» и
+    # отдельным разделом в конец (ревью 0.2.23). Запись отдаётся одному
+    # чату: у двух зафиксированных с одинаковым названием она не дублируется.
+    used: set = set()
+    pairs = []
+    for meta in metas:
+        key = _chat_key(meta.title)
+        entry = None if key in used else entries.get(key)
+        used.add(key)
+        pairs.append((meta, entry))
+    # Чат, которого нет в настройках, не теряется: в конце со значком по умолчанию.
+    for title in order:
+        key = _chat_key(title)
+        if key not in used and title:
+            used.add(key)
+            pairs.append((ChatMeta(title), entries[key]))
 
-    if not blocks:
-        # Промпт прямо разрешает «за сутки ничего стоящего»: пустые списки у
-        # каждого чата — это ответ, а не сбой. Отказ здесь оборачивался бы
-        # ночным `missing_daily_digest` вместо честного тихого дня. Но пустой
-        # `chats` — уже не ответ: модель не прошла ни по одному чату.
-        if not chats:
-            raise OpenRouterError("OpenRouter digest has no chats", "no_chats")
+    names = sender_names or {}
+    materials = material_urls or {}
+    texts = message_texts or {}
+
+    def restore(value: Any, title: str) -> Any:
+        return _restore_sender_names(value, names.get(title, {}))
+
+    def ref_texts(refs: List[Any]) -> List[str]:
+        numbers = [_ref_number(ref) for ref in refs]
+        return [texts[number] for number in numbers if number in texts]
+
+    def news_link(row: Dict[str, Any]) -> List[str]:
+        # Выбранный материал стоит и при наличии permalink: TNN удаляет
+        # сообщения через сутки, и ссылка на пост одна не ведёт к статье
+        # (задача 235, ревью 0.2.23). Без выбора — один первый материал,
+        # только когда поста нет; хвост «+N» ленту не засоряет.
+        ref = _ref_number(row.get("ref"))
+        if ref is None:
+            return []
+        picked, _hidden, _holders = _selected_materials(
+            materials, [ref], row.get("materials"), default_ref=ref)
+        source = sources.get(ref)
+        lines = [url for url in picked if url != source]
+        if source:
+            return lines + [f"[Сообщение]({source})"]
+        return lines or list(materials.get(ref, [])[:1])
+
+    demoted = parsed.get("demoted_count")
+    demoted = demoted if (isinstance(demoted, int) and not isinstance(demoted, bool)
+                          and 0 <= demoted <= 999) else 0
+
+    def render(with_summaries: bool) -> Optional[str]:
+        return render_layout(
+            pairs,
+            digest_date=layout.digest_date if layout is not None else None,
+            lead=parsed.get("lead"), demoted_by_model=demoted, clean=_clean,
+            topic_links=lambda topic: _topic_links(
+                sources, materials,
+                topic.get("refs") if isinstance(topic.get("refs"), list) else [],
+                topic.get("materials")),
+            link_links=lambda row: _source_links(
+                sources, materials, row.get("ref"), row.get("materials")),
+            news_link=news_link, restore=restore, ref_texts=ref_texts,
+            with_summaries=with_summaries)
+
+    text = render(True)
+    if text is None:
         return NOTHING_NOTABLE
-    text = "\n\n".join(blocks).strip()
+    if _utf16_units(text) > VOLUME_SOFT_LIMIT:
+        text = render(False) or text
     if _utf16_units(text) <= MAX_DIGEST_CHARS:
         return text
-    # Модель может выдать больше, чем помещается в потолок дайджеста: тем
-    # много, каждая обрезана по отдельности, а их сумма никем не гейтится.
+    # Модель может выдать больше, чем помещается в потолок дайджеста.
     # Ронять из-за этого весь выпуск — худший исход, чем отдать начало.
     fitted = fit_by_lines(text, _utf16_units, MAX_DIGEST_CHARS)
     if fitted is None:
@@ -700,10 +747,11 @@ def blocking_fetch_answer(prompt: str, model: str, api_key: str) -> Any:
     return blocking_fetch_response(prompt, model, api_key)["answer"]
 
 
-def _render_and_validate(parsed: Any, chats: List[DigestChat]) -> str:
+def _render_and_validate(parsed: Any, chats: List[DigestChat],
+                         layout: Optional[DigestLayout] = None) -> str:
     digest = render_digest(
         parsed, digest_sources(chats), digest_sender_names(chats),
-        digest_material_urls(chats))
+        digest_material_urls(chats), layout, digest_message_texts(chats))
     try:
         validate_digest_text(digest, allow_empty=False)
     except ValueError as exc:
@@ -779,6 +827,7 @@ async def _bounded_worker_exchange(process: Any, request: bytes) -> bytes:
 async def create_digest(
     chats: List[DigestChat], model: str, api_key: str, revoked: asyncio.Event,
     before_fallback: Optional[Callable[[], Awaitable[None]]] = None,
+    layout: Optional[DigestLayout] = None,
 ) -> str:
     if not chats or not any(chat.messages for chat in chats):
         return ""
@@ -786,7 +835,7 @@ async def create_digest(
         raise asyncio.CancelledError
     prompt = _prompt(chats)
     try:
-        return await _attempt_digest(chats, prompt, model, api_key, revoked)
+        return await _attempt_digest(chats, prompt, model, api_key, revoked, layout)
     except OpenRouterError as exc:
         # Только отказ модели: сбой связи, структуры или таймаут второй
         # моделью не лечится и должен остаться виден как есть.
@@ -801,16 +850,18 @@ async def create_digest(
     if before_fallback is not None:
         await before_fallback()
     digest = await _attempt_digest(
-        chats, prompt, FALLBACK_MODEL, api_key, revoked)
+        chats, prompt, FALLBACK_MODEL, api_key, revoked, layout)
     return DigestText(str(digest), getattr(digest, "llm_usage", None),
                       model=FALLBACK_MODEL, fallback_after_refusal=True)
 
 
 async def _attempt_digest(chats: List[DigestChat], prompt: str, model: str,
-                          api_key: str, revoked: asyncio.Event) -> str:
+                          api_key: str, revoked: asyncio.Event,
+                          layout: Optional[DigestLayout] = None) -> str:
     """Один вызов модели в killable воркере; отказ несёт её id."""
     try:
-        return await _attempt_digest_inner(chats, prompt, model, api_key, revoked)
+        return await _attempt_digest_inner(
+            chats, prompt, model, api_key, revoked, layout)
     except OpenRouterError as exc:
         exc.failure = sanitize_failure({**exc.failure, "model": model}) or exc.failure
         raise
@@ -818,7 +869,8 @@ async def _attempt_digest(chats: List[DigestChat], prompt: str, model: str,
 
 async def _attempt_digest_inner(chats: List[DigestChat], prompt: str,
                                 model: str, api_key: str,
-                                revoked: asyncio.Event) -> str:
+                                revoked: asyncio.Event,
+                                layout: Optional[DigestLayout] = None) -> str:
     request = canonical_json_bytes({
         "schema": WORKER_SCHEMA,
         "prompt": prompt,
@@ -884,7 +936,7 @@ async def _attempt_digest_inner(chats: List[DigestChat], prompt: str,
     # родителя есть карта «номер → сообщение», и она никуда не уезжает.
     try:
         try:
-            digest = _render_and_validate(response["answer"], chats)
+            digest = _render_and_validate(response["answer"], chats, layout)
             meta = response.get("meta")
             if (digest == NOTHING_NOTABLE and isinstance(meta, dict)
                     and meta.get("recovered") is True):

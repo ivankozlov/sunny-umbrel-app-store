@@ -497,6 +497,27 @@ class TestBugDigestFailureRendering20261002(unittest.TestCase):
             self.assertNotIn(hostile, page)
 
 
+class TestChatDisplayRendering20261006(unittest.TestCase):
+    """Форма значков чатов: только палитра, всё экранируется."""
+
+    def test_form_lists_each_chat_with_current_choice(self):
+        value = status("chat_locked")
+        value["chats"] = [
+            {"chat_id": -1001, "title": "Клуб <b>", "kind": "channel",
+             "display": {"emoji": "🏛", "kind": "news", "short_name": "Клуб"}},
+            {"chat_id": -1002, "title": "Дом", "kind": "chat",
+             "display": {"emoji": "<script>", "kind": "evil", "short_name": None}},
+        ]
+        page = render_status(value, "a" * 64)
+        self.assertIn("Оформление выпуска", page)
+        self.assertIn('value="🏛" selected', page)
+        self.assertIn('value="news" selected', page)
+        self.assertIn('value="Клуб"', page)
+        self.assertIn('name="chat_id" value="-1002"', page)
+        self.assertNotIn("<script>", page)
+        self.assertNotIn("Клуб <b>", page)
+
+
 class TestRecentRunsRendering20260817(unittest.TestCase):
     """Журнал прогонов виден в интерфейсе и санитизируется как всё остальное."""
 

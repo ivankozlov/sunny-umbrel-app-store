@@ -27,6 +27,10 @@ from .mihomo import (
     MihomoRuntime,
     render_mihomo_config,
 )
+from .layout import (
+    CHAT_DISPLAY_SCHEMA, DEFAULT_CHAT_EMOJI, ChatMeta, DigestLayout,
+    validate_chat_display, validate_chat_display_row,
+)
 from .openrouter import (
     FALLBACK_MODEL_LABEL, OpenRouterError, create_digest, failure_label,
 )
@@ -584,9 +588,11 @@ class Collector:
                     ),
                 )
                 if settings["chat_locked"]:
+                    display = self._chat_display_map(settings)
                     chats = [
                         {"chat_id": row["chat_id"], "title": row["title"],
-                         "kind": row["peer"]["kind"]}
+                         "kind": row["peer"]["kind"],
+                         "display": display[row["chat_id"]]}
                         for row in settings["chats"]
                     ]
                     monitoring_phase = "activation_required"
@@ -1734,6 +1740,55 @@ class Collector:
                 read_ack_result=None, read_ack_error_type=None,
                 last_digest_failure=None,
             )
+
+    def _chat_display_map(self, settings: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+        """Значки и типы чатов для выпуска; битый файл не роняет выпуск."""
+        chat_ids = [row["chat_id"] for row in settings.get("chats", [])]
+        stored: Dict[int, Dict[str, Any]] = {}
+        if self.paths.chat_display.exists():
+            try:
+                stored = validate_chat_display(
+                    read_json(self.paths.chat_display, max_bytes=16 * 1024), chat_ids)
+            except Exception:
+                stored = {}
+        default = {"emoji": DEFAULT_CHAT_EMOJI, "kind": "discussion", "short_name": None}
+        return {chat_id: dict(stored.get(chat_id, default)) for chat_id in chat_ids}
+
+    def _digest_layout(self, settings: Dict[str, Any], digest_date: str) -> DigestLayout:
+        display = self._chat_display_map(settings)
+        return DigestLayout(
+            date.fromisoformat(digest_date),
+            tuple(ChatMeta(row["title"], display[row["chat_id"]]["emoji"],
+                           display[row["chat_id"]]["kind"],
+                           display[row["chat_id"]]["short_name"])
+                  for row in settings["chats"]))
+
+    async def set_chat_display(self, data: Any) -> Dict[str, Any]:
+        """Значок, тип и короткое имя одного чата из формы UI."""
+        if not isinstance(data, dict) or set(data) != {
+                "chat_id", "emoji", "kind", "short_name"}:
+            raise ValueError("chat display data is invalid")
+        async with self.state_lock:
+            settings = load_settings(self.paths)
+            if not settings["chat_locked"]:
+                raise RuntimeError("chat display needs locked chats")
+            chat_ids = [row["chat_id"] for row in settings["chats"]]
+            chat_id = data["chat_id"]
+            if type(chat_id) is not int or chat_id not in chat_ids:
+                raise ValueError("chat display chat_id is unknown")
+            short = data["short_name"]
+            if isinstance(short, str) and not short.strip():
+                short = None
+            row = validate_chat_display_row({
+                "emoji": data["emoji"], "kind": data["kind"], "short_name": short})
+            current = self._chat_display_map(settings)
+            current[chat_id] = row
+            atomic_write_json(self.paths.chat_display, {
+                "schema": CHAT_DISPLAY_SCHEMA,
+                "chats": {str(key): value for key, value in current.items()},
+            }, 0o600)
+            return self._write_status(last_result="chat_display_saved",
+                                      last_error_type=None)
 
     async def renew_consent(self, expires_at: Any) -> Dict[str, Any]:
         async with self.state_lock:
@@ -2894,6 +2949,7 @@ class Collector:
                         digest_chats, settings["openrouter_model"],
                         credentials["openrouter_api_key"], revoked,
                         before_fallback,
+                        self._digest_layout(settings, gate["digest"]["digest_date"]),
                     ),
                     OPENROUTER_TIMEOUT_S,
                 )

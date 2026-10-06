@@ -494,14 +494,17 @@ class ContractTests(unittest.TestCase):
         self.assertIn(PROMPT_VERSION, _prompt([]))
         # Тем много, каждая обрезана по отдельности, а их сумма ничем не
         # ограничена — выпуск обязан быть срезан, а не отвергнут целиком.
+        # С гайдлайна 06.10.2026 суть темы режется до 160 знаков, а на чат —
+        # не больше четырёх тем; переполнение даёт число чатов.
         oversized = {"chats": [{
-            "chat": "Чат",
+            "chat": f"Чат {chat}",
             "topics": [
-                {"title": f"Тема {i}", "summary": "и" * 3000, "refs": []}
-                for i in range(10)
+                {"title": f"Topic {i} " + "t" * 60, "summary": "s" * 200,
+                 "importance": "high", "refs": []}
+                for i in range(4)
             ],
             "links": [],
-        }]}
+        } for chat in range(80)]}
         with patch("urllib.request.OpenerDirector.open",
                    return_value=FakeResponse(content=oversized)):
             digest = _blocking_digest([], "anthropic/example", "secret")
@@ -815,7 +818,7 @@ class TestBugDigestSenderCase20260914(unittest.IsolatedAsyncioTestCase):
                    return_value=worker):
             digest = await create_digest(chats, "anthropic/example", "test-key",
                                          asyncio.Event())
-        first, second = digest.split("**Второй**")
+        first, second = digest.split("💬 Второй")
         self.assertEqual(first.count("Алиса"), 5)
         self.assertEqual(second.count("Боб"), 5)
         self.assertNotIn("Боб", first)
@@ -915,7 +918,7 @@ class TestBugDigestMaterialLinksProductionPath20260914(unittest.IsolatedAsyncioT
                    return_value=worker):
             digest = await create_digest(chats, "anthropic/example", "test-key",
                                          asyncio.Event())
-        topic, materials = digest.split("📎 Ссылки и материалы")
+        topic, materials = digest.split("• Статья")
         for section in (topic, materials):
             for url in chats[1].messages[0].material_urls:
                 self.assertEqual(section.count(url), 1)
@@ -1542,10 +1545,10 @@ class TestBugEmptySkeletonInProse20261005(unittest.IsolatedAsyncioTestCase):
 
 
 
-class TestBugMaterialFlood20261006(unittest.TestCase):
+class TestBugMaterialFlood20261005(unittest.TestCase):
     """Не больше трёх выбранных материалов на пункт и счёт остальных.
 
-    06.10.2026 под ссылкой на конференцию DigiTec вывалились все 37 URL
+    05.10.2026 под ссылкой на конференцию DigiTec вывалились все 37 URL
     исходного сообщения (LinkedIn каждого спикера, сайты компаний,
     Википедия): код 0.2.14 подставлял каждый прямой URL сообщения, а модель
     видела лишь их число. Решение Ивана: модель выбирает до трёх главных
@@ -1602,7 +1605,7 @@ class TestBugMaterialFlood20261006(unittest.TestCase):
         self.assertEqual(_clean("коротко", 400), "коротко")
 
 
-class TestBugMaterialLabels20261006(unittest.TestCase):
+class TestBugMaterialLabels20261005(unittest.TestCase):
     """В промпт уходят подписи материалов, а не скрытые адреса."""
 
     def test_labels_come_from_visible_text_only(self):
@@ -1637,7 +1640,7 @@ class TestBugMaterialLabels20261006(unittest.TestCase):
 
 
 
-class TestBugMaterialReview20261006(unittest.TestCase):
+class TestBugMaterialReview20261005(unittest.TestCase):
     """Ревью 0.2.22: ограниченная строка промпта и честное «где остальное»."""
 
     def test_prompt_lists_at_most_twenty_materials(self):
