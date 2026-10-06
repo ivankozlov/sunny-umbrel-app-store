@@ -3666,6 +3666,41 @@ class TestChatDisplay20261006(unittest.IsolatedAsyncioTestCase):
             status = await collector.public_status()
             self.assertEqual({row["display"]["emoji"] for row in status["chats"]}, {"💬"})
 
+    async def test_rich_toggle_reaches_layout_and_status(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = make_paths(Path(temporary))
+            seed_locked(paths, watch_phase="active")
+            transport = FakeTransport(paths, gate(digest_due=True))
+            collector = collector_for(paths, FakeGateway(paths), transport)
+            seen = []
+
+            async def capturing(chats, model, key, revoked, before_fallback, layout):
+                seen.append(layout)
+                return "Общий дайджест"
+
+            collector.digest_function = capturing
+            status = await collector.public_status()
+            self.assertFalse(status["digest_rich"])
+            with self.assertRaises(ValueError):
+                await collector.set_digest_rich("on")
+            await collector.set_chat_display({
+                "chat_id": CHAT_IDS[0], "emoji": "🏛", "kind": "discussion",
+                "short_name": None})
+            status = await collector.set_digest_rich(True)
+            self.assertTrue(status["digest_rich"])
+            # отдельный файл: chat-display.json остаётся формата 0.2.23 (откат)
+            stored = json.loads(paths.chat_display.read_text(encoding="utf-8"))
+            self.assertEqual(set(stored), {"schema", "chats"})
+            self.assertIn(paths.digest_style, paths.reset_files())
+            # значки переживают переключение и наоборот
+            self.assertEqual(status["chats"][0]["display"]["emoji"], "🏛")
+            await collector.set_chat_display({
+                "chat_id": CHAT_IDS[1], "emoji": "🏠", "kind": "discussion",
+                "short_name": None})
+            await collector.run_once()
+            self.assertTrue(seen[-1].rich)
+            self.assertEqual([meta.emoji for meta in seen[-1].chats], ["🏛", "🏠"])
+
     async def test_reset_removes_display_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             paths = make_paths(Path(temporary))

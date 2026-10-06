@@ -62,6 +62,8 @@ async def dispatch(collector: Collector, request: Dict[str, Any]) -> Dict[str, A
         status = await collector.public_status()
         status["run_triggered"] = triggered
         return status
+    if command == "set_digest_rich":
+        return await collector.set_digest_rich(request["data"])
     if command == "set_chat_display":
         return await collector.set_chat_display(request["data"])
     if command == "renew_consent":

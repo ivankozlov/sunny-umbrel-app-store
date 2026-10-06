@@ -516,6 +516,10 @@ class TestChatDisplayRendering20261006(unittest.TestCase):
         self.assertIn('name="chat_id" value="-1002"', page)
         self.assertNotIn("<script>", page)
         self.assertNotIn("Клуб <b>", page)
+        self.assertIn('name="rich" value="off" checked', page)
+        value["digest_rich"] = True
+        page = render_status(value, "a" * 64)
+        self.assertIn('name="rich" value="on" checked', page)
 
 
 class TestRecentRunsRendering20260817(unittest.TestCase):

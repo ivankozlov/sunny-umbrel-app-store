@@ -377,7 +377,27 @@ content, receiver keys, or rendered runtime configuration.
   short name come from `data/config/chat-display.json`, set in the UI from a closed
   palette and wiped by factory reset; never hard-code chat titles or icons in this
   public source. Tier B (bold, blockquote/expandable details, inline labelled
-  links) needs a new Sunny renderer and a worker release — not in this package.
+  links) needs a new Sunny renderer and a worker release.
+- Tier B (`0.2.24`): with the owner's "Расширенное" switch (`data/config/digest-style.json`,
+  off by default; a separate file because the `0.2.23` validator rejects any extra key in
+  `chat-display.json`, and a rollback would silently drop every icon) `layout.py` emits a
+  narrow markup for the Sunny
+  `chats_text_v3` renderer — `**bold**` titles and headings, `__italic__` service lines,
+  `> ` quote for "Главное", inline `[label](url)` link segments joined with " · ",
+  `>> ` collapsible quote for news beyond `NEWS_RICH_VISIBLE`. Every model or user string
+  passes `_markup_safe` (`markup_plain`, looped to a fixed point) first: runs of `*`/`_`
+  collapse to one character (single ones are plain text for the renderer, so `dev_team`
+  survives), edge `*`/`_` are trimmed, `[`/`]` become `(`/`)`, and every leading `>` goes — so
+  only code sets markup and a model can never place its own labelled link or quote. One-shot
+  replacement was not idempotent (`*__*` became `**`, `*> x` became a quote; reviews
+  2026-10-06). The skip note runs chat titles through `markup_plain` too: a group admin sets
+  them. A material URL — its target is set by any chat member through a hidden `TextUrl` —
+  goes inline as `[host](url)` only if it fully matches `_INLINE_SAFE_URL` (no brackets, at most
+  balanced single-level parentheses); otherwise it stays a standalone URL line, which the
+  renderer labels itself, so `…/x)[bank](https://evil` cannot forge a second labelled link. Sunny uses `chats_text_v3` only for an issue whose first
+  block after the notices starts with the bold header `**☀️ Чаты`; tier-A text stays v2,
+  where model text is not cleaned. The switch is honest only after the server renderer is
+  deployed; before that the markup would arrive raw.
 - Every chat returning empty lists is an answer, not a failure — the prompt
   explicitly allows "nothing notable today", and the issue then says so in one
   line. An empty `chats` array is a failure: the model walked no chat at all.

@@ -138,7 +138,7 @@ the rest. Notes are trimmed on a word boundary. The collector wire version remai
 `sha256:0c3d6bbeba4f650e0c54162bb77e38035b8db72d05be412ae69971b3914f7590`; the owner
 updated the device the same day.
 
-`0.2.23` is prepared as a disabled Phase-A package. It applies the digest guideline
+`0.2.23`, published on 2026-10-06, applies the digest guideline
 the owner approved on 2026-10-06 (drafted by three independent designers and a
 judge): dated header, a "Главное" block that only references action/high topics,
 outcome-first titles, one-line summaries, `importance`/`state`/`when` from the model
@@ -148,7 +148,17 @@ topics per chat and an "Ещё" line, a news feed for chats marked as news, and 
 `data/config/chat-display.json`, never in the public source. Rendering stays within
 what the Sunny worker already supports (tier A); bold, quotes and inline labels
 (tier B) need a renderer change and a worker release. The collector wire version
-remains `0.2.1`. Publication and device Update are pending.
+remains `0.2.1`. Store enable commit `f74ef77` pins index digest
+`sha256:d93cae2b486ed3b45aefe9f4436dd03fe3d49db6689ff5c8d36d7c529f2cb048`.
+
+`0.2.24` is prepared as a disabled Phase-A package (tier B of the digest guideline).
+With "Расширенное" formatting switched on in the UI it emits a narrow markup —
+`**bold**`, `__italic__`, `[label](url)` inside a line, `> ` and `>> ` quote lines — for the
+Sunny `chats_text_v3` renderer; the "Главное" block becomes a quote, topic titles bold, links
+inline with labels, and news beyond the fourth go into a collapsible quote. The switch is off by
+default and stays in `data/config/digest-style.json`; switch it on only after the server renderer
+ships with the next full sport release. Model text is stripped of the same markup, so only code
+sets it. The collector wire version remains `0.2.1`. Publication and device Update are pending.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.15` have public multi-arch images.

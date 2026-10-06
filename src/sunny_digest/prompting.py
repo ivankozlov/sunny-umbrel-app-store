@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+from .layout import markup_plain
 from .models import DigestChat, SelectedMessage
 from .storage import canonical_json_bytes
 from .version import MAX_PROMPT_BYTES, PROMPT_VERSION
@@ -298,7 +299,9 @@ def digest_skip_note(rows: List[tuple]) -> str:
     """
     lines = [DIGEST_SKIP_NOTE_HEAD]
     for title, first, last in rows:
-        lines.append(f"{title}: диапазон ID {first}–{last}")
+        # Название задаёт админ группы; в выпуске уровня B заметка рендерится
+        # v3, и «> Срочно» стало бы цитатой (второе ревью 06.10).
+        lines.append(f"{markup_plain(title)}: диапазон ID {first}–{last}")
     return "\n".join(lines)
 
 

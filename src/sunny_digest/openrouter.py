@@ -502,7 +502,8 @@ def render_digest(
             link_links=lambda row: _source_links(
                 sources, materials, row.get("ref"), row.get("materials")),
             news_link=news_link, restore=restore, ref_texts=ref_texts,
-            with_summaries=with_summaries)
+            with_summaries=with_summaries,
+            rich=layout.rich if layout is not None else False)
 
     text = render(True)
     if text is None:

@@ -135,6 +135,11 @@ class Paths:
         return self.config_dir / "chat-display.json"
 
     @property
+    def digest_style(self) -> Path:
+        # Переключатель уровня B («Расширенное» оформление), 0.2.24.
+        return self.config_dir / "digest-style.json"
+
+    @property
     def known_hosts(self) -> Path:
         return self.config_dir / "known_hosts"
 
@@ -231,6 +236,7 @@ class Paths:
         return (
             self.settings,
             self.chat_display,
+            self.digest_style,
             self.known_hosts,
             self.pending,
             self.acknowledged,

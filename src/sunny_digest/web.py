@@ -214,7 +214,7 @@ def _render_digest_failure(value: Any) -> str:
 _KIND_LABELS = {"discussion": "обсуждение", "news": "новости"}
 
 
-def _render_chat_display(chats: Any, csrf: str) -> str:
+def _render_chat_display(chats: Any, csrf: str, rich: Any = False) -> str:
     """Значок, тип и короткое имя каждого чата для выпуска (гайдлайн 06.10).
 
     Хранится только на Umbrel: названия чатов не попадают в публичный код."""
@@ -245,7 +245,17 @@ def _render_chat_display(chats: Any, csrf: str) -> str:
   </form>""")
     if not forms:
         return ""
-    return ("<details><summary>Оформление выпуска</summary>"
+    rich_on = isinstance(rich, bool) and rich
+    style_form = f"""
+  <form method="post">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="set_digest_rich">
+    <p class="muted">Расширенное оформление (жирные заголовки, цитаты, ссылки в строке) требует
+    Sunny с рендером <code>chats_text_v3</code>. Включайте только после его выкатки на сервер,
+    иначе разметка придёт сырой.</p>
+    <label class="check"><input type="radio" name="rich" value="off"{"" if rich_on else " checked"}>Обычное</label>
+    <label class="check"><input type="radio" name="rich" value="on"{" checked" if rich_on else ""}>Расширенное</label>
+    <button class="secondary" type="submit">Сохранить оформление</button>
+  </form>"""
+    return ("<details><summary>Оформление выпуска</summary>" + style_form +
             "<p class=\"muted\">Значок и короткое имя чата видны в шапке раздела и в «Главном»; "
             "тип «новости» включает ленту одной строкой на новость.</p>"
             + "".join(forms) + "</details>")
@@ -467,7 +477,8 @@ Sunny Umbrel в Telegram → Settings → Devices, затем настройте
         if read_ack_error:
             read_ack = f"{read_ack} — {read_ack_error}"
         recent_rows = _render_recent_runs(status.get("recent_runs"))
-        display_forms = _render_chat_display(status.get("chats"), csrf)
+        display_forms = _render_chat_display(
+            status.get("chats"), csrf, status.get("digest_rich"))
         failure_row = _render_digest_failure(status.get("last_digest_failure"))
         repair_state_value = status.get("vpn_repair_state")
         repair_state = (
@@ -746,6 +757,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise PermissionError("chat extension was not confirmed")
                 result = self.app.ipc.request(
                     "extend_chats", _one(form, "extension_message_link"))
+            elif action == "set_digest_rich":
+                choice = _one(form, "rich")
+                if choice not in ("on", "off"):
+                    raise ValueError("digest style is invalid")
+                result = self.app.ipc.request("set_digest_rich", choice == "on")
             elif action == "set_chat_display":
                 raw_id = _one(form, "chat_id")
                 if not re.fullmatch(r"-[1-9][0-9]{0,18}", raw_id or ""):

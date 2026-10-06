@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 from datetime import date
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -74,9 +75,12 @@ class ChatMeta:
 class DigestLayout:
     digest_date: Optional[date] = None
     chats: Tuple[ChatMeta, ...] = field(default_factory=tuple)
+    # Уровень B: включает владелец в UI после выкатки рендера v3 на DO.
+    rich: bool = False
 
 
 CHAT_DISPLAY_SCHEMA = "sunny.personal-chats.chat-display.v1"
+DIGEST_STYLE_SCHEMA = "sunny.personal-chats.digest-style.v1"
 
 
 def validate_chat_display(value: Any, chat_ids: List[int]) -> Dict[int, Dict[str, Any]]:
@@ -193,8 +197,16 @@ def render_layout(
     restore: Callable[[Any, str], Any],
     ref_texts: Callable[[List[Any]], List[str]],
     with_summaries: bool = True,
+    rich: bool = False,
 ) -> Optional[str]:
-    """Собрать текст; None — ни в одном чате нет ни одного пункта."""
+    """Собрать текст; None — ни в одном чате нет ни одного пункта.
+
+    `rich` — уровень B: разметка для рендера `chats_text_v3` ядра Sunny
+    (жирный, курсив, цитаты, ссылки с подписью в строке). Модельный и
+    пользовательский текст в этом режиме очищается от той же разметки,
+    чтобы её ставил только код."""
+    if rich:
+        clean = _markup_safe(clean)
     sections: List[str] = []
     quiet: List[str] = []
     topic_index: Dict[str, Optional[Tuple[ChatMeta, str]]] = {}
@@ -214,19 +226,25 @@ def render_layout(
             demoted += max(0, overflow) + len(low_titles)
             if not visible:
                 if low_titles:
-                    sections.append(_chat_heading(meta, 0, clean) + "\n" + clean(
-                        "Ещё: " + "; ".join(low_titles[:MORE_MAX]), MORE_LINE_LIMIT))
+                    sections.append(_chat_heading(meta, 0, clean, rich) + "\n" + _more_line(
+                        clean("Ещё: " + "; ".join(low_titles[:MORE_MAX]), MORE_LINE_LIMIT),
+                        rich))
                     shown_chats += 1
                 else:
                     quiet.append(meta.name)
                 continue
-            lines = [_chat_heading(meta, len(visible), clean)]
-            for item in visible:
-                lines.append(f"• {item.title}")
-                lines.extend(item.links)
+            lines = [_chat_heading(meta, len(visible), clean, rich)]
+            for position, item in enumerate(visible):
+                if rich:
+                    prefix = ">> " if position >= NEWS_RICH_VISIBLE else ""
+                    lines.extend(prefix + line for line in _rich_news_lines(item))
+                else:
+                    lines.append(f"• {item.title}")
+                    lines.extend(item.links)
             if overflow > 0:
-                lines.append(f"+ ещё {plural(overflow, 'новость', 'новости', 'новостей')}"
-                             " — в канале")
+                tail = (f"+ ещё {plural(overflow, 'новость', 'новости', 'новостей')}"
+                        " — в канале")
+                lines.append(f"__{tail}__" if rich else tail)
             sections.append("\n".join(lines))
             shown_chats += 1
             shown_topics += len(visible)
@@ -249,13 +267,14 @@ def render_layout(
                 # не строится, иначе строка ушла бы чужому чату (ревью 0.2.23).
                 topic_index[item.topic_id] = (
                     None if item.topic_id in topic_index else (meta, item.importance))
-            blocks.append(_item_block(item, with_summaries))
+            blocks.append(_item_block(item, with_summaries, rich))
         if more_titles:
-            blocks.append(clean("Ещё: " + "; ".join(more_titles), MORE_LINE_LIMIT))
+            blocks.append(_more_line(
+                clean("Ещё: " + "; ".join(more_titles), MORE_LINE_LIMIT), rich))
         # Чат только с мелочами — раздел из одной строки «Ещё», а не тишина:
         # иначе день из одних low-тем превращался в «ничего существенного»
         # и для извлечённого ответа — в отказ empty_recovered (ревью 0.2.23).
-        head = _chat_heading(meta, len(main), clean)
+        head = _chat_heading(meta, len(main), clean, rich)
         sections.append(head + "\n" + "\n\n".join(blocks))
         shown_chats += 1
         shown_topics += len(main)
@@ -268,22 +287,115 @@ def render_layout(
               f"{plural(shown_topics, 'тема', 'темы', 'тем')}")
     if demoted:
         counts += f" · ещё {demoted} свёрнуто"
-    out.append(header + "\n" + counts)
+    out.append(f"**{header}**\n__{counts}__" if rich else header + "\n" + counts)
     lead_lines = _lead_lines(lead, topic_index, clean, restore)
     if lead_lines:
-        out.append("⚡ Главное\n" + "\n".join(lead_lines))
+        if rich:
+            out.append("> **⚡ Главное**\n" + "\n".join("> " + line for line in lead_lines))
+        else:
+            out.append("⚡ Главное\n" + "\n".join(lead_lines))
     out.extend(sections)
     if quiet:
-        out.append("💤 Без важного: " + ", ".join(quiet))
+        quiet_line = "💤 Без важного: " + ", ".join(clean(name, CHAT_NAME_LIMIT) for name in quiet)
+        out.append(f"__{quiet_line}__" if rich else quiet_line)
     return "\n\n".join(out)
 
 
-def _chat_heading(meta: ChatMeta, count: int, clean: Callable[[Any, int], str]) -> str:
+def _chat_heading(meta: ChatMeta, count: int, clean: Callable[[Any, int], str],
+                  rich: bool = False) -> str:
     name = f"{meta.emoji} {clean(meta.name, CHAT_NAME_LIMIT)}"
+    if rich:
+        name = f"**{name}**"
     return f"{name} · {count}" if count else name
 
 
-def _item_block(item: _Item, with_summaries: bool) -> str:
+# Уровень B: в ленте сначала четыре новости, остальные — в сворачиваемой цитате.
+NEWS_RICH_VISIBLE = 4
+_HIDDEN_TAIL = re.compile(r"\+(?P<count>\d+ \S+) — (?P<where>.+)$")
+
+
+_MARKUP_RUNS = re.compile(r"\*{2,}|_{2,}")
+
+
+def _markup_safe(clean: Callable[[Any, int], str]) -> Callable[[Any, int], str]:
+    """Модельный и пользовательский текст не ставит разметку уровня B сам.
+
+    Ревью 06.10: одноразовая замена не идемпотентна («*__*» давало «**»),
+    а одиночные маркеры на краю ломали обёртки кода. Поэтому серии «*»/«_»
+    схлопываются до одного символа (одиночные внутри — обычный текст для
+    рендера v3), края очищаются от них, скобки «[]» становятся «()» —
+    подпись ссылки ставит только код, — и снимается ведущий «>» любой
+    глубины."""
+    def wrapped(value: Any, limit: int) -> str:
+        return markup_plain(clean(value, limit))
+    return wrapped
+
+
+def markup_plain(text: str) -> str:
+    """Очистка разметки уровня B до неподвижной точки.
+
+    Второе ревью 06.10: края чистились после снятия «>», и «*> Важно»
+    давало «> Важно» — цитату от модели. Цикл гарантирует идемпотентность."""
+    while True:
+        cleaned = _MARKUP_RUNS.sub(lambda match: match.group(0)[0], text)
+        cleaned = cleaned.replace("[", "(").replace("]", ")")
+        cleaned = re.sub(r"^[>\s]+", "", cleaned.strip("*_ "))
+        if cleaned == text:
+            return cleaned
+        text = cleaned
+
+
+# Адрес, который рендер v3 целиком примет как цель ссылки в строке. Цель
+# материала задаёт любой участник чата (скрытый TextUrl): адрес вида
+# `…/x)[sberbank.ru](https://evil` иначе дал бы вторую ссылку с чужой
+# подписью (второе ревью 06.10). Всё остальное — отдельной строкой-URL,
+# которую рендер подписывает сам (hostname+path), как в уровне A.
+_INLINE_SAFE_URL = re.compile(r"https?://(?:[^()\[\]\s]|\([^()\[\]\s]*\))+", re.I)
+
+
+def _more_line(text: str, rich: bool) -> str:
+    return f"__{text}__" if rich and text else text
+
+
+def _link_label(url: str) -> str:
+    host = (urlsplit(url).hostname or "ссылка").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _inline_links(lines: List[str]) -> Tuple[List[str], List[str]]:
+    """Строки ссылок уровня A → сегменты одной строки уровня B и адреса,
+    которые безопасно ставить только отдельной строкой."""
+    segments: List[str] = []
+    loose: List[str] = []
+    for line in lines:
+        value = line.strip()
+        if value.startswith("[Сообщение]("):
+            segments.append(value)
+            continue
+        hidden = _HIDDEN_TAIL.match(value)
+        if hidden:
+            segments.append(f"__ещё {hidden.group('count')} {hidden.group('where')}__")
+        elif value.lower().startswith(("http://", "https://")):
+            if _INLINE_SAFE_URL.fullmatch(value):
+                segments.append(f"[{_link_label(value)}]({value})")
+            else:
+                loose.append(value)
+    return segments, loose
+
+
+def _rich_news_lines(item: "_Item") -> List[str]:
+    source = next((line for line in item.links if line.startswith("[Сообщение](")), None)
+    materials = [line for line in item.links if line != source]
+    if source:
+        url = source[len("[Сообщение]("):-1]
+        head = f"• [{item.title}]({url})"
+    else:
+        head = f"• {item.title}"
+    segments, loose = _inline_links(materials)
+    return [head + "".join(f" · {segment}" for segment in segments)] + loose
+
+
+def _item_block(item: _Item, with_summaries: bool, rich: bool = False) -> str:
     marker = "⚡" if item.importance == "action" else ("▸" if item.kind == "topic" else "•")
     title = item.title
     if item.when is not None:
@@ -292,10 +404,20 @@ def _item_block(item: _Item, with_summaries: bool) -> str:
             title += f" — {short_date(day)}"
         if hours and hours not in title:
             title += f", {hours}"
-    lines = [f"{marker} {title}"]
     keep_summary = with_summaries or item.importance in ("action", "high")
-    if item.summary and keep_summary:
-        lines.append(item.summary)
+    summary = item.summary if keep_summary else ""
+    if rich:
+        # ▸ делает жирный; ⚡ остаётся сигналом действия, • — у ссылок.
+        head = f"**{title}**"
+        if marker != "▸":
+            head = f"{marker} {head}"
+        segments, loose = _inline_links(item.links)
+        tail = "".join(f" · {segment}" for segment in segments)
+        block = f"{head}\n{summary}{tail}" if summary else f"{head}{tail}"
+        return "\n".join([block] + loose)
+    lines = [f"{marker} {title}"]
+    if summary:
+        lines.append(summary)
     lines.extend(item.links)
     return "\n".join(lines)
 

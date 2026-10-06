@@ -29,7 +29,7 @@ from .mihomo import (
 )
 from .layout import (
     CHAT_DISPLAY_SCHEMA, DEFAULT_CHAT_EMOJI, ChatMeta, DigestLayout,
-    validate_chat_display, validate_chat_display_row,
+    DIGEST_STYLE_SCHEMA, validate_chat_display, validate_chat_display_row,
 )
 from .openrouter import (
     FALLBACK_MODEL_LABEL, OpenRouterError, create_digest, failure_label,
@@ -603,6 +603,7 @@ class Collector:
                     status.update(
                         source_id=settings["source_id"],
                         chats=chats,
+                        digest_rich=self._digest_rich(),
                         monitoring_phase=monitoring_phase,
                         activation_required=not self.paths.watch_state.exists(),
                         monitoring_active=monitoring_phase == "active",
@@ -700,6 +701,7 @@ class Collector:
             "last_error_type", "last_message_count", "last_through_message_id",
             "failed_chat_count", "revocation_required", "recent_runs",
             "read_ack_result", "read_ack_error_type", "last_digest_failure",
+            "digest_rich",
             "openrouter_public_key",
             "vpn_configured", "vpn_ready", "vpn_migration_required",
             "vpn_repairing", "vpn_repair_state", "vpn_repair_attempted",
@@ -1754,14 +1756,44 @@ class Collector:
         default = {"emoji": DEFAULT_CHAT_EMOJI, "kind": "discussion", "short_name": None}
         return {chat_id: dict(stored.get(chat_id, default)) for chat_id in chat_ids}
 
+    def _digest_rich(self) -> bool:
+        """Уровень B включён владельцем; битый файл — уровень A."""
+        if not self.paths.digest_style.exists():
+            return False
+        try:
+            value = read_json(self.paths.digest_style, max_bytes=1024)
+            return value == {"schema": DIGEST_STYLE_SCHEMA, "rich": True}
+        except Exception:
+            return False
+
+    async def set_digest_rich(self, data: Any) -> Dict[str, Any]:
+        """Переключатель уровня B: только после выкатки рендера v3 на DO."""
+        if not isinstance(data, bool):
+            raise ValueError("digest style flag must be boolean")
+        async with self.state_lock:
+            settings = load_settings(self.paths)
+            if not settings["chat_locked"]:
+                raise RuntimeError("digest style needs locked chats")
+            # Отдельный файл, а не ключ в chat-display.json: валидатор 0.2.23
+            # отверг бы лишний ключ, и откат молча потерял бы значки (ревью 06.10).
+            atomic_write_json(self.paths.digest_style,
+                              {"schema": DIGEST_STYLE_SCHEMA, "rich": data}, 0o600)
+            return self._write_status(last_result="digest_style_saved",
+                                      last_error_type=None)
+
     def _digest_layout(self, settings: Dict[str, Any], digest_date: str) -> DigestLayout:
         display = self._chat_display_map(settings)
         return DigestLayout(
-            date.fromisoformat(digest_date),
-            tuple(ChatMeta(row["title"], display[row["chat_id"]]["emoji"],
-                           display[row["chat_id"]]["kind"],
-                           display[row["chat_id"]]["short_name"])
-                  for row in settings["chats"]))
+            rich=self._digest_rich(),
+            **self._layout_chats(settings, display, digest_date))
+
+    def _layout_chats(self, settings: Dict[str, Any], display: Dict[int, Dict[str, Any]],
+                      digest_date: str) -> Dict[str, Any]:
+        return dict(digest_date=date.fromisoformat(digest_date), chats=tuple(
+            ChatMeta(row["title"], display[row["chat_id"]]["emoji"],
+                     display[row["chat_id"]]["kind"],
+                     display[row["chat_id"]]["short_name"])
+            for row in settings["chats"]))
 
     async def set_chat_display(self, data: Any) -> Dict[str, Any]:
         """Значок, тип и короткое имя одного чата из формы UI."""

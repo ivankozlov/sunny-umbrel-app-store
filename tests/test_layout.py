@@ -200,6 +200,124 @@ class TestBugGuidelineReview20261006(unittest.TestCase):
         self.assertTrue(date_in_text(date(2026, 3, 8), ["8 марта"]))
 
 
+class TestBugDigestRichTierB20261006(unittest.TestCase):
+    """Уровень B: разметку для рендера chats_text_v3 ставит только код.
+
+    Иван попросил «уровень B» 06.10. Ядро Sunny понимает **жирный**,
+    __курсив__, [подпись](url) в строке и строки «> »/«>> » как цитаты.
+    Модельный текст обязан быть очищен от той же разметки, иначе модель
+    сама ставила бы ссылки с подписями и цитаты в выпуск."""
+
+    RICH = DigestLayout(date(2026, 10, 7), LAYOUT.chats, rich=True)
+
+    def test_rich_structure(self):
+        text = render_digest({
+            "lead": [{"topic_id": "w", "text": "Отключат воду"}],
+            "chats": [
+                {"chat": "Дом", "topics": [
+                    topic("w", "Отключение воды", "action", summary="По словам УК")]},
+                {"chat": "Клуб", "topics": [topic("a", "CFO: итог", "high")]},
+                {"chat": "TNN", "links": [{"title": f"Новость {i}", "ref": i + 1}
+                                          for i in range(6)]}]},
+            SOURCES, layout=self.RICH)
+        self.assertTrue(text.startswith("**☀️ Чаты · ср, 7 окт**\n__"))
+        self.assertIn("> **⚡ Главное**\n> 🏠 Отключат воду", text)
+        self.assertIn("**🏛 Клуб** · 1\n**CFO: итог** · [Сообщение](https://t.me/c/1/101)", text)
+        self.assertIn("⚡ **Отключение воды**\nПо словам УК · [Сообщение](", text)
+        self.assertIn("• [Новость 3](https://t.me/c/1/104)\n>> • [Новость 4](", text)
+        self.assertTrue(text.endswith("__💤 Без важного: Инвесторы__"))
+
+    def test_model_text_cannot_inject_markup(self):
+        text = render_digest({"chats": [{"chat": "Клуб", "topics": [topic(
+            "a", "**Жирно** [фишинг](https://evil.example/x)", "high",
+            summary="> цитата __курсив__")]}]}, SOURCES, layout=self.RICH)
+        self.assertNotIn("](https://evil.example", text)
+        self.assertNotIn("****", text)
+        self.assertNotIn("\n> цитата", text)
+        self.assertNotIn("__курсив__", text)
+
+    def test_markup_cleaning_is_idempotent_and_keeps_text(self):
+        text = render_digest({"chats": [
+            {"chat": "Клуб", "topics": [
+                topic("a", "*__*Срочно*__*", "high", summary="> > Фейк"),
+                topic("b", "C* в проде и dev_team", "high"),
+                topic("c", "[Анонс] Митап_", "high"),
+                topic("d", "a*__*b", "high")]}]}, SOURCES, layout=self.RICH)
+        self.assertIn("**a*_*b**", text)
+        self.assertIn("**Срочно**\nФейк", text)
+        self.assertIn("**C* в проде и dev_team**", text)
+        self.assertIn("**(Анонс) Митап**", text)
+        self.assertNotIn("\n> ", text.split("> **⚡ Главное**")[-1].split("\n\n", 1)[-1])
+
+    def test_news_title_with_brackets_stays_a_link(self):
+        text = render_digest({"chats": [{"chat": "TNN", "links": [
+            {"title": "[Анонс] Митап", "ref": 1}]}]}, SOURCES, layout=self.RICH)
+        self.assertIn("• [(Анонс) Митап](https://t.me/c/1/101)", text)
+
+    def test_hidden_tail_keeps_where(self):
+        from sunny_digest.layout import _inline_links
+        self.assertEqual(_inline_links(["+5 ссылок — в исходных сообщениях"]),
+                         (["__ещё 5 ссылок в исходных сообщениях__"], []))
+
+    def test_rich_is_off_by_default(self):
+        text = render_digest({"chats": [{"chat": "Клуб", "topics": [
+            topic("a", "Тема")]}]}, SOURCES, layout=LAYOUT)
+        self.assertNotIn("**", text)
+        self.assertIn("▸ Тема\n[Сообщение](", text)
+
+    def test_material_and_hidden_tail_become_inline_segments(self):
+        text = render_digest({"chats": [{"chat": "Клуб", "topics": [topic(
+            "a", "DigiTec", "normal", summary="Суть", refs=(2,),
+            materials=[{"n": 2, "i": 1}])]}]}, SOURCES,
+            material_urls={2: ["https://www.digitec.am/en-US", "https://b.example/x"]},
+            layout=self.RICH)
+        self.assertIn("**DigiTec**\nСуть · [digitec.am](https://www.digitec.am/en-US)"
+                      " · __ещё 1 ссылка в сообщении__ · [Сообщение](https://t.me/c/1/102)", text)
+
+
+class TestBugDigestRichSecondReview20261006(unittest.TestCase):
+    """Второе ревью уровня B 06.10: цитата через «*>», подмена подписи через
+    цель материала, заметка о пропуске с названием чата от админа группы."""
+
+    RICH = DigestLayout(date(2026, 10, 7), LAYOUT.chats, rich=True)
+
+    def test_markup_plain_is_idempotent(self):
+        from sunny_digest.layout import markup_plain
+        for raw in ["*> Важно", "_>> x", "> *> **y**", "[a](https://e.x)", "a*__*b",
+                    " _*_ > z", "**", ">"]:
+            once = markup_plain(raw)
+            self.assertEqual(markup_plain(once), once, raw)
+            self.assertFalse(once.startswith(">"), raw)
+            self.assertNotIn("**", once)
+            self.assertNotIn("__", once)
+            self.assertNotIn("[", once)
+
+    def test_star_quote_summary_is_not_a_quote(self):
+        text = render_digest({"chats": [{"chat": "Клуб", "topics": [topic(
+            "a", "Тема", "high", summary="*> Важно")]}]}, SOURCES, layout=self.RICH)
+        self.assertNotIn("\n> Важно", text)
+        self.assertIn("\nВажно · [Сообщение](", text)
+
+    def test_hostile_material_target_goes_to_own_line(self):
+        hostile = "https://a.com/x)[sberbank.ru](https://evil.com"
+        text = render_digest({"chats": [
+            {"chat": "Клуб", "topics": [topic(
+                "a", "Тема", "high", summary="Суть", refs=(2,),
+                materials=[{"n": 2, "i": 1}, {"n": 2, "i": 2}])]},
+            {"chat": "TNN", "links": [{"title": "Новость", "ref": 2, "materials": [1]}]}]},
+            SOURCES, material_urls={2: [hostile, "https://ok.example/a_(b)"]},
+            layout=self.RICH)
+        self.assertNotIn("[sberbank.ru]", text.replace(f"\n{hostile}", ""))
+        self.assertIn(f"\n{hostile}", text)
+        self.assertIn("[ok.example](https://ok.example/a_(b))", text)
+
+    def test_skip_note_title_is_plain(self):
+        from sunny_digest.prompting import digest_skip_note
+        note = digest_skip_note([("> Срочно", 1, 2), ("Чат [Сбер](https://evil.com)", 3, 4)])
+        self.assertIn("\nСрочно: диапазон ID 1–2", note)
+        self.assertNotIn("[Сбер]", note)
+
+
 class TestChatDisplayValidation20261006(unittest.TestCase):
     """Значки чатов — только из палитры, только для зафиксированных чатов."""
 
