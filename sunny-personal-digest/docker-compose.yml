@@ -7,7 +7,7 @@ services:
       APP_PORT: 8080
 
   web:
-    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.2.23@sha256:RELEASE_GATE_MULTIARCH_DIGEST
+    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.2.23@sha256:d93cae2b486ed3b45aefe9f4436dd03fe3d49db6689ff5c8d36d7c529f2cb048
     command: ["web"]
     user: "1000:1000"
     init: true
@@ -36,7 +36,7 @@ services:
       timeout: 5s
       retries: 3
   collector:
-    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.2.23@sha256:RELEASE_GATE_MULTIARCH_DIGEST
+    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.2.23@sha256:d93cae2b486ed3b45aefe9f4436dd03fe3d49db6689ff5c8d36d7c529f2cb048
     command: ["collector"]
     user: "1000:1000"
     init: true
