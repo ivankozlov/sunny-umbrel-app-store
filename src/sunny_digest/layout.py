@@ -198,6 +198,7 @@ def render_layout(
     ref_texts: Callable[[List[Any]], List[str]],
     with_summaries: bool = True,
     rich: bool = False,
+    more_link: Callable[[Any], Optional[str]] = lambda ref: None,
 ) -> Optional[str]:
     """Собрать текст; None — ни в одном чате нет ни одного пункта.
 
@@ -217,18 +218,17 @@ def render_layout(
         items, more = _chat_items(
             meta, entry or {}, clean=clean, topic_links=topic_links,
             link_links=link_links, news_link=news_link, restore=restore,
-            ref_texts=ref_texts)
+            ref_texts=ref_texts, more_link=more_link)
         if meta.kind == "news":
             visible = [item for item in items if item.importance != "low"]
             overflow = len(visible) - NEWS_PER_CHAT
-            low_titles = [item.title for item in items if item.importance == "low"]
+            low_titles = [_more_entry(item) for item in items if item.importance == "low"]
             visible = visible[:NEWS_PER_CHAT]
             demoted += max(0, overflow) + len(low_titles)
             if not visible:
                 if low_titles:
-                    sections.append(_chat_heading(meta, 0, clean, rich) + "\n" + _more_line(
-                        clean("Ещё: " + "; ".join(low_titles[:MORE_MAX]), MORE_LINE_LIMIT),
-                        rich))
+                    sections.append(_chat_heading(meta, 0, clean, rich) + "\n"
+                                    + _more_line(low_titles[:MORE_MAX], clean, rich))
                     shown_chats += 1
                 else:
                     quiet.append(meta.name)
@@ -253,8 +253,8 @@ def render_layout(
         main = [item for item in ordered if item.importance != "low"]
         overflow = main[TOPICS_PER_CHAT:]
         main = main[:TOPICS_PER_CHAT]
-        extra = [item.title for item in overflow] + [
-            item.title for item in ordered if item.importance == "low"]
+        extra = [_more_entry(item) for item in overflow] + [
+            _more_entry(item) for item in ordered if item.importance == "low"]
         demoted += len(extra)
         more_titles = (extra + more)[:MORE_MAX]
         if not main and not more_titles:
@@ -269,8 +269,7 @@ def render_layout(
                     None if item.topic_id in topic_index else (meta, item.importance))
             blocks.append(_item_block(item, with_summaries, rich))
         if more_titles:
-            blocks.append(_more_line(
-                clean("Ещё: " + "; ".join(more_titles), MORE_LINE_LIMIT), rich))
+            blocks.append(_more_line(more_titles, clean, rich))
         # Чат только с мелочами — раздел из одной строки «Ещё», а не тишина:
         # иначе день из одних low-тем превращался в «ничего существенного»
         # и для извлечённого ответа — в отказ empty_recovered (ревью 0.2.23).
@@ -353,8 +352,46 @@ def markup_plain(text: str) -> str:
 _INLINE_SAFE_URL = re.compile(r"https?://(?:[^()\[\]\s]|\([^()\[\]\s]*\))+", re.I)
 
 
-def _more_line(text: str, rich: bool) -> str:
-    return f"__{text}__" if rich and text else text
+def _source_url(links: List[str]) -> Optional[str]:
+    """Permalink исходного сообщения — его ставит код из карты источников."""
+    for line in links:
+        if line.startswith("[Сообщение](") and line.endswith(")"):
+            url = line[len("[Сообщение]("):-1]
+            if _INLINE_SAFE_URL.fullmatch(url):
+                return url
+    return None
+
+
+def _more_entry(item: "_Item") -> Tuple[str, Optional[str]]:
+    return item.title, _source_url(item.links)
+
+
+def _more_line(entries: List[Tuple[str, Optional[str]]],
+               clean: Callable[[Any, int], str], rich: bool) -> str:
+    """Строка «Ещё». В уровне B каждый пункт — ссылка на своё сообщение.
+
+    Иван 08.10: в «Ещё» не хватало ссылок. Цель — только permalink
+    источника (как у заголовка новости): адрес материала задаёт участник
+    чата, и за подписью-заголовком его хост был бы не виден. Пункт без
+    источника остаётся курсивом. Бюджет строки считается по видимому
+    тексту: обрезка всей строки разрезала бы разметку ссылки."""
+    if not rich:
+        return clean("Ещё: " + "; ".join(title for title, _url in entries),
+                     MORE_LINE_LIMIT)
+    parts: List[str] = []
+    room = MORE_LINE_LIMIT - len("Ещё: ")
+    for title, url in entries:
+        room -= 2 if parts else 0
+        if room < 8:
+            break
+        label = clean(title, room)
+        if not label:
+            continue
+        room -= len(label)
+        parts.append(f"[{label}]({url})" if url else f"__{label}__")
+        if label != title:
+            break
+    return "__Ещё:__ " + "; ".join(parts) if parts else ""
 
 
 def _link_label(url: str) -> str:
@@ -427,7 +464,8 @@ def _importance(value: Any, default: str = "normal") -> str:
 
 
 def _chat_items(meta: ChatMeta, entry: Dict[str, Any], *, clean, topic_links,
-                link_links, news_link, restore, ref_texts) -> Tuple[List[_Item], List[str]]:
+                link_links, news_link, restore, ref_texts,
+                more_link) -> Tuple[List[_Item], List[Tuple[str, Optional[str]]]]:
     names_key = meta.title
     items: List[_Item] = []
     topics = entry.get("topics") or []
@@ -460,12 +498,18 @@ def _chat_items(meta: ChatMeta, entry: Dict[str, Any], *, clean, topic_links,
                 "link", _importance(row.get("importance")),
                 title + (f" — {note}" if note else ""), "", link_links(row)))
     more_raw = entry.get("more")
-    more = []
+    more: List[Tuple[str, Optional[str]]] = []
     if isinstance(more_raw, list):
         for value in more_raw[:MORE_MAX]:
+            # С 08.10 мелочь — {text, ref}: номер сообщения даёт ссылку в
+            # уровне B. Прежняя форма — строка без ссылки.
+            ref = value.get("ref") if isinstance(value, dict) else None
+            if isinstance(value, dict):
+                value = value.get("text")
             text = clean(restore(value, names_key), MORE_ITEM_LIMIT) if isinstance(value, str) else ""
             if text:
-                more.append(text)
+                url = more_link(ref) if ref is not None else None
+                more.append((text, url if url and _INLINE_SAFE_URL.fullmatch(url) else None))
     return items, more
 
 

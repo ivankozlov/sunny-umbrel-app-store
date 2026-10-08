@@ -151,14 +151,19 @@ what the Sunny worker already supports (tier A); bold, quotes and inline labels
 remains `0.2.1`. Store enable commit `f74ef77` pins index digest
 `sha256:d93cae2b486ed3b45aefe9f4436dd03fe3d49db6689ff5c8d36d7c529f2cb048`.
 
-`0.2.24` is prepared as a disabled Phase-A package (tier B of the digest guideline).
+`0.2.24` (tier B of the digest guideline) is published and enabled: Store `f33fb9f`, index
+`sha256:9fa1dc5608b32aa91dff875343663172cd4358df10a7afcdace4d712a0c82ada`.
 With "Расширенное" formatting switched on in the UI it emits a narrow markup —
 `**bold**`, `__italic__`, `[label](url)` inside a line, `> ` and `>> ` quote lines — for the
 Sunny `chats_text_v3` renderer; the "Главное" block becomes a quote, topic titles bold, links
 inline with labels, and news beyond the fourth go into a collapsible quote. The switch is off by
-default and stays in `data/config/digest-style.json`; switch it on only after the server renderer
-ships with the next full sport release. Model text is stripped of the same markup, so only code
-sets it. The collector wire version remains `0.2.1`. Publication and device Update are pending.
+default and stays in `data/config/digest-style.json`; the server renderer shipped on 2026-10-06
+inside sport v2.12, so the switch may be turned on after the device Update. Model text is stripped
+of the same markup, so only code sets it. The collector wire version remains `0.2.1`.
+
+`0.2.25` (prepared, not published) links every item of the tier-B "Ещё" line to its source
+message: folded topics, minor news and the model's small notes, which now come with a message
+number. Tier A is unchanged.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.15` have public multi-arch images.

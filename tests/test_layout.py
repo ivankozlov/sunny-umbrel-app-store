@@ -318,6 +318,80 @@ class TestBugDigestRichSecondReview20261006(unittest.TestCase):
         self.assertNotIn("[Сбер]", note)
 
 
+class TestBugDigestMoreLinks20261008(unittest.TestCase):
+    """Иван 08.10: в строке «Ещё» уровня B не было ссылок.
+
+    Свёрнутые темы и мелкие новости знают своё сообщение, но строка «Ещё»
+    печатала только заголовки; мелочи модели были строками без номера.
+    Теперь пункт — ссылка на permalink источника; материал за подпись не
+    прячется; бюджет строки — по видимому тексту, не по разметке."""
+
+    RICH = DigestLayout(date(2026, 10, 8), LAYOUT.chats, rich=True)
+
+    def test_overflow_low_and_more_become_links(self):
+        text = render_digest({"chats": [{"chat": "Клуб", "topics": [
+            topic(f"t{i}", f"Тема {i}", "high", refs=(i,)) for i in range(1, 6)] + [
+            topic("low", "Мелкая", "low", refs=(7,))],
+            "more": [{"text": "Квартира с потолками", "ref": 8}, "Старая мелочь"]}]},
+            SOURCES, layout=self.RICH)
+        self.assertIn("__Ещё:__ [Тема 5](https://t.me/c/1/105); "
+                      "[Мелкая](https://t.me/c/1/107); "
+                      "[Квартира с потолками](https://t.me/c/1/108)", text)
+
+    def test_more_without_source_stays_italic(self):
+        text = render_digest({"chats": [{"chat": "Клуб", "more": [
+            "Старая мелочь", {"text": "Без номера"}, {"text": "Чужой", "ref": 999},
+            {"text": "Булев", "ref": True}]}]}, SOURCES, layout=self.RICH)
+        self.assertIn("**🏛 Клуб**\n__Ещё:__ __Старая мелочь__; __Без номера__; __Чужой__", text)
+        self.assertNotIn("](", text)
+
+    def test_news_low_items_link_to_post(self):
+        text = render_digest({"chats": [{"chat": "TNN", "links": [
+            {"title": "Уровень Невы 119 см", "ref": 3, "importance": "low"},
+            {"title": "Переиздание Bloodhound Gang", "ref": 4, "importance": "low"}]}]},
+            SOURCES, layout=self.RICH)
+        self.assertIn("**📰 TNN**\n__Ещё:__ [Уровень Невы 119 см](https://t.me/c/1/103); "
+                      "[Переиздание Bloodhound Gang](https://t.me/c/1/104)", text)
+
+    def test_material_is_not_hidden_behind_title(self):
+        text = render_digest({"chats": [{"chat": "TNN", "links": [
+            {"title": "Новость", "ref": 39, "materials": [1], "importance": "low"}]}]},
+            {}, material_urls={39: ["https://evil.example/x"]}, layout=self.RICH)
+        self.assertIn("__Ещё:__ __Новость__", text)
+        self.assertNotIn("evil.example", text)
+
+    def test_budget_counts_visible_text_and_keeps_links_whole(self):
+        import re
+        titles = ["Длинный заголовок номер один про очень важные вещи и детали",
+                  "Второй длинный заголовок тоже про многое и разное сразу тут",
+                  "Третий длинный заголовок который уже не поместится в строку"]
+        text = render_digest({"chats": [{"chat": "Клуб", "more": [
+            {"text": title, "ref": n} for n, title in enumerate(titles, 1)]}]},
+            SOURCES, layout=self.RICH)
+        line = next(row for row in text.split("\n") if row.startswith("__Ещё:__"))
+        links = re.findall(r"\[([^\]]+)\]\((https://t\.me/c/1/\d+)\)", line)
+        visible = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line).replace("__", "")
+        self.assertLessEqual(len(visible), 160)
+        self.assertEqual(len(links), 3)
+        self.assertTrue(links[-1][0].endswith("…"))
+        self.assertEqual(re.sub(r"\[[^\]]+\]\([^)]+\)", "", line.split(" ", 1)[1])
+                         .replace("; ", ""), "")
+
+    def test_more_text_cannot_inject_link(self):
+        text = render_digest({"chats": [{"chat": "Клуб", "more": [
+            {"text": "Жми [сюда](https://evil.example/x)", "ref": 2}]}]},
+            SOURCES, layout=self.RICH)
+        self.assertNotIn("](https://evil.example", text)
+        self.assertIn("[Жми (сюда)(https://evil.example/x)](https://t.me/c/1/102)", text)
+
+    def test_tier_a_line_is_unchanged(self):
+        text = render_digest({"chats": [{"chat": "Клуб", "topics": [
+            topic(f"t{i}", f"Тема {i}", "high") for i in range(1, 6)],
+            "more": [{"text": "Мелочь", "ref": 2}, "Строка"]}]}, SOURCES, layout=LAYOUT)
+        self.assertIn("\nЕщё: Тема 5; Мелочь; Строка", text)
+        self.assertNotIn("__", text)
+
+
 class TestChatDisplayValidation20261006(unittest.TestCase):
     """Значки чатов — только из палитры, только для зафиксированных чатов."""
 

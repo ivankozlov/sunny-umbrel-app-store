@@ -398,6 +398,12 @@ content, receiver keys, or rendered runtime configuration.
   block after the notices starts with the bold header `**☀️ Чаты`; tier-A text stays v2,
   where model text is not cleaned. The switch is honest only after the server renderer is
   deployed; before that the markup would arrive raw.
+- "Ещё" links (`0.2.25`, owner's request 2026-10-08): in tier B every "Ещё" item is
+  `[title](permalink)` of its source message; the model returns `more` as
+  `{"text", "ref"}` (a bare string is still accepted and stays plain). The target is only the
+  code-built source permalink, never a material URL: a chat member sets that target, and the
+  title label would hide its host. The 160-character budget counts visible text, never the
+  markup, so truncation cannot cut a link apart. Tier A keeps the plain line.
 - Every chat returning empty lists is an answer, not a failure — the prompt
   explicitly allows "nothing notable today", and the issue then says so in one
   line. An empty `chats` array is a failure: the model walked no chat at all.

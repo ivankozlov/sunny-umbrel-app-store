@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Chats
-version: "0.2.24"
+version: "0.2.25"
 tagline: One daily digest and morning read receipts for selected chats
 description: >-
   Resolves message links for only the explicitly selected Telegram groups.
@@ -20,12 +20,10 @@ description: >-
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  Optional rich digest formatting: bold headings, the "Главное" block as a
-  quote, links with labels inside the line, and the tail of the news feed in
-  a collapsible quote. It is off by default and must only be switched on in
-  "Оформление выпуска" after the Sunny server renders chats_text_v3;
-  otherwise the markup would arrive raw. Model text is stripped of markup so
-  only the app sets it. The collector wire protocol remains 0.2.1.
+  With rich digest formatting switched on, every item of the "Ещё" line links
+  to its own message, so folded topics, minor news and small notes can be
+  opened from the digest. Only the message permalink is used as a link target;
+  an item without one stays plain. The collector wire protocol remains 0.2.1.
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store
 dependencies: []
