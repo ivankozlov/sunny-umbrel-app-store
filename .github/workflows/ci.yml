@@ -9,7 +9,8 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    # Cached Chromium needs unprivileged user namespaces for its sandbox.
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
       - name: Check out source

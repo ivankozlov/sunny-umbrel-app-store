@@ -11,11 +11,13 @@ jobs:
   native:
     strategy:
       fail-fast: false
+      # Ubuntu 24.04 blocks cached Chromium's sandbox with its userns policy.
+      # Supported 22.04 VMs keep the browser sandbox and Docker guards intact.
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: ubuntu-22.04
             architecture: amd64
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-22.04-arm
             architecture: arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60

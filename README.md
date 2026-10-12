@@ -481,7 +481,7 @@ Wire `COLLECTOR_VERSION` deliberately stays `0.2.1` until an explicit chain migr
 Run `python3 scripts/check_package.py --release` before every enabling commit.
 
 For the `0.3.0` candidate, `native-security.yml` runs on the standard native
-`ubuntu-24.04` and `ubuntu-24.04-arm` GitHub VMs before the publish job can access
+`ubuntu-22.04` and `ubuntu-22.04-arm` GitHub VMs before the publish job can access
 GHCR. `scripts/check_native_release.py` checks host/daemon/image architecture,
 actual image source, offline tests without skips, vault/Argon2, native SSH/Mihomo,
 active-job cancellation, six migration crash barriers and the unchanged browser
@@ -491,6 +491,8 @@ verified against a temporary loopback CA, and saved container/network IDs and
 labels must be absent after cleanup. These are synthetic CI fixtures, not proof
 of the owner's installation or permission to Update. The VM's core handler is
 set to `core` only in that disposable CI job; AppArmor/seccomp are not disabled.
+The browser jobs use supported 22.04 VMs because 24.04's default user-namespace
+policy rejects the cached Chromium sandbox; no `--no-sandbox` workaround is used.
 No native arm64 result has yet been recorded for this prepared workflow.
 
 Never overwrite a version tag, use a mutable tag without its digest, or enable the
