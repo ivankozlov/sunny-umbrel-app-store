@@ -5,7 +5,7 @@ import json
 import os
 from typing import Any, Dict
 
-from .collector import Collector
+from .guardian_engine import Collector
 from .storage import Paths, canonical_json_bytes, safe_unlink
 
 
@@ -113,6 +113,10 @@ async def _scheduler(collector: Collector) -> None:
 
 
 async def serve(paths: Paths) -> None:
+    # Only encrypted guardian startup is a production entry point. Keep this
+    # harness for the scheduler tests; never accept real filesystem Paths.
+    if isinstance(paths, Paths):
+        raise RuntimeError("use the encrypted guardian service")
     collector = Collector(paths)
     safe_unlink(paths.ipc_socket)
     server = await asyncio.start_unix_server(

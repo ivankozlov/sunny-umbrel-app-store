@@ -9,6 +9,27 @@ content, receiver keys, or rendered runtime configuration.
 
 ## Security invariants
 
+- Before changing vault/passkeys/guardian, preparing role directories or attempting
+  the `0.3.0` security rollout, read `SECURITY.md` and the owner runbook in full.
+  The owner runbook is `umbrel/SECURITY_ROLLOUT.md` in the private Sunny repository;
+  it is deliberately not exported to this public snapshot. The pre-migration
+  two-role audit does not prove the candidate: Linux/owner acceptance and
+  per-action publication/Update/migration approvals remain mandatory.
+- Secret filesystem adapters exist only in guardian. Never add plaintext fallback
+  or environment switches for memory protections. Jobs/admin sockets authenticate
+  kernel peer UIDs and have separate mounts; jobs never expose Telegram/admin RPC.
+  Display/source mappings and rendering stay in guardian. Pending/checkpoint fsync
+  ordering remains in its existing config domain.
+- Model jobs carry both MONOTONIC and BOOTTIME expiries; a suspend gap invalidates
+  the grant before mailbox delivery and every HTTPS send. Do not reduce this to
+  an asyncio timeout: Linux monotonic stops during suspend. Reset must fsync its
+  revocation warning before the guardian's first cancellation/cleanup await.
+- A vault replace followed by directory-fsync failure has unknown commit state:
+  close the vault and stop, never keep the old DEK or resume a previous snapshot
+  from RAM. Changing the phrase rotates the DEK. Native exec resets dumpability;
+  prove zero inherited core limits and refuse piped host core handlers instead of
+  claiming PR_SET_DUMPABLE survives exec. See `SECURITY.md` for the remaining limits.
+
 - Runtime reads one immutable set of 1–16 exact group/supergroup `InputPeer`
   values. Setup accepts one message link per group, durably enters a one-shot
   `resolving_links` phase before paged dialog enumeration, and permanently disables lookup
@@ -449,14 +470,14 @@ python3 -m compileall -q src tests scripts
 
 In the `umbrel/` subtree of the private source repository `ivankozlov/sunny/main`,
 `scripts/check_package.py --release` must remain red: the disabled manifest and release
-placeholder are the intentional Phase-A state of the source tree. This does not
-describe the Store `main`, where the enabling commits live — it carries enabled
-`v0.2.14`, with the historical enabled `v0.2.5` still in its history. Distribution was
-withdrawn on 2026-08-14 and reopened on 2026-08-17; the public GHCR package now holds
-`v0.2.6` through `v0.2.14`, while `v0.2.5` stays deleted. Every release requires
+placeholder are the intentional Phase-A state of the source tree. Enabling commits
+live only in the Store after the real image digest has been independently verified.
+Distribution was withdrawn on 2026-08-14 and reopened on 2026-08-17;
+the withdrawn `v0.2.5` stays deleted. Every release requires
 separate approval, a new semver/tag, a real independently verified multi-architecture
 digest, and a separate enabling commit; never overwrite the withdrawn `v0.2.5` tag. The publish job stays `main`-only behind
 the protected `ghcr-release` Environment;
 privileged QEMU/BuildKit helpers remain digest-pinned.
-The manifest's `defaultShell` stays pinned to `collector`, because VPN and
-session diagnostics require the private/config mounts absent from `web`.
+The manifest's `defaultShell` stays pinned to `collector` for package continuity.
+In `0.3.0`, owner setup and private/config diagnostics use the `guardian` console
+as UID 1000; collector and web no longer have those mounts.

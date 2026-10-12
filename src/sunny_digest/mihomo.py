@@ -174,6 +174,7 @@ class MihomoRuntime:
         startup_timeout: float = 20.0,
         stop_timeout: float = 5.0,
         probe_interval: float = 0.1,
+        require_memory_guards: bool = False,
     ):
         if startup_timeout <= 0 or stop_timeout <= 0 or probe_interval < 0:
             raise ValueError("Mihomo runtime timeouts are invalid")
@@ -185,6 +186,7 @@ class MihomoRuntime:
         self.startup_timeout = startup_timeout
         self.stop_timeout = stop_timeout
         self.probe_interval = probe_interval
+        self.require_memory_guards = require_memory_guards
         self._process: Optional[asyncio.subprocess.Process] = None
         self._cleanup_task: Optional[asyncio.Task[None]] = None
         self._ready = False
@@ -200,6 +202,11 @@ class MihomoRuntime:
         if self._temporary is not None or self.paths is not None:
             raise RuntimeError("Mihomo runtime directory was not cleaned")
         try:
+            if self.require_memory_guards:
+                from .memory_guard import verify_native_parent
+                from .secret_files import require_private_tmpfs
+                verify_native_parent()
+                require_private_tmpfs(self.runtime_parent)
             self._temporary = tempfile.TemporaryDirectory(
                 prefix="sunny-mihomo-", dir=str(self.runtime_parent))
             self.paths = MihomoPaths.for_runtime_root(Path(self._temporary.name))
@@ -224,6 +231,9 @@ class MihomoRuntime:
                 umask=0o077,
                 start_new_session=True,
             )
+            if self.require_memory_guards:
+                from .memory_guard import verify_native_child
+                verify_native_child(self._process.pid)
             await self._wait_until_ready()
             self._ready = True
         except BaseException:

@@ -15,6 +15,10 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 
 def atomic_write_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
+    from .vault_storage import VaultRecord
+    if isinstance(path, VaultRecord):
+        path.write(data)
+        return
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory_fd = os.open(
         path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -67,6 +71,13 @@ def read_json(path: Path, max_bytes: int = 128 * 1024) -> Dict[str, Any]:
 
 
 def safe_unlink(path: Path) -> None:
+    from .vault_storage import VaultRecord
+    if isinstance(path, VaultRecord):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
     try:
         path.unlink()
     except FileNotFoundError:
@@ -88,7 +99,12 @@ def unlink_atomic_material(paths: Iterable[Path]) -> None:
     must remove the exact prefixes as well as the canonical names.  Prefixes
     are derived from an explicit allowlist; unrelated dotfiles are untouched.
     """
-    canonical = tuple(paths)
+    from .vault_storage import VaultRecord
+    all_paths = tuple(paths)
+    for path in all_paths:
+        if isinstance(path, VaultRecord):
+            safe_unlink(path)
+    canonical = tuple(path for path in all_paths if not isinstance(path, VaultRecord))
     for path in canonical:
         safe_unlink(path)
     by_parent: Dict[Path, set[str]] = {}

@@ -17,13 +17,20 @@ request produces the online status was not established, so the owner chose a sho
 morning window and dropped mentions.
 
 > **Release gate:** install only a commit whose manifest has `disabled: false`
-> and whose two Compose services pin the same real immutable multi-architecture
+> and whose three runtime Compose services pin the same real immutable multi-architecture
 > digest. A checkout with `disabled: true` or
 > `RELEASE_GATE_MULTIARCH_DIGEST` is intentionally not installable.
 
 The app/package/image ID remains `sunny-personal-digest` for release continuity;
 the v0.2 product name is **Sunny Personal Chats**. v0.2 is a breaking credential
 generation and does not migrate the unpublished v0.1 pilot state.
+
+The `0.3.0` candidate introduces an encrypted vault and an isolated guardian.
+A disabled candidate is **not approved for Update**. The last owner-reported
+runtime before migration was `0.2.25`, with the earlier two-role deployment.
+Read [SECURITY.md](SECURITY.md) for the threat model. The owner rollout runbook is
+`umbrel/SECURITY_ROLLOUT.md` in the private Sunny repository and is not exported
+to this snapshot. The historical release notes below describe the earlier releases.
 
 The recorded state of the physical Umbrel on 2026-08-25 was `0.2.11`: eight exact
 peers, the receiver generation, durable baseline, session, and active monitoring state
@@ -161,14 +168,14 @@ default and stays in `data/config/digest-style.json`; the server renderer shippe
 inside sport v2.12, so the switch may be turned on after the device Update. Model text is stripped
 of the same markup, so only code sets it. The collector wire version remains `0.2.1`.
 
-`0.2.25` (prepared, not published) links every item of the tier-B "Ещё" line to its source
-message: folded topics, minor news and the model's small notes, which now come with a message
+`0.2.25` links every item of the tier-B "Ещё" line to its source message: folded
+topics, minor news and the model's small notes, which now come with a message
 number. Tier A is unchanged.
 
 The Store repository and the public GHCR package were withdrawn on 2026-08-14 and
 restored on 2026-08-17; `0.2.6` through `0.2.15` have public multi-arch images.
-**Update** and uninstall/reinstall therefore have a public source again. The device now
-runs public `0.2.15` according to the owner; its update from `0.2.9` to `0.2.10` exercised
+**Update** and uninstall/reinstall therefore have a public source again. The owner
+last reported public `0.2.25`; the earlier update from `0.2.9` to `0.2.10` exercised
 the real recreate/pull path and preserved state. Docker image pruning remains out of bounds without a separate destructive
 approval and a concrete need, and a future distribution closure could remove the public
 source again. The `umbrel/` subtree of private source
@@ -291,7 +298,7 @@ specific chats. Containment is enforced locally and fails closed:
 - when that pull skips unread messages of a live chat, the issue says so in its first
   lines: the wire declares the range from the receiver's cursor and hides the gap
   entirely, so the text is the only honest channel;
-- raw daily chat text exists only in collector memory and the ZDR OpenRouter
+- raw daily chat text exists only in guardian/model-worker memory and the ZDR OpenRouter
   request. Every request sets `provider.zdr=true` and
   `provider.data_collection=deny`; Opus uses an explicit `max_tokens=32768` budget;
 - bounded mention events were an explicit privacy exception until 2026-09-13: they were
@@ -319,22 +326,34 @@ authorized session harmless. On suspected compromise terminate the device named
 Umbrel app_proxy (Umbrel login)
         │
         ▼
-web :8080 (second Basic Auth with APP_PASSWORD)
-        │ narrow JSON IPC over Unix socket
+web :8080, UID 1002 (APP_PASSWORD, fixed HTTPS Origin, CSRF)
+        │ admin socket; passkey verification is inside guardian
         ▼
-collector ── exact Telegram peers
+guardian, UID 1000 ── encrypted vault, policy, scheduler, exact Telegram peers
     │      ├── loopback SOCKS → VLESS/REALITY → Telegram only
-    │      ├── OpenRouter ZDR (daily raw text only, ssh forward via DO)
     │      └── SSH forced-command receiver (direct)
     │
-    ├── /data/config   locked settings, checkpoints, pending final payloads
-    ├── /data/private  Telegram session and provider/uploader credentials
-    └── /data/runtime  socket, redacted status, heartbeat
+    ├── /data/config   checkpoints, pending final payloads, revocation markers
+    ├── /data/private  encrypted vault + public browser hints
+    ├── /data/runtime  role-separated sockets and generic heartbeat
+    └── jobs socket → collector, UID 1001 → killable model worker
+                          └── own SSH tunnel + TLS → OpenRouter ZDR
 ```
 
-`web` mounts only `data/runtime`. Credentials necessarily transit through its
-authenticated forms and Unix-socket client during setup, but the web container
-does not mount or write `data/config` or `data/private`.
+`web` mounts only its admin IPC directory; collector mounts only its jobs IPC
+directory. Both lack config/private, have distinct UIDs and own PID/network
+namespaces. Guardian alone owns credentials and delivery checkpoints. Source
+references, display names and deterministic digest rendering stay in guardian;
+collector receives a bounded pseudonymous prompt plus the model API/tunnel keys.
+Secrets required by OpenSSH/Mihomo live briefly in each role's private tmpfs.
+All three roles set core limits to zero and have zero cgroup swap allowance.
+
+Guardian starts locked after restart/update/reboot. Unlock needs the separate vault
+phrase and a fresh UV-required passkey assertion. Web or collector restarts preserve
+the running guardian's unlocked state. Sensitive admin changes need a fresh assertion
+bound to the operation, normalized payload and current vault identity/revision.
+Setup/presentation steps use a 15-minute authenticated view lease and retain the
+existing one-hour uninterrupted setup limit. No daily OTP is required.
 
 Umbrel backups exclude `data/private`, `data/runtime`, both pending payloads, and
 their crash-temporary files. Config retains a non-secret outstanding-session marker.
@@ -342,6 +361,11 @@ After a config-only restore, terminate or verify the old **Sunny Umbrel** device
 Telegram, acknowledge that action in the UI, and provision a fresh credential epoch.
 
 ## Provisioning
+
+For `0.3.0`, first complete the separate HTTPS/passkey/bootstrap/migration procedure
+in the private Sunny owner runbook `umbrel/SECURITY_ROLLOUT.md`. The steps below
+describe Telegram/provider provisioning after vault unlock. Updating the current
+device is a separate approval.
 
 1. Create Telegram application credentials at `my.telegram.org`.
 2. Prepare an HTTPS subscription containing at least one VLESS/REALITY TCP node with
@@ -367,7 +391,7 @@ Telegram, acknowledge that action in the UI, and provision a fresh credential ep
    acknowledgements visible on every Telegram client.
 8. Finish Telegram login, paste one message link from each of 1–16 groups, then
    verify the resolved titles and lock the exact checkbox set within the same
-   one-hour collector process. Do not submit two links from the same group.
+   one-hour guardian process. Do not submit two links from the same group.
 
 Accepted links are ordinary public or private `https://t.me/...` message links,
 including forum-topic links; a forum link selects the whole group. Linked-discussion
@@ -417,27 +441,25 @@ Docker is required for the production image check:
 docker build --platform linux/amd64 -t sunny-personal-digest:local .
 ```
 
-The real web path can be rendered without credentials with the test-only fake IPC
-fixture. Production code still requires the configured Unix socket.
-
-The Umbrel app terminal defaults to the `collector` service. That is intentional:
-VPN/session diagnostics need `data/config` and `data/private`, which are absent from
-the deliberately narrower `web` container.
+The browser gate runs the production HTTP handler/JS and real WebAuthn verification
+against an in-memory policy fixture and two CDP virtual authenticators. All browser
+requests are intercepted; it uses no owner credentials or live endpoints:
 
 ```bash
-tmpdir="$(mktemp -d)"
-PYTHONPATH=src python3 tests/fake_ipc_server.py \
-  --socket "$tmpdir/control.sock" --phase fresh
-
-# In another terminal:
-SUNNY_IPC_SOCKET="$tmpdir/control.sock" SUNNY_WEB_HOST=127.0.0.1 \
-SUNNY_WEB_PORT=18080 SUNNY_UI_USERNAME=sunny SUNNY_UI_PASSWORD=test-only \
-PYTHONPATH=src python3 -m sunny_digest.main web
+python3 -m pip install playwright==1.58.0
+python3 -m playwright install chromium-headless-shell
+PYTHONPATH=src python3 scripts/check_security_ui.py
 ```
 
-Open `http://127.0.0.1:18080/` and authenticate as `sunny` / `test-only`.
-Use the fixture phases to inspect login, message-link confirmation, locked, and
-activation screens.
+Run these commands in a dedicated local test environment. `--browser` accepts an
+already cached headless-shell and `--out-dir` writes synthetic screenshots.
+The browser gate does not prove owner device verification, a real TLS chain or
+the Linux/container protections. `main` intentionally refuses non-Linux production
+startup rather than exposing a plaintext development bypass.
+
+The Umbrel default terminal still opens collector, which no longer owns credentials.
+For the owner console commands, select the **guardian** container in Portainer and
+use UID `1000`. Diagnostics must not print secret files or full Docker environment.
 
 ## Two-phase GitHub/GHCR release
 
@@ -457,6 +479,19 @@ placeholder; the enabling commit lives only in the Store repository. Any further
 release must use a new semver/tag and repeat the full sequence.
 Wire `COLLECTOR_VERSION` deliberately stays `0.2.1` until an explicit chain migration.
 Run `python3 scripts/check_package.py --release` before every enabling commit.
+
+For the `0.3.0` candidate, `native-security.yml` runs on the standard native
+`ubuntu-24.04` and `ubuntu-24.04-arm` GitHub VMs before the publish job can access
+GHCR. `scripts/check_native_release.py` checks host/daemon/image architecture,
+actual image source, offline tests without skips, vault/Argon2, native SSH/Mihomo,
+active-job cancellation, six migration crash barriers and the unchanged browser
+assertions against the native image's HTTP/WebAuthn backend. Chromium runs on the
+CI host with its sandbox; the backend remains in the hardened image. Test TLS is
+verified against a temporary loopback CA, and saved container/network IDs and
+labels must be absent after cleanup. These are synthetic CI fixtures, not proof
+of the owner's installation or permission to Update. The VM's core handler is
+set to `core` only in that disposable CI job; AppArmor/seccomp are not disabled.
+No native arm64 result has yet been recorded for this prepared workflow.
 
 Never overwrite a version tag, use a mutable tag without its digest, or enable the
 app before both the repository and image are available through the explicitly approved

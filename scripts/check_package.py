@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parent.parent
 APP = ROOT / "sunny-personal-digest"
 PLACEHOLDER = "RELEASE_GATE_MULTIARCH_DIGEST"
@@ -44,6 +46,78 @@ def service_block(compose: str, name: str) -> str:
     if not match:
         return ""
     return match.group(1)
+
+
+def _yaml_list(block: str, key: str) -> tuple[str, ...]:
+    match = re.search(rf"(?m)^    {re.escape(key)}:\n((?:      - [^\n]*\n)+)", block)
+    return tuple(line.strip()[2:] for line in match.group(1).splitlines()) if match else ()
+
+
+def role_layout_errors(compose: str) -> list[str]:
+    """Closed allowlist for the three security roles."""
+    errors: list[str] = []
+    class UniqueLoader(yaml.SafeLoader):
+        def construct_mapping(self, node, deep=False):
+            keys = set()
+            for key, _ in node.value:
+                name = self.construct_object(key, deep=True)
+                if name in keys:
+                    raise ValueError("duplicate Compose key")
+                keys.add(name)
+            return super().construct_mapping(node, deep=deep)
+    try:
+        document = yaml.load(compose, Loader=UniqueLoader)
+        if not isinstance(document, dict) or set(document) != {"version", "services"}:
+            raise ValueError("Compose root is not closed")
+        services = document["services"]
+        if not isinstance(services, dict) or set(services) != {"app_proxy", "web", "collector", "guardian"}:
+            raise ValueError("Compose services are not closed")
+        common = {"image", "command", "user", "init", "restart", "stop_grace_period",
+                  "read_only", "cap_drop", "security_opt", "tmpfs", "ulimits",
+                  "pids_limit", "mem_limit", "memswap_limit", "environment",
+                  "volumes", "healthcheck"}
+        if set(services["app_proxy"]) != {"environment"}:
+            raise ValueError("app proxy fields are not closed")
+        for name in ("web", "collector", "guardian"):
+            role = services[name]
+            if not isinstance(role, dict) or set(role) != common | ({"group_add"} if name == "guardian" else set()):
+                raise ValueError("runtime fields are not closed")
+            if (role["command"] != [name] or role["read_only"] is not True
+                    or role["cap_drop"] != ["ALL"]
+                    or role["security_opt"] != ["no-new-privileges:true"]
+                    or role["ulimits"] != {"core": {"soft": 0, "hard": 0}}):
+                raise ValueError("runtime protections differ")
+    except (yaml.YAMLError, ValueError, TypeError, KeyError):
+        errors.append("Compose document has unsupported fields or invalid protections")
+    if set(re.findall(r"(?m)^  ([a-zA-Z0-9_-]+):$", compose)) != {"app_proxy", "web", "collector", "guardian"}:
+        errors.append("compose services must be exactly app_proxy/web/collector/guardian")
+    # This checker accepts the deliberately narrow checked-in Compose format.
+    # Aliases, overrides and duplicate keys can make a regex see the safe first
+    # value while Compose applies a later, unsafe one.
+    if re.search(r"(?m)^\s*(?:pid|ipc|network_mode|volumes_from|extends|build|privileged|cap_add|devices|ports):", compose):
+        errors.append("namespace sharing and extra runtime privileges are forbidden")
+    if re.search(r"(?m)^\s*(?:<<:|[a-zA-Z0-9_-]+:\s*[&*])", compose):
+        errors.append("Compose aliases and merge overrides are unsupported")
+    service_names = re.findall(r"(?m)^  ([a-zA-Z0-9_-]+):$", compose)
+    if len(service_names) != len(set(service_names)):
+        errors.append("Compose service names must be unique")
+    expected = {
+        "web": ("1002", ("${APP_DATA_DIR}/data/runtime/ipc/admin:/data/ipc:ro",), ("/tmp:rw,noexec,nosuid,nodev,size=16m",)),
+        "collector": ("1001", ("${APP_DATA_DIR}/data/runtime/ipc/jobs:/data/ipc:ro",), ("/tmp:rw,noexec,nosuid,nodev,size=32m", "/run/collector-private:rw,noexec,nosuid,nodev,size=32m,mode=0700,uid=1001,gid=1001")),
+        "guardian": ("1000", ("${APP_DATA_DIR}/data/config:/data/config", "${APP_DATA_DIR}/data/private:/data/private", "${APP_DATA_DIR}/data/runtime:/data/runtime"), ("/tmp:rw,noexec,nosuid,nodev,size=32m", "/run/guardian-private:rw,noexec,nosuid,nodev,size=32m,mode=0700,uid=1000,gid=1000")),
+    }
+    for name, (uid, volumes, tmpfs) in expected.items():
+        block = service_block(compose, name)
+        keys = re.findall(r"(?m)^    ([a-zA-Z0-9_-]+):", block)
+        if len(keys) != len(set(keys)):
+            errors.append(f"{name} contains duplicate runtime fields")
+        if f'user: "{uid}:{uid}"' not in block: errors.append(f"{name} has an unexpected uid")
+        if _yaml_list(block, "volumes") != volumes: errors.append(f"{name} volumes are not the exact allowlist")
+        if _yaml_list(block, "tmpfs") != tmpfs: errors.append(f"{name} tmpfs are not the exact allowlist")
+        memory = re.search(r"(?m)^    mem_limit: ([1-9][0-9]*m)\n    memswap_limit: ([1-9][0-9]*m)$", block)
+        if memory is None or memory.group(1) != memory.group(2): errors.append(f"{name} swap allowance must be zero")
+        if "core:\n        soft: 0\n        hard: 0" not in block: errors.append(f"{name} core limit must be zero")
+    return errors
 
 
 def telegram_client_guard(gateway: str) -> tuple[bool, bool, bool]:
@@ -409,9 +483,9 @@ def main() -> int:
         r"v([0-9]+\.[0-9]+\.[0-9]+)@sha256:([^\s]+)$",
         compose,
     )
-    checks.require(len(images) == 2, "both runtime services must use the pinned GHCR image")
-    if len(images) == 2:
-        checks.require(images[0] == images[1], "web and collector images must be identical")
+    checks.require(len(images) == 3, "all three runtime services must use the pinned GHCR image")
+    if len(images) == 3:
+        checks.require(len(set(images)) == 1, "runtime service images must be identical")
         if version_match:
             checks.require(all(version == version_match.group(1) for version, _ in images),
                            "manifest and image versions differ")
@@ -440,24 +514,42 @@ def main() -> int:
     }
     for pattern, message in forbidden.items():
         checks.require(re.search(pattern, compose) is None, message)
+    for pattern, message in {r"(?m)^\s*pid:\s*host$": "host PID namespace is forbidden", r"(?m)^\s*volumes_from:": "volumes_from is forbidden"}.items():
+        checks.require(re.search(pattern, compose) is None, message)
 
     web = service_block(compose, "web")
     collector = service_block(compose, "collector")
-    checks.require(bool(web) and bool(collector), "web/collector service blocks are required")
-    checks.require("/data/runtime:/data/runtime" in web, "web must mount runtime")
+    guardian = service_block(compose, "guardian")
+    for message in role_layout_errors(compose):
+        checks.require(False, message)
+    checks.require(bool(web) and bool(collector) and bool(guardian), "web/collector/guardian service blocks are required")
     checks.require("/data/config" not in web and "/data/private" not in web,
                    "web must not mount config/private")
-    for mount in ("/data/config:/data/config", "/data/private:/data/private",
-                  "/data/runtime:/data/runtime"):
-        checks.require(mount in collector, f"collector missing mount {mount}")
-    for name, block in (("web", web), ("collector", collector)):
-        checks.require('user: "1000:1000"' in block, f"{name} must run as uid 1000")
+    checks.require("/data/config" not in collector and "/data/private" not in collector,
+                   "collector must not mount config/private")
+    for mount in ("/data/config:/data/config", "/data/private:/data/private", "/data/runtime:/data/runtime"):
+        checks.require(mount in guardian, f"guardian missing mount {mount}")
+    expected_roles = (("web", web, "1002", "admin"), ("collector", collector, "1001", "jobs"), ("guardian", guardian, "1000", None))
+    for name, block, uid, socket_name in expected_roles:
+        checks.require(f'user: "{uid}:{uid}"' in block, f"{name} must run as uid {uid}")
         checks.require("read_only: true" in block, f"{name} rootfs must be read-only")
         checks.require("cap_drop:\n      - ALL" in block, f"{name} must drop all capabilities")
         checks.require("no-new-privileges:true" in block,
                        f"{name} must set no-new-privileges")
-        checks.require("pids_limit:" in block and "mem_limit:" in block,
+        checks.require("pids_limit:" in block and "mem_limit:" in block and "memswap_limit:" in block,
                        f"{name} must have process/memory limits")
+        checks.require("core:\n        soft: 0\n        hard: 0" in block,
+                       f"{name} must disable core dumps")
+        memory = re.search(r"mem_limit: (\d+m)\n    memswap_limit: (\d+m)", block)
+        checks.require(memory is not None and memory.group(1) == memory.group(2),
+                       f"{name} must have zero cgroup swap allowance")
+        if socket_name:
+            checks.require(f"/data/ipc/{socket_name}" in block,
+                           f"{name} must mount only its {socket_name} IPC directory")
+    checks.require('group_add:\n      - "1001"\n      - "1002"' in guardian,
+                   "guardian must join collector and web IPC groups")
+    checks.require("/run/collector-private" in collector and "/run/guardian-private" in guardian,
+                   "secret roles require separate private tmpfs directories")
     checks.require("SUNNY_UI_PASSWORD: ${APP_PASSWORD}" in web,
                    "second auth must use APP_PASSWORD")
     checks.require("APP_HOST: sunny-personal-digest_web_1" in compose,
@@ -517,7 +609,9 @@ def main() -> int:
         checks.require(marker in third_party_notices,
                        f"third-party notice is missing: {marker}")
     checks.require("--require-hashes" in dockerfile, "pip install must require hashes")
-    checks.require("USER 1000:1000" in dockerfile, "image must end as uid 1000")
+    for marker in ("groupadd --gid 1000 guardian", "groupadd --gid 1001 collector",
+                   "groupadd --gid 1002 web", "USER 1001:1001"):
+        checks.require(marker in dockerfile, f"Dockerfile missing role setup: {marker}")
     checks.require(re.search(r"(?m)^python-socks\[asyncio\]==2\.8\.2$",
                              requirements_input) is not None,
                    "requirements input must pin the Telethon SOCKS transport")
@@ -530,6 +624,14 @@ def main() -> int:
     checks.require(re.search(r"(?m)^pyyaml==6\.0\.3\s*\\$",
                              requirements) is not None,
                    "requirements lock must contain the Clash YAML parser")
+    checks.require(re.search(r"(?m)^cryptography==46\.0\.5$", requirements_input) is not None,
+                   "requirements input must pin cryptography for Vault")
+    checks.require(re.search(r"(?m)^webauthn==2\.7\.1$", requirements_input) is not None,
+                   "requirements input must pin WebAuthn")
+    checks.require(re.search(r"(?m)^cryptography==46\.0\.5\s*\\$", requirements) is not None,
+                   "requirements lock must contain cryptography")
+    checks.require(re.search(r"(?m)^webauthn==2\.7\.1\s*\\$", requirements) is not None,
+                   "requirements lock must contain WebAuthn")
     requirement_starts = list(re.finditer(
         r"(?m)^[A-Za-z0-9_.-]+(?:\[[A-Za-z0-9_,.-]+\])?==[^\s\\]+",
         requirements,
@@ -623,6 +725,9 @@ def main() -> int:
     for workflow in (ROOT / ".github/workflows").glob("*.yml"):
         body = text(workflow)
         for action in re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s]+)$", body):
+            if action == "./.github/workflows/native-security.yml":
+                checks.require((ROOT / action[2:]).is_file(), "native acceptance workflow is absent")
+                continue  # A local reusable workflow runs from this same immutable checkout.
             ref = action.rsplit("@", 1)[-1]
             checks.require(re.fullmatch(r"[0-9a-f]{40}", ref) is not None,
                            f"workflow action is not SHA-pinned: {action}")
@@ -633,7 +738,7 @@ def main() -> int:
             "publish workflow default and manifest versions differ",
         )
     for invariant in (
-        "gate:", "needs: gate", "persist-credentials: false",
+        "gate:", "needs: [gate, native]", "persist-credentials: false",
         "python -m unittest discover", "python scripts/check_package.py",
         "platforms: linux/amd64,linux/arm64", "sbom: true", "provenance: mode=max",
         "Refuse to overwrite an existing version tag",
@@ -661,6 +766,11 @@ def main() -> int:
                    "publish workflow must not grant package writes globally")
     checks.require("packages: write" not in gate_job,
                    "read-only release gate must not write packages")
+    native_job = service_block(publish, "native")
+    checks.require("uses: ./.github/workflows/native-security.yml" in native_job,
+                   "publish must run native acceptance before registry access")
+    checks.require("packages: write" not in native_job,
+                   "native acceptance must not write packages")
     checks.require("packages: write" in publish_job,
                    "only the publish job must receive package write access")
 

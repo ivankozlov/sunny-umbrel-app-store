@@ -6,7 +6,7 @@ on:
       version:
         description: Semver matching umbrel-app.yml (without v)
         required: true
-        default: "0.2.25"
+        default: "0.3.0"
         type: string
       bootstrap_empty_package:
         description: One-time bootstrap for an absent GHCR package
@@ -56,8 +56,11 @@ jobs:
           python scripts/check_package.py
           python -m compileall -q src tests scripts
 
+  native:
+    uses: ./.github/workflows/native-security.yml
+
   publish:
-    needs: gate
+    needs: [gate, native]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     environment: ghcr-release
@@ -155,5 +158,5 @@ jobs:
             echo "Image: \`ghcr.io/ivankozlov/sunny-personal-digest:v${RELEASE_VERSION}\`"
             echo "Digest: \`${IMAGE_DIGEST}\`"
             echo
-            echo "Make the GHCR package public, verify both architectures, then pin this digest in both Compose services."
+            echo "Make the GHCR package public, verify both architectures, then pin this digest in all three Compose services (guardian, collector, web)."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -11,6 +11,7 @@ from .openrouter import (
     blocking_fetch_response,
 )
 from .storage import canonical_json_bytes
+from .model_lease import validate_lease, require_lease
 
 
 def main() -> int:
@@ -20,8 +21,8 @@ def main() -> int:
         if not raw or len(raw) > MAX_WORKER_REQUEST_BYTES:
             return 2
         value = json.loads(raw.decode("utf-8"))
-        if not isinstance(value, dict) or set(value) != {
-                "schema", "prompt", "model", "api_key"}:
+        fields = {"schema", "prompt", "model", "api_key"}
+        if not isinstance(value, dict) or set(value) not in (fields, fields | {"lease"}):
             return 2
         prompt = value["prompt"]
         model = value["model"]
@@ -33,7 +34,13 @@ def main() -> int:
                 or not isinstance(api_key, str) or not 16 <= len(api_key) <= 512):
             return 2
         try:
-            response = blocking_fetch_response(prompt, model, api_key)
+            if "lease" in value:
+                lease = validate_lease(value["lease"])
+                require_lease(lease)
+                response = blocking_fetch_response(prompt, model, api_key, lease=lease)
+            else:
+                # Legacy helper is exercised only by offline state-machine tests.
+                response = blocking_fetch_response(prompt, model, api_key)
         except OpenRouterError as exc:
             # Наружу — только уже санитизированный код отказа и служебные
             # поля (HTTP-статус, finish_reason, id генерации), без текста
@@ -53,4 +60,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from .memory_guard import protect_process
+    protect_process()
     raise SystemExit(main())

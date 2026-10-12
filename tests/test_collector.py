@@ -12,8 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import sunny_digest.collector as collector_module
-from sunny_digest.collector import (
+import sunny_digest.guardian_engine as collector_module
+from sunny_digest.guardian_engine import (
     Collector,
     DIALOG_CANDIDATES_SCHEMA,
     RECENT_RUNS_LIMIT,

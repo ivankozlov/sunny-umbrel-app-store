@@ -6,7 +6,48 @@ Contact the repository owner privately through GitHub instead.
 
 ## Trust boundary
 
-The collector's Telegram session authorizes the same account capabilities as
+The `0.3.0` source is a disabled security candidate, not the current `0.2.24`
+deployment. Its rollout/acceptance gates are in [SECURITY_ROLLOUT.md](SECURITY_ROLLOUT.md).
+
+Only guardian owns the encrypted vault, Telegram policy and receipt state machine.
+The model collector and web have different UIDs, separate namespaces and separately
+authorized Unix sockets; neither mounts config/private. Model jobs cannot invoke
+Telegram, acknowledge messages, supply a receiver gate or change delivery cursors.
+The model role receives the OpenRouter API key and its tunnel key during a job:
+compromise can steal those keys and that job's prompt. Cancellation cannot erase
+data already copied by a hostile process. A missing cleanup ACK closes the job gate
+and requires a fresh locked guardian restart; the ACK itself is not cryptographic
+proof that a compromised collector obeyed it.
+
+Model grants carry paired host MONOTONIC/BOOTTIME expiries. A suspend gap invalidates
+queued and active grants and requires a fresh receiver gate. The HTTP child checks
+again before sending headers/prompt; active work is cancelled and reaped after resume.
+These cooperative checks cannot recall a request already accepted by the provider
+or stop a hostile collector using a copied model key independently.
+
+The vault uses Argon2id (64 MiB, 3 iterations, 4 lanes) and authenticated Fernet
+envelopes. Changing the phrase also rotates the DEK. Its keys are never persisted
+in plaintext. A valid older snapshot remains decryptable with its old phrase;
+whole-file rollback, historical snapshots, SSD forensic recovery, already stolen
+sessions and plaintext pending digest/checkpoint metadata are outside this protection.
+The encrypted vault remains excluded from Umbrel backups.
+
+Passkeys protect online admin operations, not offline decryption. Someone holding
+both the vault and its phrase can decrypt it without a passkey. WebAuthn requires
+UV, exact fixed HTTPS Origin/RP ID, one-use challenges, expiry and operation/payload
+binding. Public manifest entries are browser hints: authorization always uses the
+decrypted canonical passkeys. Host root, trusted guardian/web compromise, malicious
+UI code and deception about a legitimate action remain within the trust boundary.
+
+All role processes and Python workers refuse unknown/nonzero cgroup swap allowance,
+set zero soft/hard core limits and verify Linux dumpability is off. One DEK page is
+mlock'ed and marked DONTDUMP; other Python/KDF copies are not guaranteed zeroized or
+mlock'ed. Native exec resets dumpability: OpenSSH/Mihomo inherit zero core limits,
+and secret-bearing native use additionally refuses piped host core handlers.
+Private scratch must be owned tmpfs. Host hibernation or physical RAM extraction is
+not prevented by cgroup swap limits; host policy is a separate acceptance gate.
+
+The guardian's Telegram session authorizes the same account capabilities as
 any already-authorized Telegram client. Telegram 2FA protects new logins; it
 does not neutralize a stolen live session. Revoke the device named
 `Sunny Umbrel` in Telegram immediately if the host or app is suspected to be
@@ -41,7 +82,7 @@ history, peers, and read state are forbidden. API hash and StringSession reach t
 worker over stdin, never argv, environment, or a file, and its proxy is the exact
 `127.0.0.1:7891` SOCKS endpoint with no direct fallback. Ordinary failure restores the
 previous node/runtime; revocation cancels and reaps the candidate without reopening the
-old route. Mihomo config/cache live on collector `tmpfs` and are erased after the child
+old route. Mihomo config/cache live on guardian `tmpfs` and are erased after the child
 is physically reaped. Factory reset cannot promise SSD forensic erasure or revoke the
 provider token; rotate that token after compromise.
 

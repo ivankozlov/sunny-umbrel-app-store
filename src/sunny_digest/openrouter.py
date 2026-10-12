@@ -26,6 +26,7 @@ from .prompting import (
 )
 from .storage import canonical_json_bytes
 from .version import MAX_DIGEST_CHARS
+from .model_lease import require_lease
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -197,22 +198,43 @@ class _TunnelHTTPSConnection(http.client.HTTPSConnection):
     против 127.0.0.1 нельзя тем более: тогда любой, кто занял локальный порт,
     получил бы и запрос, и bearer-ключ."""
 
-    def __init__(self, tls_host: str, **kwargs: Any) -> None:
+    def __init__(self, tls_host: str, *, lease=None, **kwargs: Any) -> None:
         super().__init__(TUNNEL_HOST, TUNNEL_PORT, **kwargs)
         self._tls_host = tls_host
+        self._lease = lease
 
     def connect(self) -> None:
+        if self._lease is not None:
+            require_lease(self._lease)
         sock = socket.create_connection(
             (TUNNEL_HOST, TUNNEL_PORT), self.timeout, self.source_address)
         self.sock = self._context.wrap_socket(sock, server_hostname=self._tls_host)
+        if self._lease is not None:
+            try:
+                require_lease(self._lease)
+            except TimeoutError:
+                self.close()
+                raise
+
+    def send(self, data):
+        if self._lease is not None:
+            require_lease(self._lease)
+            if self.sock is None:
+                self.connect()
+            require_lease(self._lease)
+        return super().send(data)
 
 
 class _TunnelHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, *, lease=None):
+        super().__init__()
+        self._lease = lease
+
     def https_open(self, req):  # noqa: ANN001
         def build(host: str, **kwargs: Any) -> http.client.HTTPSConnection:
             kwargs.pop("context", None)
             return _TunnelHTTPSConnection(
-                host.split(":", 1)[0], context=ssl.create_default_context(), **kwargs)
+                host.split(":", 1)[0], context=ssl.create_default_context(), lease=self._lease, **kwargs)
 
         return self.do_open(build, req)
 
@@ -557,7 +579,7 @@ def _usage_summary(value: Any) -> Dict[str, Any]:
 
 
 def blocking_fetch_response(
-    prompt: str, model: str, api_key: str,
+    prompt: str, model: str, api_key: str, *, lease=None,
 ) -> Dict[str, Any]:
     """Запрос к OpenRouter: структура ответа и безопасная usage-сводка."""
     provider: Dict[str, Any] = {
@@ -596,8 +618,10 @@ def blocking_fetch_response(
         },
     )
     opener = urllib.request.build_opener(
-        _TunnelHTTPSHandler(), _RefuseRedirects())
+        _TunnelHTTPSHandler(lease=lease), _RefuseRedirects())
     try:
+        if lease is not None:
+            require_lease(lease)
         with opener.open(request, timeout=HTTP_TIMEOUT_S) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:

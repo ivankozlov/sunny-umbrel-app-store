@@ -117,6 +117,10 @@ async def _bounded_exchange(process: Any, request: bytes) -> bytes:
 async def generate_upload_key(paths: Paths, source_id: str) -> Tuple[str, str]:
     if paths.upload_key.exists() or paths.upload_public_key.exists():
         raise RuntimeError("upload key already exists")
+    if hasattr(paths, "vault"):
+        from .secret_files import generate_encrypted_ed25519
+        return generate_encrypted_ed25519(
+            paths, "upload_key", "upload_public_key", f"{source_id}@sunny-umbrel")
     args = [
         "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
         f"{source_id}@sunny-umbrel", "-f", str(paths.upload_key),
@@ -144,17 +148,17 @@ class SSHTransport:
         self.port = int(upload["port"])
         self.user = upload["user"]
 
-    def _args(self, command: str) -> list[str]:
+    def _args(self, command: str, *, identity=None, known_hosts=None) -> list[str]:
         if command not in ("status-v2", "monitor-upload-v2", "digest-upload-v2"):
             raise ValueError("unsupported receiver command")
         return [
             "ssh", "-F", "/dev/null", "-T",
-            "-i", str(self.paths.upload_key),
+            "-i", str(identity if identity is not None else self.paths.upload_key),
             "-p", str(self.port),
             "-o", "BatchMode=yes",
             "-o", "IdentitiesOnly=yes",
             "-o", "StrictHostKeyChecking=yes",
-            "-o", f"UserKnownHostsFile={self.paths.known_hosts}",
+            "-o", f"UserKnownHostsFile={known_hosts if known_hosts is not None else self.paths.known_hosts}",
             "-o", "GlobalKnownHostsFile=/dev/null",
             "-o", "HostKeyAlgorithms=ssh-ed25519",
             "-o", "PubkeyAcceptedAlgorithms=ssh-ed25519",
@@ -173,13 +177,33 @@ class SSHTransport:
 
     async def _exchange(self, command: str, request: bytes,
                         revoked: asyncio.Event) -> Dict[str, Any]:
+        if hasattr(self.paths, "vault"):
+            from .secret_files import secret_files
+            with secret_files(self.paths.scratch, {
+                "identity": self.paths.upload_key.read_bytes(),
+                "known_hosts": self.paths.known_hosts.read_bytes(),
+            }) as files:
+                return await self._exchange_inner(command, request, revoked,
+                                                  identity=files["identity"],
+                                                  known_hosts=files["known_hosts"])
+        return await self._exchange_inner(command, request, revoked)
+
+    async def _exchange_inner(self, command: str, request: bytes,
+                              revoked: asyncio.Event, **files) -> Dict[str, Any]:
         if revoked.is_set():
             raise asyncio.CancelledError
         process = await asyncio.create_subprocess_exec(
-            *self._args(command), stdin=asyncio.subprocess.PIPE,
+            *self._args(command, **files), stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
         exchange = asyncio.create_task(_bounded_exchange(process, request))
+        if hasattr(self.paths, "vault"):
+            try:
+                from .memory_guard import verify_native_child
+                verify_native_child(process.pid)
+            except BaseException:
+                await _finish_process_cleanup(process, exchange)
+                raise
         cancelled = asyncio.create_task(revoked.wait())
         try:
             done, _ = await asyncio.wait(

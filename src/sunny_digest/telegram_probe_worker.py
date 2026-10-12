@@ -60,4 +60,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from .memory_guard import protect_process
+    protect_process()
     raise SystemExit(main())

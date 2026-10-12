@@ -19,17 +19,26 @@ def check_web() -> bool:
         connection.close()
 
 
+def _fresh(path: Path) -> bool:
+    return path.is_file() and time.time() - path.stat().st_mtime < 900
+
+
 def check_collector() -> bool:
+    socket = Path(os.environ.get("SUNNY_JOBS_SOCKET", "/data/ipc/jobs.sock"))
+    scratch = Path(os.environ.get("SUNNY_SCRATCH_DIR", "/run/collector-private"))
+    return socket.is_socket() and _fresh(scratch / "heartbeat")
+
+
+def check_guardian() -> bool:
     runtime = Path(os.environ.get("SUNNY_RUNTIME_DIR", "/data/runtime"))
-    socket = Path(os.environ.get("SUNNY_IPC_SOCKET", str(runtime / "control.sock")))
-    heartbeat = runtime / "heartbeat"
-    return socket.is_socket() and heartbeat.is_file() and time.time() - heartbeat.stat().st_mtime < 900
+    return (runtime / "ipc/admin/admin.sock").is_socket() and (runtime / "ipc/jobs/jobs.sock").is_socket() and _fresh(runtime / "guardian-heartbeat")
 
 
 def main() -> int:
     mode = sys.argv[1] if len(sys.argv) == 2 else ""
     try:
-        healthy = check_web() if mode == "web" else check_collector() if mode == "collector" else False
+        healthy = (check_web() if mode == "web" else check_collector() if mode == "collector"
+                   else check_guardian() if mode == "guardian" else False)
     except Exception:
         healthy = False
     return 0 if healthy else 1

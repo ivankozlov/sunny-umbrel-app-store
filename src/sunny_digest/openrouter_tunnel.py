@@ -46,6 +46,10 @@ async def generate_openrouter_key(paths: Paths, source_id: str) -> Tuple[str, st
 
     if paths.openrouter_key.exists() or paths.openrouter_public_key.exists():
         raise RuntimeError("openrouter key already exists")
+    if hasattr(paths, "vault"):
+        from .secret_files import generate_encrypted_ed25519
+        return generate_encrypted_ed25519(
+            paths, "openrouter_key", "openrouter_public_key", f"{source_id}@sunny-openrouter")
     returncode, _ = await _run_command([
         "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
         f"{source_id}@sunny-openrouter", "-f", str(paths.openrouter_key),
@@ -85,6 +89,7 @@ class OpenRouterTunnel:
         self.ready_timeout = ready_timeout
         self.probe_interval = probe_interval
         self._process: Optional[asyncio.subprocess.Process] = None
+        self._cleanup_task = None
 
     def _args(self) -> list[str]:
         return [
@@ -122,6 +127,9 @@ class OpenRouterTunnel:
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         try:
+            if hasattr(self.paths, "guarded_native"):
+                from .memory_guard import verify_native_child
+                verify_native_child(self._process.pid)
             await self._wait_until_ready()
         except BaseException:
             await self.stop()
@@ -157,12 +165,42 @@ class OpenRouterTunnel:
             raise TunnelUnavailableError("ssh tunnel is not running")
 
     async def stop(self) -> None:
-        process, self._process = self._process, None
-        if process is None or process.returncode is not None:
+        process = self._process
+        if process is None:
             return
-        process.terminate()
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._reap(process))
+        cleanup = self._cleanup_task
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
         try:
-            await asyncio.wait_for(process.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            cleanup.result()
+        finally:
+            self._process = None
+            self._cleanup_task = None
+        if cancelled:
+            raise asyncio.CancelledError
+
+    @staticmethod
+    async def _reap(process) -> None:
+        if process.returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+        else:
+            # asyncio publishes returncode only after its child watcher has
+            # reaped the process. No second wait is needed for this state.
+            return

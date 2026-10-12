@@ -8,9 +8,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from check_package import (  # noqa: E402
     ROOT,
+    role_layout_errors,
     telegram_client_guard,
     telegram_probe_guard,
 )
+
+
+class TestPackageRoleLayoutGuard(unittest.TestCase):
+    def setUp(self):
+        self.compose = (ROOT / "sunny-personal-digest/docker-compose.yml").read_text(encoding="utf-8")
+
+    def test_rejects_role_layout_weakening(self):
+        mutations = (
+            ("${APP_DATA_DIR}/data/runtime/ipc/jobs:/data/ipc:ro", "${APP_DATA_DIR}/data/private:/vault:ro"),
+            ("${APP_DATA_DIR}/data/runtime/ipc/admin:/data/ipc:ro", "${APP_DATA_DIR}/data/runtime/ipc/admin:/data/ipc"),
+            ("memswap_limit: 512m", "memswap_limit: 1024m"),
+            ('user: "1001:1001"', 'user: "1000:1000"'),
+            ("mode=0700,uid=1001,gid=1001", "mode=0777,uid=1001,gid=1001"),
+            ("  guardian:\n", "  rogue:\n    image: example\n  guardian:\n"),
+            ('user: "1001:1001"', 'user: "1001:1001"\n    user: "0:0"'),
+            ('user: "1001:1001"', 'user: "1001:1001"\n    pid: service:guardian'),
+            ('user: "1001:1001"', 'user: "1001:1001"\n    ipc: service:guardian'),
+            ('user: "1001:1001"', 'user: "1001:1001"\n    network_mode: service:guardian'),
+            ('user: "1001:1001"', 'user: "1001:1001"\n    <<: *unsafe_defaults'),
+            ('user: "1001:1001"', 'user: "1001:1001"\n    entrypoint: /bin/sh'),
+            ('        hard: 0', '        hard: 0\n        hard: -1'),
+        )
+        for before, after in mutations:
+            with self.subTest(before=before):
+                self.assertTrue(role_layout_errors(self.compose.replace(before, after, 1)))
+
+    def test_accepts_the_actual_candidate(self):
+        self.assertEqual(role_layout_errors(self.compose), [])
 
 
 class TestPackageTelegramProxyGuard(unittest.TestCase):

@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: false
+disabled: true
 category: automation
 name: Sunny Personal Chats
-version: "0.2.25"
+version: "0.3.0"
 tagline: One daily digest and morning read receipts for selected chats
 description: >-
   Resolves message links for only the explicitly selected Telegram groups.
@@ -14,16 +14,24 @@ description: >-
   every 5 minutes. Mentions are not forwarded to Sunny.
 
 
+  Credentials and selected-chat policy are encrypted locally. A fixed trusted
+  HTTPS address, an owner passkey and a separate vault passphrase are required.
+  After a guardian restart the app waits for manual unlock; ordinary daily runs
+  require no OTP or Telegram confirmation.
+
+
   Telegram and provider credentials are deliberately excluded from Umbrel
   backups. A restored config requires manual confirmation that the previous
   Telegram device was terminated before reauthorization. Installation is enabled
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  With rich digest formatting switched on, every item of the "Ещё" line links
-  to its own message, so folded topics, minor news and small notes can be
-  opened from the digest. Only the message permalink is used as a link target;
-  an item without one stays plain. The collector wire protocol remains 0.2.1.
+  Security candidate: encrypted vault, separate guardian/model/web roles,
+  passkey-bound administrative operations and manual unlock after guardian
+  restart. Existing data requires explicitly confirmed migration; rollback
+  to plaintext is unsupported. Installation remains disabled pending Linux,
+  HTTPS, owner-passkey and immutable multi-architecture release acceptance.
+  The collector wire protocol remains 0.2.1.
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store
 dependencies: []

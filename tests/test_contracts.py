@@ -1425,7 +1425,7 @@ class TestBugOpusWorkerTimeout20261004(unittest.IsolatedAsyncioTestCase):
     отказ, а не был убит родителем."""
 
     def test_limits_are_ordered_and_cover_both_attempts(self):
-        from sunny_digest.collector import OPENROUTER_TIMEOUT_S
+        from sunny_digest.guardian_engine import OPENROUTER_TIMEOUT_S
 
         self.assertGreaterEqual(WORKER_TIMEOUT_S, 200)
         self.assertLess(HTTP_TIMEOUT_S, WORKER_TIMEOUT_S)

@@ -7,9 +7,9 @@ services:
       APP_PORT: 8080
 
   web:
-    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.2.25@sha256:56464619fdbc8b9d3a841e3ebcb65f41949da618819013f7068de0adab09b592
+    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.3.0@sha256:RELEASE_GATE_MULTIARCH_DIGEST
     command: ["web"]
-    user: "1000:1000"
+    user: "1002:1002"
     init: true
     restart: on-failure
     stop_grace_period: 30s
@@ -20,25 +20,30 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
     pids_limit: 64
     mem_limit: 128m
+    memswap_limit: 128m
     environment:
-      SUNNY_IPC_SOCKET: /data/runtime/control.sock
+      SUNNY_IPC_SOCKET: /data/ipc/admin.sock
       SUNNY_WEB_HOST: 0.0.0.0
       SUNNY_WEB_PORT: 8080
       SUNNY_UI_USERNAME: sunny
       SUNNY_UI_PASSWORD: ${APP_PASSWORD}
     volumes:
-      - ${APP_DATA_DIR}/data/runtime:/data/runtime
+      - ${APP_DATA_DIR}/data/runtime/ipc/admin:/data/ipc:ro
     healthcheck:
       test: ["CMD", "python", "-m", "sunny_digest.healthcheck", "web"]
       interval: 30s
       timeout: 5s
       retries: 3
   collector:
-    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.2.25@sha256:56464619fdbc8b9d3a841e3ebcb65f41949da618819013f7068de0adab09b592
+    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.3.0@sha256:RELEASE_GATE_MULTIARCH_DIGEST
     command: ["collector"]
-    user: "1000:1000"
+    user: "1001:1001"
     init: true
     restart: on-failure
     stop_grace_period: 30s
@@ -49,19 +54,60 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m
+      - /run/collector-private:rw,noexec,nosuid,nodev,size=32m,mode=0700,uid=1001,gid=1001
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
     pids_limit: 96
     mem_limit: 512m
+    memswap_limit: 512m
+    environment:
+      SUNNY_JOBS_SOCKET: /data/ipc/jobs.sock
+      SUNNY_SCRATCH_DIR: /run/collector-private
+    volumes:
+      - ${APP_DATA_DIR}/data/runtime/ipc/jobs:/data/ipc:ro
+    healthcheck:
+      test: ["CMD", "python", "-m", "sunny_digest.healthcheck", "collector"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  guardian:
+    image: ghcr.io/ivankozlov/sunny-personal-digest:v0.3.0@sha256:RELEASE_GATE_MULTIARCH_DIGEST
+    command: ["guardian"]
+    user: "1000:1000"
+    group_add:
+      - "1001"
+      - "1002"
+    init: true
+    restart: on-failure
+    stop_grace_period: 40s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+      - /run/guardian-private:rw,noexec,nosuid,nodev,size=32m,mode=0700,uid=1000,gid=1000
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
+    pids_limit: 96
+    mem_limit: 512m
+    memswap_limit: 512m
     environment:
       SUNNY_CONFIG_DIR: /data/config
       SUNNY_PRIVATE_DIR: /data/private
       SUNNY_RUNTIME_DIR: /data/runtime
-      SUNNY_IPC_SOCKET: /data/runtime/control.sock
+      SUNNY_SCRATCH_DIR: /run/guardian-private
     volumes:
       - ${APP_DATA_DIR}/data/config:/data/config
       - ${APP_DATA_DIR}/data/private:/data/private
       - ${APP_DATA_DIR}/data/runtime:/data/runtime
     healthcheck:
-      test: ["CMD", "python", "-m", "sunny_digest.healthcheck", "collector"]
+      test: ["CMD", "python", "-m", "sunny_digest.healthcheck", "guardian"]
       interval: 30s
       timeout: 5s
       retries: 3

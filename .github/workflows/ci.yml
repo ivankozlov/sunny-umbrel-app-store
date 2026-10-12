@@ -29,16 +29,15 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Check Umbrel package invariants
         run: python scripts/check_package.py
+      - name: Verify security UI with a synthetic authenticator
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m pip install playwright==1.58.0
+          python -m playwright install --with-deps chromium-headless-shell
+          python scripts/check_security_ui.py
       - name: Compile Python sources
         run: python -m compileall -q src tests scripts
 
   image:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
-      - name: Build production image
-        run: docker build --pull=false --tag sunny-personal-digest:ci .
+    uses: ./.github/workflows/native-security.yml

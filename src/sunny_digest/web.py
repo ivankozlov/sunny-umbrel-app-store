@@ -80,13 +80,15 @@ class IPCClient:
         return result
 
 
-def _layout(content: str, csrf: str, notice: str = "") -> bytes:
+def _layout(content: str, csrf: str, notice: str = "", *, allow_reset: bool = True) -> bytes:
     notice_html = f'<div class="notice">{_escape(notice)}</div>' if notice else ""
     reset_html = f"""<details class="reset"><summary>Factory reset / отзыв доступа</summary>
   <form method="post">{_hidden_csrf(csrf)}<input type="hidden" name="action" value="reset">
     <label class="check"><input type="checkbox" name="confirm_reset" value="yes" required>Остановить локальные операции, попытаться завершить Telegram-сессию и удалить все локальные credentials. Если Telegram не подтвердит logout, новая настройка будет заблокирована до ручного завершения устройства.</label>
     <button class="danger" type="submit">Отозвать и удалить</button>
   </form></details>"""
+    if not allow_reset:
+        reset_html = ""
     document = f"""<!doctype html>
 <html lang="ru">
 <head>
