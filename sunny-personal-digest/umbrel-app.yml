@@ -1,6 +1,6 @@
 manifestVersion: 1
 id: sunny-personal-digest
-disabled: true
+disabled: false
 category: automation
 name: Sunny Personal Chats
 version: "0.3.0"
@@ -26,11 +26,12 @@ description: >-
   only after a public multi-architecture GHCR image has been published, verified,
   and pinned by immutable digest.
 releaseNotes: >-
-  Security candidate: encrypted vault, separate guardian/model/web roles,
+  Encrypted vault, separate guardian/model/web roles,
   passkey-bound administrative operations and manual unlock after guardian
   restart. Existing data requires explicitly confirmed migration; rollback
-  to plaintext is unsupported. Installation remains disabled pending Linux,
-  HTTPS, owner-passkey and immutable multi-architecture release acceptance.
+  to plaintext is unsupported. Native amd64/arm64 security acceptance passed.
+  Before Update, prepare role directories and configure the fixed HTTPS origin;
+  the owner must register a passkey and explicitly confirm migration.
   The collector wire protocol remains 0.2.1.
 developer: Ivan Kozlov
 website: https://github.com/ivankozlov/sunny-umbrel-app-store

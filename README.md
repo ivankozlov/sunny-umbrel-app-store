@@ -493,7 +493,10 @@ of the owner's installation or permission to Update. The VM's core handler is
 set to `core` only in that disposable CI job; AppArmor/seccomp are not disabled.
 The browser jobs use supported 22.04 VMs because 24.04's default user-namespace
 policy rejects the cached Chromium sandbox; no `--no-sandbox` workaround is used.
-No native arm64 result has yet been recorded for this prepared workflow.
+Native amd64 and arm64 acceptance passed in GitHub run `38212687801` on the
+`0.3.0` source. The published image is pinned by one independently verified OCI
+index digest; both images contain the exact gated app source. The physical owner
+Update and plaintext migration remain separate steps.
 
 Never overwrite a version tag, use a mutable tag without its digest, or enable the
 app before both the repository and image are available through the explicitly approved
