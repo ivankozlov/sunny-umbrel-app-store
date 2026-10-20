@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import os
 import re
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 import yaml
@@ -24,6 +26,22 @@ MIHOMO_LICENSE_SHA256 = (
 )
 
 
+# umbreld 1.7.4 (legacy-compat/app-script) runs app-data/<app>/hooks/<event> as
+# root on the host and sources exports.sh; an Update copies exactly
+# "docker-compose.yml *.template exports.sh torrc hooks" from the Store template
+# with `cp --archive` and deletes nothing. Shipping any of them would put root
+# code from a public package on every installation, or overwrite the owner's
+# own post-start hook that brings the HTTPS helper back (18.10.2026).
+HOST_CODE_NAMES = ("hooks", "exports.sh", "torrc")
+PRIVATE_MARKERS_ENV = "SUNNY_PACKAGE_PRIVATE_MARKERS"
+PRIVATE_MARKERS_FILE_ENV = "SUNNY_PACKAGE_PRIVATE_MARKERS_FILE"
+TAILNET_HOSTNAME = re.compile(
+    r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+" + r"ts" + r"\." + r"net\b",
+    re.IGNORECASE,
+)
+TAILNET_HOSTNAME_BYTES = re.compile(TAILNET_HOSTNAME.pattern.encode("ascii"), re.IGNORECASE)
+
+
 class Checks:
     def __init__(self):
         self.errors: list[str] = []
@@ -35,6 +53,50 @@ class Checks:
 
 def text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def private_markers(*, require_deployment: bool = False) -> tuple[str, ...]:
+    """Read deployment-specific leak markers without putting them in the package."""
+    values = ["-----BEGIN " + "OPENSSH " + "PRIVATE KEY-----", "sk-" + "or-" + "v1-"]
+    supplied = os.environ.get(PRIVATE_MARKERS_ENV, "")
+    marker_file = os.environ.get(PRIVATE_MARKERS_FILE_ENV)
+    if marker_file:
+        try:
+            supplied += "\n" + Path(marker_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise ValueError("private marker input is unreadable") from error
+    deployment = []
+    for line in supplied.splitlines():
+        marker = line.removeprefix("\ufeff").strip()
+        if not marker:
+            continue
+        if any(unicodedata.category(char) in {"Cc", "Cf"} for char in marker):
+            raise ValueError("private marker input contains control characters")
+        deployment.append(marker)
+    if require_deployment and not deployment:
+        raise ValueError("release requires nonempty private marker input")
+    values.extend(deployment)
+    return tuple(dict.fromkeys(values))
+
+
+def private_marker_errors(root: Path, markers: tuple[str, ...]) -> list[str]:
+    errors: list[str] = []
+    for path in root.rglob("*"):
+        relative = path.relative_to(root).as_posix()
+        if TAILNET_HOSTNAME.search(relative):
+            errors.append("possible tailnet hostname in package")
+        for marker in markers:
+            if marker in relative:
+                errors.append("possible private marker in package")
+        if not path.is_file() or path.suffix in (".pyc", ".png"):
+            continue
+        body = path.read_bytes()
+        if TAILNET_HOSTNAME_BYTES.search(body):
+            errors.append("possible tailnet hostname in package")
+        for marker in markers:
+            if marker.encode("utf-8") in body:
+                errors.append("possible private marker in package")
+    return errors
 
 
 def sha256(path: Path) -> str:
@@ -117,6 +179,15 @@ def role_layout_errors(compose: str) -> list[str]:
         memory = re.search(r"(?m)^    mem_limit: ([1-9][0-9]*m)\n    memswap_limit: ([1-9][0-9]*m)$", block)
         if memory is None or memory.group(1) != memory.group(2): errors.append(f"{name} swap allowance must be zero")
         if "core:\n        soft: 0\n        hard: 0" not in block: errors.append(f"{name} core limit must be zero")
+    return errors
+
+
+def host_code_errors(app: Path) -> list[str]:
+    """Refuse package paths that umbreld executes, sources or copies on Update."""
+    errors = [f"{name} in the package directory runs or lands on the Umbrel host as root"
+              for name in HOST_CODE_NAMES if os.path.lexists(app / name)]
+    errors.extend("*.template files are rendered on the host and copied on Update"
+                  for _path in sorted(app.rglob("*.template")))
     return errors
 
 
@@ -430,6 +501,8 @@ def main() -> int:
     )
     for path in required:
         checks.require(path.is_file(), f"missing required file: {path.relative_to(ROOT)}")
+    for message in host_code_errors(APP):
+        checks.require(False, message)
     if checks.errors:
         print("\n".join(f"ERROR: {error}" for error in checks.errors), file=sys.stderr)
         return 1
@@ -684,18 +757,13 @@ def main() -> int:
     checks.require("sunny_digest.vpn_subscription_worker" in vpn_subscription,
                    "subscription subprocess boundary is missing")
 
-    private_markers = ("-----BEGIN OPENSSH PRIVATE KEY-----", "sk-or-v1-")
-    for path in ROOT.rglob("*"):
-        if (not path.is_file() or path.resolve() == Path(__file__).resolve()
-                or path.suffix in (".pyc", ".png")):
-            continue
-        try:
-            body = text(path)
-        except UnicodeDecodeError:
-            continue
-        for marker in private_markers:
-            checks.require(marker not in body,
-                           f"possible credential marker in {path.relative_to(ROOT)}")
+    try:
+        markers = private_markers(require_deployment=args.release)
+    except ValueError as error:
+        checks.require(False, str(error))
+    else:
+        for error in private_marker_errors(ROOT, markers):
+            checks.require(False, error)
 
     for secret_name in (".env", ".env.local", "id_ed25519", "telegram.session"):
         checks.require(not (ROOT / secret_name).exists(), f"secret file exists: {secret_name}")

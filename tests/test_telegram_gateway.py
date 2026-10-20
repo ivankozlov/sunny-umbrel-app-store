@@ -727,6 +727,10 @@ class TestBugPeerTimeoutIsolation20260814(unittest.IsolatedAsyncioTestCase):
                 super().__init__([], upper_id=None)
                 self.active = 0
                 self.max_active = 0
+                self.hung_started = asyncio.Event()
+                self.hung_started_count = 0
+                self.healthy_tail_done = asyncio.Event()
+                self.healthy_tail_count = 0
 
             async def send_read_acknowledge(self, peer, **kwargs):
                 self.read_ack_calls.append((peer, kwargs))
@@ -734,7 +738,13 @@ class TestBugPeerTimeoutIsolation20260814(unittest.IsolatedAsyncioTestCase):
                 self.max_active = max(self.max_active, self.active)
                 try:
                     if peer <= -5:
+                        self.hung_started_count += 1
+                        if self.hung_started_count == gateway_module.PEER_OPERATION_CONCURRENCY:
+                            self.hung_started.set()
                         await asyncio.Event().wait()
+                    self.healthy_tail_count += 1
+                    if self.healthy_tail_count == 4:
+                        self.healthy_tail_done.set()
                     return True
                 finally:
                     self.active -= 1
@@ -750,10 +760,22 @@ class TestBugPeerTimeoutIsolation20260814(unittest.IsolatedAsyncioTestCase):
         client = IsolatingClient()
         with patch(
                 "sunny_digest.telegram_gateway.PEER_OPERATION_TIMEOUT_S", 0.02):
-            succeeded, failed = await asyncio.wait_for(
-                MultiGateway(client).acknowledge_reads("session", targets),
-                timeout=0.15,
-            )
+            operation = asyncio.create_task(
+                MultiGateway(client).acknowledge_reads("session", targets))
+            try:
+                # Это не измерение wall clock: под полной suite 150 мс зависели
+                # от планировщика, а не от gateway. Барьеры доказывают первую
+                # параллельную волну и healthy tail; секунда только аварийно
+                # ограничивает зависший регресс. Настоящий RPC hang остаётся
+                # здесь, а не имитируется исключением клиента.
+                await asyncio.wait_for(client.hung_started.wait(), timeout=1)
+                self.assertEqual(client.max_active, 4)
+                await asyncio.wait_for(client.healthy_tail_done.wait(), timeout=1)
+                succeeded, failed = await asyncio.wait_for(operation, timeout=1)
+            finally:
+                if not operation.done():
+                    operation.cancel()
+                    await asyncio.gather(operation, return_exceptions=True)
 
         self.assertEqual(failed, list(range(-16, -4)))
         self.assertEqual(succeeded, [-4, -3, -2, -1])
@@ -1108,6 +1130,10 @@ class _PerPeerClient(FakeClient):
         self.hung = set(hung)
         self.active = 0
         self.max_active = 0
+        self.hung_started = asyncio.Event()
+        self.hung_started_count = 0
+        self.healthy_tail_done = asyncio.Event()
+        self.healthy_tail_count = 0
 
     async def __call__(self, request):
         self.raw_calls.append(request)
@@ -1118,7 +1144,13 @@ class _PerPeerClient(FakeClient):
             if requested in self.broken:
                 raise RuntimeError("stale access hash")
             if requested in self.hung:
+                self.hung_started_count += 1
+                if self.hung_started_count == gateway_module.PEER_OPERATION_CONCURRENCY:
+                    self.hung_started.set()
                 await asyncio.Event().wait()
+            self.healthy_tail_count += 1
+            if self.healthy_tail_count == 4:
+                self.healthy_tail_done.set()
             return SimpleNamespace(dialogs=[
                 SimpleNamespace(peer=requested, top_message=self.tops[requested]),
             ])
@@ -1177,10 +1209,17 @@ class TestBugMorningPeerTops20260913(unittest.IsolatedAsyncioTestCase):
         )
         with patch(
                 "sunny_digest.telegram_gateway.PEER_OPERATION_TIMEOUT_S", 0.02):
-            tops, failed = await asyncio.wait_for(
-                _PerPeerGateway(client).snapshot_peer_tops("session", selected),
-                timeout=0.15,
-            )
+            operation = asyncio.create_task(
+                _PerPeerGateway(client).snapshot_peer_tops("session", selected))
+            try:
+                await asyncio.wait_for(client.hung_started.wait(), timeout=1)
+                self.assertEqual(client.max_active, 4)
+                await asyncio.wait_for(client.healthy_tail_done.wait(), timeout=1)
+                tops, failed = await asyncio.wait_for(operation, timeout=1)
+            finally:
+                if not operation.done():
+                    operation.cancel()
+                    await asyncio.gather(operation, return_exceptions=True)
         self.assertEqual(failed, list(range(-16, -4)))
         self.assertEqual(tops, {-4: 4, -3: 3, -2: 2, -1: 1})
         self.assertEqual(client.max_active, 4)

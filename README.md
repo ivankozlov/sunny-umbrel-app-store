@@ -431,6 +431,10 @@ From this directory:
 PYTHONPYCACHEPREFIX=/tmp/sunny-umbrel-pycache \
   PYTHONPATH=src python3 -m unittest discover -s tests -v
 python3 scripts/check_package.py
+# For a release, supply newline-separated private hostname/IP/VPN-domain markers
+# from an untracked local file, for example:
+SUNNY_PACKAGE_PRIVATE_MARKERS_FILE=/secure/path/sunny-package-markers \
+  python3 scripts/check_package.py --release
 PYTHONPYCACHEPREFIX=/tmp/sunny-umbrel-pycache \
   python3 -m compileall -q src tests scripts
 ```
@@ -453,6 +457,8 @@ PYTHONPATH=src python3 scripts/check_security_ui.py
 
 Run these commands in a dedicated local test environment. `--browser` accepts an
 already cached headless-shell and `--out-dir` writes synthetic screenshots.
+The paired native UI client also requires an explicit `--host <current-tailnet-host>`;
+the probe keeps TLS hostname verification for that value.
 The browser gate does not prove owner device verification, a real TLS chain or
 the Linux/container protections. `main` intentionally refuses non-Linux production
 startup rather than exposing a plaintext development bypass.
@@ -478,7 +484,9 @@ after it: disabled source first, the protected `Publish image` workflow with
 placeholder; the enabling commit lives only in the Store repository. Any further
 release must use a new semver/tag and repeat the full sequence.
 Wire `COLLECTOR_VERSION` deliberately stays `0.2.1` until an explicit chain migration.
-Run `python3 scripts/check_package.py --release` before every enabling commit.
+Before every enabling commit, run `scripts/check_package.py --release` with
+`SUNNY_PACKAGE_PRIVATE_MARKERS_FILE` pointing to an untracked local file containing
+one actual tailnet hostname, private droplet IP, or VPN domain marker per line.
 
 For the `0.3.0` candidate, `native-security.yml` runs on the standard native
 `ubuntu-22.04` and `ubuntu-22.04-arm` GitHub VMs before the publish job can access

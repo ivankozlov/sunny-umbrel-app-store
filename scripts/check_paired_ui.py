@@ -246,6 +246,12 @@ class Backend:
         return Connection()
 
 
+def paired_ui_host(value):
+    if not value:
+        raise RuntimeError("explicit paired UI host required")
+    return value
+
+
 async def browser_gate(gate, backend, browser, output):
     if sys.flags.optimize:
         raise RuntimeError("the frozen UI assertions must be enabled")
@@ -287,6 +293,7 @@ def main():
     parser.add_argument("--browser")
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--prefix")
+    parser.add_argument("--host")
     args = parser.parse_args()
     access = access_file(args.access)
     if args.mode == "server":
@@ -306,7 +313,7 @@ def main():
     if platform.system() != "Darwin" or not args.out_dir or not args.browser:
         raise RuntimeError("explicit Mac browser/output required")
     from check_linux_ui import verify_screenshots
-    backend = Backend("umbrel.tailf62436.ts.net", 9444, access)
+    backend = Backend(paired_ui_host(args.host), 9444, access)
     if backend.control("snapshot")["guard"] != NATIVE_LINE:
         raise RuntimeError("native backend receipt missing")
     args.out_dir.mkdir(mode=0o700, parents=True, exist_ok=False)

@@ -1,17 +1,283 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
+import check_package  # noqa: E402
 from check_package import (  # noqa: E402
+    APP,
     ROOT,
+    host_code_errors,
+    private_markers,
+    private_marker_errors,
     role_layout_errors,
     telegram_client_guard,
     telegram_probe_guard,
 )
+
+
+class TestBugPackageHostCode20261018(unittest.TestCase):
+    """18.10.2026: the owner's post-start hook must survive Store Updates.
+
+    umbreld runs app hooks as root and an Update copies hooks/, exports.sh,
+    *.template and torrc from the Store template over app-data.
+    """
+
+    def package(self, tmp, build):
+        app = Path(tmp) / "sunny-personal-digest"
+        (app / "data/config").mkdir(parents=True)
+        (app / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        build(app)
+        return app
+
+    def test_actual_package_has_no_host_code(self):
+        self.assertEqual(host_code_errors(APP), [])
+
+    def test_clean_synthetic_package_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(host_code_errors(self.package(tmp, lambda app: None)), [])
+
+    def test_refuses_each_path_umbreld_runs_or_copies(self):
+        cases = {
+            "empty hooks directory": lambda app: (app / "hooks").mkdir(),
+            "post-start hook": lambda app: ((app / "hooks").mkdir(), (app / "hooks/post-start").write_text("#!/bin/sh\n")),
+            "hooks as a file": lambda app: (app / "hooks").write_text(""),
+            "hooks as a symlink": lambda app: (app / "hooks").symlink_to(app / "data"),
+            "dangling hooks symlink": lambda app: (app / "hooks").symlink_to(app / "missing"),
+            "exports.sh": lambda app: (app / "exports.sh").write_text("export X=1\n"),
+            "torrc": lambda app: (app / "torrc").write_text(""),
+            "top-level template": lambda app: (app / "settings.yml.template").write_text("x\n"),
+            "nested template": lambda app: (app / "data/config/app.conf.template").write_text("x\n"),
+        }
+        for name, build in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                self.assertTrue(host_code_errors(self.package(tmp, build)))
+
+    def test_checker_main_refuses_a_package_with_a_hook(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "umbrel"
+            shutil.copytree(ROOT, root, symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
+            app = root / "sunny-personal-digest"
+            (app / "hooks").mkdir()
+            (app / "hooks/post-start").write_text("#!/bin/sh\n")
+            errors = io.StringIO()
+            with mock.patch.object(check_package, "ROOT", root), mock.patch.object(check_package, "APP", app), \
+                    mock.patch.object(sys, "argv", ["check_package.py"]), contextlib.redirect_stderr(errors):
+                self.assertEqual(check_package.main(), 1)
+            self.assertEqual(errors.getvalue(), "ERROR: hooks in the package directory runs or lands on the Umbrel host as root\n")
+
+    def test_checker_main_refuses_template_path_without_disclosing_marker(self):
+        marker = "vpn." + "synthetic" + ".internal"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "umbrel"
+            shutil.copytree(ROOT, root, symlinks=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "tests"))
+            (root / "sunny-personal-digest" / (marker + ".template")).write_text("x\n", encoding="utf-8")
+            errors = io.StringIO()
+            with mock.patch.object(check_package, "ROOT", root), \
+                    mock.patch.object(check_package, "APP", root / "sunny-personal-digest"), \
+                    mock.patch.dict("os.environ", {}, clear=True), \
+                    mock.patch.object(sys, "argv", ["check_package.py"]), contextlib.redirect_stderr(errors):
+                self.assertEqual(check_package.main(), 1)
+            self.assertEqual(errors.getvalue(), "ERROR: *.template files are rendered on the host and copied on Update\n")
+            self.assertNotIn(marker, errors.getvalue())
+
+
+class TestBugPackagePrivateMarkers20261019(unittest.TestCase):
+    """The public package must not carry deployment routing identifiers."""
+
+    def test_clean_package_accepts_configured_private_markers(self):
+        markers = (
+            "synthetic-tailnet-" + "6ae9" + "." + "ts" + "." + "net",
+            ".".join(("10", "43", "18", "9")),
+            "vpn." + "synthetic" + ".internal",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "README.md").write_text("public package\n", encoding="utf-8")
+            self.assertEqual(private_marker_errors(root, markers), [])
+
+    def test_rejects_tailnet_private_ip_and_vpn_domain_markers(self):
+        markers = (
+            "synthetic-tailnet-" + "6ae9" + "." + "ts" + "." + "net",
+            ".".join(("10", "43", "18", "9")),
+            "vpn." + "synthetic" + ".internal",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for index, marker in enumerate(markers):
+                path = root / f"marker-{index}.txt"
+                path.write_text(marker, encoding="utf-8")
+                expected = ["possible private marker in package"]
+                if index == 0:
+                    expected.insert(0, "possible tailnet hostname in package")
+                self.assertEqual(private_marker_errors(root, markers), expected)
+                path.unlink()
+
+    def test_checker_main_rejects_a_configured_private_marker(self):
+        marker = "vpn." + "synthetic" + ".internal"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "umbrel"
+            shutil.copytree(ROOT, root, symlinks=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "tests"))
+            (root / "synthetic-private-marker").write_text(marker, encoding="utf-8")
+            errors = io.StringIO()
+            with mock.patch.object(check_package, "ROOT", root), \
+                    mock.patch.object(check_package, "APP", root / "sunny-personal-digest"), \
+                    mock.patch.dict("os.environ", {"SUNNY_PACKAGE_PRIVATE_MARKERS": marker}, clear=True), \
+                    mock.patch.object(check_package.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                    mock.patch.object(sys, "argv", ["check_package.py"]), contextlib.redirect_stderr(errors):
+                self.assertEqual(check_package.main(), 1)
+            self.assertEqual(errors.getvalue(), "ERROR: possible private marker in package\n")
+
+    def test_checker_main_accepts_clean_package_without_private_marker_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "umbrel"
+            shutil.copytree(ROOT, root, symlinks=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "tests"))
+            output = io.StringIO()
+            with mock.patch.object(check_package, "ROOT", root), \
+                    mock.patch.object(check_package, "APP", root / "sunny-personal-digest"), \
+                    mock.patch.dict("os.environ", {}, clear=True), \
+                    mock.patch.object(check_package.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                    mock.patch.object(sys, "argv", ["check_package.py"]), contextlib.redirect_stderr(output):
+                self.assertEqual(check_package.main(), 0)
+            self.assertEqual(output.getvalue(), "")
+
+    def test_checker_main_rejects_tailnet_hostname_without_private_marker_input(self):
+        hostname = "synthetic-tailnet-" + "6ae9" + "." + "ts" + "." + "net"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "umbrel"
+            shutil.copytree(ROOT, root, symlinks=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "tests"))
+            (root / "synthetic-tailnet-host").write_text(hostname, encoding="utf-8")
+            output = io.StringIO()
+            with mock.patch.object(check_package, "ROOT", root), \
+                    mock.patch.object(check_package, "APP", root / "sunny-personal-digest"), \
+                    mock.patch.dict("os.environ", {}, clear=True), \
+                    mock.patch.object(check_package.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                    mock.patch.object(sys, "argv", ["check_package.py"]), contextlib.redirect_stderr(output):
+                self.assertEqual(check_package.main(), 1)
+            self.assertEqual(output.getvalue(), "ERROR: possible tailnet hostname in package\n")
+
+    def test_release_refuses_missing_empty_or_unreadable_private_marker_input(self):
+        cases = (
+            ("missing", {}),
+            ("empty", {"SUNNY_PACKAGE_PRIVATE_MARKERS": "\n  \n"}),
+            ("bom", {"SUNNY_PACKAGE_PRIVATE_MARKERS": "\ufeff"}),
+            ("control", {"SUNNY_PACKAGE_PRIVATE_MARKERS": "vpn.synthetic.internal\x01"}),
+            ("control_c1", {"SUNNY_PACKAGE_PRIVATE_MARKERS": "vpn.synthetic.internal\u0081"}),
+            ("format", {"SUNNY_PACKAGE_PRIVATE_MARKERS": "vpn.synthetic.internal\u200b"}),
+            ("unreadable", {"SUNNY_PACKAGE_PRIVATE_MARKERS_FILE": "/missing/private-markers"}),
+        )
+        for name, env in cases:
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "umbrel"
+                shutil.copytree(ROOT, root, symlinks=True,
+                                ignore=shutil.ignore_patterns("__pycache__", "tests"))
+                output = io.StringIO()
+                with mock.patch.object(check_package, "ROOT", root), \
+                        mock.patch.object(check_package, "APP", root / "sunny-personal-digest"), \
+                        mock.patch.dict("os.environ", env, clear=True), \
+                        mock.patch.object(check_package.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                        mock.patch.object(sys, "argv", ["check_package.py", "--release"]), contextlib.redirect_stderr(output):
+                    self.assertEqual(check_package.main(), 1)
+                expected = {
+                    "unreadable": "private marker input is unreadable",
+                    "control": "private marker input contains control characters",
+                    "control_c1": "private marker input contains control characters",
+                    "format": "private marker input contains control characters",
+                }.get(name, "release requires nonempty private marker input")
+                self.assertIn("ERROR: " + expected + "\n", output.getvalue())
+
+    def test_external_marker_file_normalizes_bom_and_allows_release_input(self):
+        marker = "vpn." + "synthetic" + ".internal"
+        with tempfile.TemporaryDirectory() as tmp:
+            marker_file = Path(tmp) / "markers"
+            marker_file.write_text("\ufeff" + marker + "\n", encoding="utf-8")
+            with mock.patch.dict("os.environ", {
+                "SUNNY_PACKAGE_PRIVATE_MARKERS_FILE": str(marker_file),
+            }, clear=True):
+                self.assertIn(marker, private_markers(require_deployment=True))
+
+    def test_release_refuses_empty_bom_or_invalid_external_marker_file(self):
+        cases = (("empty", b""), ("bom", "\ufeff".encode()), ("invalid", b"\xff"))
+        for name, contents in cases:
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "umbrel"
+                shutil.copytree(ROOT, root, symlinks=True,
+                                ignore=shutil.ignore_patterns("__pycache__", "tests"))
+                marker_file = Path(tmp) / "markers"
+                marker_file.write_bytes(contents)
+                output = io.StringIO()
+                with mock.patch.object(check_package, "ROOT", root), \
+                        mock.patch.object(check_package, "APP", root / "sunny-personal-digest"), \
+                        mock.patch.dict("os.environ", {
+                            "SUNNY_PACKAGE_PRIVATE_MARKERS_FILE": str(marker_file),
+                        }, clear=True), \
+                        mock.patch.object(check_package.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                        mock.patch.object(sys, "argv", ["check_package.py", "--release"]), contextlib.redirect_stderr(output):
+                    self.assertEqual(check_package.main(), 1)
+                expected = "private marker input is unreadable" if name == "invalid" else "release requires nonempty private marker input"
+                self.assertIn("ERROR: " + expected + "\n", output.getvalue())
+
+    def test_checker_main_rejects_marker_in_binary_body_or_path_without_disclosure(self):
+        marker = "vpn." + "synthetic" + ".internal"
+        hostname = "synthetic-tailnet-" + "6ae9" + "." + "ts" + "." + "net"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "umbrel"
+            shutil.copytree(ROOT, root, symlinks=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "tests"))
+            (root / "notes.txt").write_bytes(hostname.encode() + b"\xff")
+            (root / (marker + ".png")).write_bytes(b"public package\n")
+            (root / (marker + ".pyc")).write_bytes(b"public package\n")
+            (root / marker).mkdir()
+            output = io.StringIO()
+            with mock.patch.object(check_package, "ROOT", root), \
+                    mock.patch.object(check_package, "APP", root / "sunny-personal-digest"), \
+                    mock.patch.dict("os.environ", {"SUNNY_PACKAGE_PRIVATE_MARKERS": marker}, clear=True), \
+                    mock.patch.object(check_package.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                    mock.patch.object(sys, "argv", ["check_package.py"]), contextlib.redirect_stderr(output):
+                self.assertEqual(check_package.main(), 1)
+            self.assertIn("ERROR: possible tailnet hostname in package\n", output.getvalue())
+            self.assertIn("ERROR: possible private marker in package\n", output.getvalue())
+            self.assertNotIn(hostname, output.getvalue())
+            self.assertNotIn(marker, output.getvalue())
+
+    def test_release_with_clean_external_marker_file_reaches_release_gates(self):
+        marker = "vpn." + "synthetic" + ".internal"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "umbrel"
+            shutil.copytree(ROOT, root, symlinks=True,
+                            ignore=shutil.ignore_patterns("__pycache__", "tests"))
+            marker_file = Path(tmp) / "markers"
+            marker_file.write_text(marker + "\n", encoding="utf-8")
+            output = io.StringIO()
+            with mock.patch.object(check_package, "ROOT", root), \
+                    mock.patch.object(check_package, "APP", root / "sunny-personal-digest"), \
+                    mock.patch.dict("os.environ", {
+                        "SUNNY_PACKAGE_PRIVATE_MARKERS_FILE": str(marker_file),
+                    }, clear=True), \
+                    mock.patch.object(check_package.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                    mock.patch.object(sys, "argv", ["check_package.py", "--release"]), contextlib.redirect_stderr(output):
+                expected = 1 if "disabled: true" in (
+                    root / "sunny-personal-digest" / "umbrel-app.yml"
+                ).read_text(encoding="utf-8") else 0
+                self.assertEqual(check_package.main(), expected)
+            self.assertNotIn("private marker input", output.getvalue())
+            if expected:
+                self.assertIn("ERROR: release manifest must be enabled\n", output.getvalue())
+            else:
+                self.assertEqual(output.getvalue(), "")
 
 
 class TestPackageRoleLayoutGuard(unittest.TestCase):
