@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import shutil
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import check_package  # noqa: E402
+import check_native_release  # noqa: E402
 from check_package import (  # noqa: E402
     APP,
     ROOT,
@@ -278,6 +280,68 @@ class TestBugPackagePrivateMarkers20261019(unittest.TestCase):
                 self.assertIn("ERROR: release manifest must be enabled\n", output.getvalue())
             else:
                 self.assertEqual(output.getvalue(), "")
+
+
+class TestBugNativePackageFixture20261020(unittest.TestCase):
+    """Native probe must carry every public package input used by its tests."""
+
+    def test_freeze_keeps_a_complete_package_checker_context(self):
+        tracked = []
+        explicit = {
+            ".dockerignore", "Dockerfile", "requirements.txt", "requirements.in",
+            "LICENSE", "THIRD_PARTY_NOTICES.md", "README.md", "SECURITY.md",
+            "AGENTS.md", "CLAUDE.md", "umbrel-app-store.yml",
+            "sunny-personal-digest/docker-compose.yml",
+            "sunny-personal-digest/umbrel-app.yml",
+            "sunny-personal-digest/icon.svg",
+        }
+        for path in ROOT.rglob("*"):
+            relative = path.relative_to(ROOT).as_posix()
+            included = relative in explicit or relative.startswith(
+                ("src/", "tests/", "scripts/", "LICENSES/", ".github/workflows/"))
+            if (relative.startswith(("src/", "tests/", "scripts/"))
+                    and path.suffix not in {".py", ".js"}):
+                included = False
+            if (path.is_file() or path.is_symlink()) and included:
+                tracked.append(relative)
+
+        def git_inventory(*args, **kwargs):
+            if args[-1] == "HEAD":
+                return "synthetic-native-fixture\n"
+            self.assertIn("ls-files", args)
+            pathspecs = args[args.index("--") + 1:]
+            selected = [
+                name for name in tracked
+                if any(name == pattern or name.startswith(pattern + "/") for pattern in pathspecs)
+            ]
+            return "\0".join(selected) + "\0"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            context = Path(tmp) / "probe"
+            # /probe in the native image has no Git checkout or Git binary.
+            # Mock only its source inventory and HEAD; freeze/audit still read
+            # the real public files into a separate frozen context.
+            with mock.patch.object(check_native_release, "command", side_effect=git_inventory):
+                manifest = check_native_release.freeze(ROOT, context)
+            self.assertEqual(manifest["unittest_count"], 523)
+            check_native_release.audit_context(context)
+            self.assertTrue((context / "CLAUDE.md").is_symlink())
+            self.assertEqual((context / "CLAUDE.md").readlink(), Path("AGENTS.md"))
+            output = io.StringIO()
+            with mock.patch.object(check_package, "ROOT", context), \
+                    mock.patch.object(check_package, "APP", context / "sunny-personal-digest"), \
+                    mock.patch.object(check_package.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                    mock.patch.object(sys, "argv", ["check_package.py"]), contextlib.redirect_stderr(output):
+                self.assertEqual(check_package.main(), 0)
+            self.assertEqual(output.getvalue(), "")
+            manifest_path = context / "probe-manifest.json"
+            tampered = json.loads(manifest_path.read_text(encoding="utf-8"))
+            tampered["links"] = {"CLAUDE.md": "README.md"}
+            manifest_path.write_text(json.dumps(tampered), encoding="utf-8")
+            (context / "CLAUDE.md").unlink()
+            (context / "CLAUDE.md").symlink_to("README.md")
+            with self.assertRaisesRegex(RuntimeError, "native gate context changed"):
+                check_native_release.audit_context(context)
 
 
 class TestPackageRoleLayoutGuard(unittest.TestCase):

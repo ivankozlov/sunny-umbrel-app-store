@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MACHINES = {"amd64": "x86_64", "arm64": "aarch64"}
+CONTEXT_LINKS = {"CLAUDE.md": "AGENTS.md"}
 CASES = (("units", 1000, 300), ("vault", 1000, 90),
          ("native", 1000, 120), ("native", 1001, 120),
          ("active", 1000, 900), ("migration", 1000, 900))
@@ -50,7 +51,11 @@ def freeze(source, output):
     names = command("git", "-C", str(source), "ls-files", "-z", "--",
                     "src", "tests", "scripts", "Dockerfile", ".dockerignore",
                     "requirements.txt", "LICENSE", "LICENSES", "THIRD_PARTY_NOTICES.md",
-                    "sunny-personal-digest/docker-compose.yml").split("\0")
+                    "requirements.in", "README.md", "SECURITY.md", "AGENTS.md",
+                    "CLAUDE.md", "umbrel-app-store.yml", ".github/workflows",
+                    "sunny-personal-digest/docker-compose.yml",
+                    "sunny-personal-digest/umbrel-app.yml",
+                    "sunny-personal-digest/icon.svg").split("\0")
     names = [name for name in names if name]
     required = {"Dockerfile", ".dockerignore", "requirements.txt",
                 "sunny-personal-digest/docker-compose.yml",
@@ -62,9 +67,17 @@ def freeze(source, output):
         raise RuntimeError("native gate source inventory is incomplete")
     output.mkdir(mode=0o755)
     hashes = {}
+    links = {}
     for name in names:
         path = source / name
-        if (path.is_symlink() or any(parent.is_symlink() for parent in path.parents if parent != source.parent)
+        if path.is_symlink():
+            if CONTEXT_LINKS.get(name) != str(path.readlink()):
+                raise RuntimeError("unsafe native gate input")
+            target = output / name
+            target.symlink_to("AGENTS.md")
+            links[name] = str(path.readlink())
+            continue
+        if (any(parent.is_symlink() for parent in path.parents if parent != source.parent)
                 or not path.is_file() or any(
                 part in {"secrets", "credentials", "data", "__pycache__"}
                 or part.startswith(".env") for part in Path(name).parts)
@@ -78,7 +91,8 @@ def freeze(source, output):
         target.chmod(0o644)
         hashes[name] = hashlib.sha256(blob).hexdigest()
     manifest = {"format": 1, "source_commit": command("git", "-C", str(source),
-                "rev-parse", "HEAD").strip(), "unittest_count": 507, "files": hashes}
+                "rev-parse", "HEAD").strip(), "unittest_count": 523,
+                "files": hashes, "links": links}
     (output / "probe-manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n")
     (output / "probe-manifest.json").chmod(0o644)
     return manifest
@@ -89,10 +103,17 @@ def audit_context(context):
         raise RuntimeError("native gate context root differs")
     manifest = json.loads((context / "probe-manifest.json").read_text())
     entries = list(context.rglob("*"))
+    links = manifest.get("links", {})
     if (not manifest["files"] or context.is_symlink()
-            or any(p.is_symlink() or not (p.is_file() or p.is_dir()) for p in entries)
-            or {str(p.relative_to(context)) for p in entries if p.is_file()}
+            or links != CONTEXT_LINKS
+            or any((p.is_symlink() and str(p.relative_to(context)) not in links)
+                   or not (p.is_file() or p.is_dir() or p.is_symlink()) for p in entries)
+            or {str(p.relative_to(context)) for p in entries if p.is_file() and not p.is_symlink()}
             != set(manifest["files"]) | {"probe-manifest.json"}
+            or {str(p.relative_to(context)): str(p.readlink()) for p in entries if p.is_symlink()}
+            != links
+            or any(not (context / target).is_file() or (context / target).is_symlink()
+                   for target in links.values())
             or any(hashlib.sha256((context / name).read_bytes()).hexdigest() != digest
                    for name, digest in manifest["files"].items())):
         raise RuntimeError("native gate context changed")
